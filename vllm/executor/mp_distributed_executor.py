@@ -20,7 +20,7 @@ from vllm.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
-
+# Multi process
 class MultiprocessingDistributedExecutor(DistributedExecutorBase):
     """Python multiprocessing-based distributed executor"""
 
@@ -86,6 +86,7 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
             self.worker_monitor = None
         else:
             result_handler = ResultHandler()
+            # 启动 workers
             for rank in range(1, world_size):
                 worker = ProcessWorkerWrapper(result_handler,
                                               WorkerWrapperBase,

@@ -529,6 +529,7 @@ async def show_version():
     return JSONResponse(content=ver)
 
 
+# Simple Chat api entry
 @router.post("/v1/chat/completions",
              dependencies=[Depends(validate_json_request)],
              responses={
@@ -556,6 +557,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
         return base(raw_request).create_error_response(
             message="The model does not support Chat Completions API")
 
+    # handle chat completion
     generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):

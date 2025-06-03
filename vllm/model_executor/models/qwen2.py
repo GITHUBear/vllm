@@ -206,6 +206,8 @@ class Qwen2DecoderLayer(nn.Module):
         dual_chunk_attention_config = getattr(config,
                                               "dual_chunk_attention_config",
                                               None)
+        if dual_chunk_attention_config:
+            logger.error(f"dual_chunk_attention_config is not NONE")
 
         # By default, Qwen2 uses causal attention as it is a decoder-only model.
         # You can override the HF config with `is_causal=False` to enable

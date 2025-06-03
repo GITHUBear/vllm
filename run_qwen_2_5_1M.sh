@@ -1,0 +1,2 @@
+# VLLM_SKIP_DCA_CONFIG=1 VLLM_USE_V1=0 vllm serve Qwen/Qwen2.5-7B-Instruct-1M --tensor-parallel-size 4 --enable-chunked-prefill --max-num-batched-tokens 131072 --max-model-len 1048576
+VLLM_ATTENTION_BACKEND=DUAL_CHUNK_FLASH_ATTN VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve Qwen/Qwen2.5-7B-Instruct-1M --tensor-parallel-size 4 --enable-chunked-prefill --max-num-batched-tokens 131072 --max-model-len 1048576 --enforce-eager

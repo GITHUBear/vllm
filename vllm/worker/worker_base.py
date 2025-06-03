@@ -540,6 +540,7 @@ class WorkerWrapperBase:
             del os.environ[key]
         update_environment_variables(envs)
 
+    # 初始化 worker 对象实际上发生在这里
     def init_worker(self, all_kwargs: List[Dict[str, Any]]) -> None:
         """
         Here we inject some common logic before initializing the worker.
@@ -621,6 +622,7 @@ class WorkerWrapperBase:
             raise e
 
     def __getattr__(self, attr):
+        # 因为这个操作，使得worker中的属性可以被使用了，比如 load_model
         return getattr(self.worker, attr)
 
 

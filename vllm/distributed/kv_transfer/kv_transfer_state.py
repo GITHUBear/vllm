@@ -46,7 +46,7 @@ def is_v1_kv_transfer_group(
 
     return isinstance(connector, KVConnectorBase_V1)
 
-
+# kvconnector agent 初始化
 def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
     """
     Initialize KV cache transfer parallel group.

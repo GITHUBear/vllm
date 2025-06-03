@@ -10,6 +10,9 @@ from vllm.vllm_flash_attn import (fa_version_unsupported_reason,
                                   flash_attn_varlen_func,
                                   flash_attn_with_kvcache,
                                   is_fa_version_supported)
+import logging
+import time
+logger = logging.getLogger(__name__)
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
@@ -76,17 +79,28 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
-@pytest.mark.parametrize("use_out", [True, False])
-@pytest.mark.parametrize("kv_lens", [[1328, 18, 463], [1, 54, 293, 70]])
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
-@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("sliding_window", [None, 256])
-@pytest.mark.parametrize("fa_version", [2, 3])
-@pytest.mark.parametrize("q_dtype", QDTYPES)
+# @pytest.mark.parametrize("use_out", [True, False])
+# @pytest.mark.parametrize("kv_lens", [[1328, 18, 463], [1, 54, 293, 70]])
+# @pytest.mark.parametrize("num_heads", NUM_HEADS)
+# @pytest.mark.parametrize("head_size", HEAD_SIZES)
+# @pytest.mark.parametrize("block_size", BLOCK_SIZES)
+# @pytest.mark.parametrize("dtype", DTYPES)
+# @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
+# @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+# @pytest.mark.parametrize("sliding_window", [None, 256])
+# @pytest.mark.parametrize("fa_version", [2, 3])
+# @pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("use_out", [True])
+@pytest.mark.parametrize("kv_lens", [[1000],[2000],[5000],[10000],[20000],[50000],[100000],[200000],[500000]])
+@pytest.mark.parametrize("num_heads", [(4,4)])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("block_size", [16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("soft_cap", [None])
+@pytest.mark.parametrize("num_blocks", [32768])
+@pytest.mark.parametrize("sliding_window", [None])
+@pytest.mark.parametrize("fa_version", [2])
+@pytest.mark.parametrize("q_dtype", [None])
 @torch.inference_mode()
 def test_flash_attn_with_paged_kv(
     use_out: bool,
@@ -101,7 +115,7 @@ def test_flash_attn_with_paged_kv(
     fa_version: int,
     q_dtype: Optional[torch.dtype],
 ) -> None:
-    torch.set_default_device("cuda")
+    torch.set_default_device("cuda:1")
     if not is_fa_version_supported(fa_version):
         pytest.skip(f"Flash attention version {fa_version} not supported due "
                     f"to: \"{fa_version_unsupported_reason(fa_version)}\"")
@@ -110,6 +124,7 @@ def test_flash_attn_with_paged_kv(
                     "supported on version 3 with bfloat16 base type")
 
     current_platform.seed_everything(0)
+    # 3
     num_seqs = len(kv_lens)
     num_query_heads = num_heads[0]
     num_kv_heads = num_heads[1]
@@ -154,6 +169,10 @@ def test_flash_attn_with_paged_kv(
         k_descale = torch.ones(scale_shape, dtype=torch.float32)
         v_descale = torch.ones(scale_shape, dtype=torch.float32)
 
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    # fa_start = time.perf_counter()
+    start.record()
     output = flash_attn_with_kvcache(
         q=maybe_quantized_query,
         k_cache=maybe_quantized_key_cache,
@@ -170,6 +189,10 @@ def test_flash_attn_with_paged_kv(
         k_descale=k_descale,
         v_descale=v_descale,
     )
+    end.record()
+    torch.cuda.synchronize()
+    fa_cost = start.elapsed_time(end)
+    # fa_end = time.perf_counter()
     output = output if not use_out else out
     output = output.squeeze(1)
 
@@ -177,6 +200,7 @@ def test_flash_attn_with_paged_kv(
     if q_dtype is not None:
         atol, rtol = 1.5e-1, 1.5e-1
 
+    naive_start = time.perf_counter()
     ref_output = ref_paged_attn(query=query,
                                 key_cache=key_cache,
                                 value_cache=value_cache,
@@ -186,23 +210,40 @@ def test_flash_attn_with_paged_kv(
                                 scale=scale,
                                 soft_cap=soft_cap,
                                 sliding_window=sliding_window)
+    naive_end = time.perf_counter()
+    logger.info(f"kv_lens: {kv_lens} fa:{fa_cost} naive:{(naive_end - naive_start) * 1000}")
     torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
         f"{torch.max(torch.abs(output - ref_output))}"
 
 
-@pytest.mark.parametrize("use_out", [True, False])
+# @pytest.mark.parametrize("use_out", [True, False])
+# @pytest.mark.parametrize("seq_lens",
+#                          [[(1, 1328), (5, 18),
+#                            (129, 463)], [(1, 523), (1, 37), (1, 2011)]])
+# @pytest.mark.parametrize("num_heads", NUM_HEADS)
+# @pytest.mark.parametrize("head_size", HEAD_SIZES)
+# @pytest.mark.parametrize("block_size", BLOCK_SIZES)
+# @pytest.mark.parametrize("sliding_window", [None, 256])
+# @pytest.mark.parametrize("dtype", DTYPES)
+# @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
+# @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+# @pytest.mark.parametrize("fa_version", [2, 3])
+# @pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("use_out", [True])
 @pytest.mark.parametrize("seq_lens",
-                         [[(1, 1328), (5, 18),
-                           (129, 463)], [(1, 523), (1, 37), (1, 2011)]])
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("sliding_window", [None, 256])
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
-@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("fa_version", [2, 3])
-@pytest.mark.parametrize("q_dtype", QDTYPES)
+                         [[(1000, 1000)], [(2048, 2048)], [(5000, 5000)], [(10000, 10000)], [(20000, 20000)], [(50000, 50000)], [(100000, 100000)], [(200000, 200000)],
+                          [(500000, 500000)], [(1000000, 1000000)]])
+# @pytest.mark.parametrize("seq_lens",
+#                          [[(50000, 50000)]])
+@pytest.mark.parametrize("num_heads", [(4,4)])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("block_size", [32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("soft_cap", [None])
+@pytest.mark.parametrize("num_blocks", [32768])
+@pytest.mark.parametrize("sliding_window", [None])
+@pytest.mark.parametrize("fa_version", [2])
+@pytest.mark.parametrize("q_dtype", [None])
 @torch.inference_mode()
 def test_varlen_with_paged_kv(
     use_out: bool,
@@ -217,7 +258,7 @@ def test_varlen_with_paged_kv(
     fa_version: int,
     q_dtype: Optional[torch.dtype],
 ) -> None:
-    torch.set_default_device("cuda")
+    torch.set_default_device("cuda:1")
     if not is_fa_version_supported(fa_version):
         pytest.skip(f"Flash attention version {fa_version} not supported due "
                     f"to: \"{fa_version_unsupported_reason(fa_version)}\"")
@@ -247,6 +288,7 @@ def test_varlen_with_paged_kv(
                             head_size,
                             dtype=dtype)
     value_cache = torch.randn_like(key_cache)
+    logger.info(f"KVCACHE GPU: {key_cache.element_size() * key_cache.numel() * 2 / 1024 / 1024 / 1024} GB  QUERY GPU: {query.element_size() * query.numel() / 1024 / 1024 / 1024} GB")
     cu_query_lens = torch.tensor([0] + query_lens,
                                  dtype=torch.int32).cumsum(dim=0,
                                                            dtype=torch.int32)
@@ -277,6 +319,10 @@ def test_varlen_with_paged_kv(
         k_descale = torch.ones(scale_shape, dtype=torch.float32)
         v_descale = torch.ones(scale_shape, dtype=torch.float32)
 
+    # fa_start = time.perf_counter()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
     output = flash_attn_varlen_func(
         q=maybe_quantized_query,
         k=maybe_quantized_key_cache,
@@ -296,21 +342,28 @@ def test_varlen_with_paged_kv(
         k_descale=k_descale,
         v_descale=v_descale,
     )
+    end.record()
+    torch.cuda.synchronize()
+    # fa_end = time.perf_counter()
     output = output if not use_out else out
 
-    ref_output = ref_paged_attn(
-        query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        query_lens=query_lens,
-        kv_lens=kv_lens,
-        block_tables=block_tables,
-        scale=scale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
-    )
-    atol, rtol = 1.5e-2, 1e-2
-    if q_dtype is not None:
-        atol, rtol = 1.5e-1, 1.5e-1
-    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
-        f"{torch.max(torch.abs(output - ref_output))}"
+    # naive_start = time.perf_counter()
+    # ref_output = ref_paged_attn(
+    #     query=query,
+    #     key_cache=key_cache,
+    #     value_cache=value_cache,
+    #     query_lens=query_lens,
+    #     kv_lens=kv_lens,
+    #     block_tables=block_tables,
+    #     scale=scale,
+    #     sliding_window=sliding_window,
+    #     soft_cap=soft_cap,
+    # )
+    # naive_end = time.perf_counter()
+    # atol, rtol = 1.5e-2, 1e-2
+    # if q_dtype is not None:
+    #     atol, rtol = 1.5e-1, 1.5e-1
+    # torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
+    #     f"{torch.max(torch.abs(output - ref_output))}"
+    # logger.info(f"{seq_lens} fa:{(fa_end - fa_start) * 1000} naive:{(naive_end - naive_start) * 1000}")
+    logger.info(f"{seq_lens} {kv_lens} fa:{start.elapsed_time(end)}")

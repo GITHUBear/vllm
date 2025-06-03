@@ -12,6 +12,10 @@ from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.utils import get_max_shared_memory_bytes
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 if not current_platform.is_rocm():
     from xformers import ops as xops
     from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
@@ -44,7 +48,7 @@ USE_ALIBI = [False, True]
 KV_CACHE_DTYPE = ["auto", "fp8"]
 SEEDS = [0]
 CUDA_DEVICES = [
-    f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
+    f"cuda:{i + 1}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
 ]
 
 
@@ -159,6 +163,7 @@ def test_paged_attention(
     torch.set_default_device(device)
     scale = float(1.0 / (head_size**0.5))
     num_query_heads, num_kv_heads = num_heads
+    # [n_seq, n_q_heads, head_sz]
     query = torch.empty(num_seqs, num_query_heads, head_size, dtype=dtype)
     query.uniform_(-scale, scale)
 

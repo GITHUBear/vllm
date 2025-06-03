@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import ast
 import copy
 import enum
@@ -4240,8 +4241,14 @@ class VllmConfig:
                                                        self.speculative_config,
                                                        self.device_config)
             self.model_config.verify_with_parallel_config(self.parallel_config)
-            self.model_config.verify_dual_chunk_attention_config(
-                self.load_config)
+            skip_load_dca_config = os.getenv("VLLM_SKIP_DCA_CONFIG", False)
+            if not skip_load_dca_config:
+                self.model_config.verify_dual_chunk_attention_config(
+                    self.load_config)
+            else:
+                if hasattr(self.model_config.hf_config, "dual_chunk_attention_config"):
+                    self.model_config.hf_config.dual_chunk_attention_config = None
+                logger.error(f"SKIP LOAD DCA CONFIG")
 
         if self.cache_config is not None:
             self.cache_config.verify_with_parallel_config(self.parallel_config)

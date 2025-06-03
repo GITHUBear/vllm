@@ -200,9 +200,9 @@ class ProcessWorkerWrapper:
         self._task_queue.close()
         self.process.kill()
 
-
+# 多进程 worker 的工作循环
 def _run_worker_process(
-    worker_factory: Callable[[VllmConfig, int], Any],
+    worker_factory: Callable[[VllmConfig, int], Any], #WorkerWrapperBase
     task_queue: Queue,
     result_queue: Queue,
     vllm_config: VllmConfig,

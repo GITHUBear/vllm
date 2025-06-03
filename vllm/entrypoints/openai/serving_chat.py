@@ -175,6 +175,7 @@ class OpenAIServingChat(OpenAIServing):
                 tool.model_dump() for tool in request.tools
             ]
 
+            # tokenize the prompts
             (
                 conversation,
                 request_prompts,
@@ -238,6 +239,8 @@ class OpenAIServingChat(OpenAIServing):
                         params=sampling_params,
                     )
                 else:
+                    # For vllm-v0 -> AsyncLLMEngine
+                    # For vllm-v1 -> AsyncLLM
                     generator = self.engine_client.generate(
                         engine_prompt,
                         sampling_params,

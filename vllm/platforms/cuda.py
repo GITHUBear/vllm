@@ -126,6 +126,8 @@ class CudaPlatformBase(Platform):
                     parallel_config.sd_worker_cls = \
                         "vllm.worker.worker.Worker"
             else:
+                # v1: 在cuda平台上默认使用 vllm.v1.worker.gpu_worker.Worker
+                # v0: 在cuda平台上默认使用 vllm.worker.worker.Worker
                 if envs.VLLM_USE_V1:
                     parallel_config.worker_cls = \
                             "vllm.v1.worker.gpu_worker.Worker"

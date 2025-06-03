@@ -272,9 +272,14 @@ class LLMEngine:
                                                     self.tokenizer,
                                                     mm_registry)
 
+        # 初始化 Executor
+        # init_worker
+        # init_device
+        # load_model
         self.model_executor = executor_class(vllm_config=vllm_config)
 
         if self.model_config.runner_type != "pooling":
+            # 确定 KVCache 分配情况
             self._initialize_kv_caches()
 
         # If usage stat is enabled, collect relevant info.
@@ -433,6 +438,7 @@ class LLMEngine:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+        # 现在开始分配 KVCache 显存空间
         self.model_executor.initialize_cache(num_gpu_blocks, num_cpu_blocks)
         elapsed = time.time() - start
         logger.info(("init engine (profile, create kv cache, "

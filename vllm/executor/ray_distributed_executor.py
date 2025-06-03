@@ -48,6 +48,7 @@ class RayWorkerMetaData:
     ip: str = ""
 
 
+# Multi node executor
 class RayDistributedExecutor(DistributedExecutorBase):
     """Ray-based distributed executor"""
 

@@ -1406,6 +1406,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             # it is important to create tensors inside the loop, rather than
             # multiplying the list, to avoid Dynamo from treating them as
             # tensor aliasing.
+            # 用空的 kvcache 计算出不使用 KVCache 时的一次显存占用
             kv_caches = [
                 torch.tensor([], dtype=torch.float32, device=self.device)
                 for _ in range(num_layers)

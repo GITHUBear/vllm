@@ -200,6 +200,7 @@ class RequestTracker:
 
         abort_request = partial(self.abort_request, verbose=verbose)
         stream = AsyncStream(request_id, abort_request)
+        # put the request into request Queue
         self._new_requests.put_nowait((stream, {
             "request_id": request_id,
             **engine_add_request_kwargs
@@ -264,6 +265,7 @@ class _AsyncLLMEngine(LLMEngine):
     """Extension of LLMEngine to add async methods."""
 
     def __init__(self, *args, **kwargs):
+        # LLMEngine 初始化
         super().__init__(*args, **kwargs)
 
     async def step_async(
@@ -613,6 +615,7 @@ class AsyncLLMEngine(EngineClient):
                 "VLLM_USE_V1=0 or 1 and report this issue on Github.")
 
         self.log_requests = log_requests
+        # _AsyncLLMEngine 初始化
         self.engine = self._engine_class(*args, **kwargs)
 
         # This ensures quick processing of request outputs
@@ -843,6 +846,7 @@ class AsyncLLMEngine(EngineClient):
                 await asyncio.sleep(0)
                 if engine_ref() is None:
                     return
+                # Wait new_requests_event to be set!
                 await request_tracker.wait_for_new_requests()
                 engine = engine_ref()
                 if not engine:
@@ -941,6 +945,7 @@ class AsyncLLMEngine(EngineClient):
 
         if not self.is_running:
             if self.start_engine_loop:
+                # 启动事件循环，处理请求
                 self.start_background_loop()
             else:
                 raise AsyncEngineDeadError(
@@ -1133,6 +1138,7 @@ class AsyncLLMEngine(EngineClient):
         ```
         """
         try:
+            # async add_request
             async for output in await self.add_request(
                     request_id,
                     prompt,

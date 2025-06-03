@@ -146,7 +146,7 @@ endif()
 if (AVX512_FOUND AND NOT AVX512_DISABLED)
     FetchContent_Declare(
         oneDNN
-        GIT_REPOSITORY https://github.com/oneapi-src/oneDNN.git
+        GIT_REPOSITORY git@github.com:uxlfoundation/oneDNN.git
         GIT_TAG  v3.7.1
         GIT_PROGRESS TRUE
         GIT_SHALLOW TRUE
@@ -171,7 +171,7 @@ if (AVX512_FOUND AND NOT AVX512_DISABLED)
 elseif(POWER10_FOUND)
     FetchContent_Declare(
         oneDNN
-        GIT_REPOSITORY https://github.com/oneapi-src/oneDNN.git
+        GIT_REPOSITORY git@github.com:uxlfoundation/oneDNN.git
         GIT_TAG v3.7.2
         GIT_PROGRESS TRUE
         GIT_SHALLOW TRUE
