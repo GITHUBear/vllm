@@ -35,19 +35,19 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()
-  # FetchContent_Declare(
-  #         vllm-flash-attn
-  #         GIT_REPOSITORY git@github.com:vllm-project/flash-attention.git
-  #         GIT_TAG 8798f27777fb57f447070301bf33a9f9c607f491
-  #         GIT_PROGRESS TRUE
-  #         # Don't share the vllm-flash-attn build between build types
-  #         BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
-  # )
   FetchContent_Declare(
           vllm-flash-attn
-          SOURCE_DIR /data/shanhaikang.shk/vllm/.deps/vllm-flash-attn-src
+          GIT_REPOSITORY git@github.com:vllm-project/flash-attention.git
+          GIT_TAG 8798f27777fb57f447070301bf33a9f9c607f491
+          GIT_PROGRESS TRUE
+          # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
+  # FetchContent_Declare(
+  #         vllm-flash-attn
+  #         SOURCE_DIR /data/shanhaikang.shk/vllm/.deps/vllm-flash-attn-src
+  #         BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
+  # )
 endif()
 
 

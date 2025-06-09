@@ -214,3 +214,4 @@ benchmarks/needle_in_a_haystack/results
 benchmarks/needle_in_a_haystack/*.out
 benchmarks/infinite_benchmark/*.out
 benchmarks/infinite_benchmark/*.output
+nohup.out

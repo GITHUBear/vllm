@@ -1,0 +1,1 @@
+CCACHE_NOHASHDIR="true" nohup pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple &

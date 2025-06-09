@@ -16,20 +16,20 @@ if(FLASH_MLA_SRC_DIR)
         BUILD_COMMAND ""
   )
 else()
-  # FetchContent_Declare(
-  #       flashmla
-  #       GIT_REPOSITORY git@github.com:vllm-project/FlashMLA.git
-  #       GIT_TAG 575f7724b9762f265bbee5889df9c7d630801845
-  #       GIT_PROGRESS TRUE
-  #       CONFIGURE_COMMAND ""
-  #       BUILD_COMMAND ""
-  # )
   FetchContent_Declare(
         flashmla
-        SOURCE_DIR /data/shanhaikang.shk/vllm/.deps/flashmla-src
+        GIT_REPOSITORY git@github.com:vllm-project/FlashMLA.git
+        GIT_TAG 575f7724b9762f265bbee5889df9c7d630801845
+        GIT_PROGRESS TRUE
         CONFIGURE_COMMAND ""
         BUILD_COMMAND ""
   )
+  # FetchContent_Declare(
+  #       flashmla
+  #       SOURCE_DIR /data/shanhaikang.shk/vllm/.deps/flashmla-src
+  #       CONFIGURE_COMMAND ""
+  #       BUILD_COMMAND ""
+  # )
 endif()
 
 
