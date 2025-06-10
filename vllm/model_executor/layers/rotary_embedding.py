@@ -1534,6 +1534,7 @@ class DualChunkRotaryEmbedding(CustomOp):
         dtype: torch.dtype,
         chunk_size: int,
         local_size: int,
+        use_cuda: bool = True,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -1544,6 +1545,7 @@ class DualChunkRotaryEmbedding(CustomOp):
         self.chunk_size = chunk_size
         self.local_size = local_size
         self.dtype = dtype
+        self.use_cuda = use_cuda
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
         (q_cache, qc_cache, k_cache, qc_no_clamp_cache,
          q_inter_cache) = self._compute_cos_sin_cache()
@@ -1628,48 +1630,83 @@ class DualChunkRotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        query = query.view(*query.shape[:-1], -1, self.head_size)
-        key = key.view(*key.shape[:-1], -1, self.head_size)
-        query_rot = query[..., :self.rotary_dim]
-        key_rot = key[..., :self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim:]
-            key_pass = key[..., self.rotary_dim:]
+        if not self.use_cuda:
+            assert offsets is None
+            assert self.head_size == self.rotary_dim
+            # print(f"================= before rotary {query.storage_offset()} {key.storage_offset()} {positions.shape} {query.shape} {key.shape} ========")
+            query = query.view(*query.shape[:-1], -1, self.head_size)
+            key = key.view(*key.shape[:-1], -1, self.head_size)
+            query_rot = query[..., :self.rotary_dim]
+            key_rot = key[..., :self.rotary_dim]
+            if self.rotary_dim < self.head_size:
+                query_pass = query[..., self.rotary_dim:]
+                key_pass = key[..., self.rotary_dim:]
+            else:
+                query_pass = None
+                key_pass = None
+
+            positions_with_offsets = (torch.add(positions, offsets)
+                                    if offsets is not None else positions)
+            key = self._apply_rotary_embedding(
+                self.cos_sin_k_cache[positions_with_offsets], key_rot, key_pass)
+            chunk_len = self.chunk_size - self.local_size
+            query = self._apply_rotary_embedding(
+                self.cos_sin_q_cache[positions_with_offsets % chunk_len],
+                query_rot, query_pass)
+            query_succ = self._apply_rotary_embedding(
+                self.cos_sin_qc_cache[positions_with_offsets % chunk_len],
+                query_rot, query_pass)
+            query_inter = self._apply_rotary_embedding(
+                self.cos_sin_qc_cache[chunk_len - 1].repeat(positions.shape[0], 1),
+                query_rot, query_pass)
+            query_succ_critical = self._apply_rotary_embedding(
+                self.cos_sin_qc_no_clamp_cache[positions_with_offsets % chunk_len],
+                query_rot, query_pass)
+            query_inter_critical = self._apply_rotary_embedding(
+                self.cos_sin_q_inter_cache[positions_with_offsets % chunk_len],
+                query_rot, query_pass)
+
+            # merge query into one tensor to simplify the interfaces
+            query = torch.cat((
+                query,
+                query_succ,
+                query_inter,
+                query_succ_critical,
+                query_inter_critical,
+            ),
+                            dim=-1)
+            # print(f"================= after rotary {query.shape} {key.shape} ========")
+            return query, key
         else:
-            query_pass = None
-            key_pass = None
+            # print(f"==================== use dca_rotary_embedding cuda ==============")
+            assert offsets is None
+            assert self.head_size == self.rotary_dim
+            chunk_len = self.chunk_size - self.local_size
+            query_shape = query.shape
+            out = torch.empty((*query_shape[:-1], query_shape[-1] * 5), dtype=self.dtype, device=self.device)
+            # print(f"==================== {query_shape} {out.shape} ============")
+            # assert positions.is_contiguous()
+            # assert self.cos_sin_q_cache.is_contiguous()
+            # assert self.cos_sin_qc_cache.is_contiguous()
+            # assert self.cos_sin_qc_no_clamp_cache.is_contiguous()
+            # assert self.cos_sin_q_inter_cache.is_contiguous()
+            # assert out.is_contiguous()
+            # assert query.is_contiguous() and key.is_contiguous()
+            torch.ops._C.dca_rotary_embedding(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_q_cache,
+                self.cos_sin_qc_cache,
+                self.cos_sin_qc_no_clamp_cache,
+                self.cos_sin_q_inter_cache,
+                out,
+                chunk_len,
+                self.is_neox_style,
+            )
 
-        positions_with_offsets = (torch.add(positions, offsets)
-                                  if offsets is not None else positions)
-        key = self._apply_rotary_embedding(
-            self.cos_sin_k_cache[positions_with_offsets], key_rot, key_pass)
-        chunk_len = self.chunk_size - self.local_size
-        query = self._apply_rotary_embedding(
-            self.cos_sin_q_cache[positions_with_offsets % chunk_len],
-            query_rot, query_pass)
-        query_succ = self._apply_rotary_embedding(
-            self.cos_sin_qc_cache[positions_with_offsets % chunk_len],
-            query_rot, query_pass)
-        query_inter = self._apply_rotary_embedding(
-            self.cos_sin_qc_cache[chunk_len - 1].repeat(positions.shape[0], 1),
-            query_rot, query_pass)
-        query_succ_critical = self._apply_rotary_embedding(
-            self.cos_sin_qc_no_clamp_cache[positions_with_offsets % chunk_len],
-            query_rot, query_pass)
-        query_inter_critical = self._apply_rotary_embedding(
-            self.cos_sin_q_inter_cache[positions_with_offsets % chunk_len],
-            query_rot, query_pass)
-
-        # merge query into one tensor to simplify the interfaces
-        query = torch.cat((
-            query,
-            query_succ,
-            query_inter,
-            query_succ_critical,
-            query_inter_critical,
-        ),
-                          dim=-1)
-        return query, key
+            return out, key
 
     def _apply_rotary_embedding(self, cos_sin, hidden_rot, hidden_pass):
         cos, sin = cos_sin.chunk(2, dim=-1)

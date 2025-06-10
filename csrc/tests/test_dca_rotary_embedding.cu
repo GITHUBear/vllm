@@ -139,3 +139,29 @@ int main() {
   std::cout << out_ptr[0] << ", " << out_ptr[head_size] << ", " << out_ptr[head_size * 2] << ", " << out_ptr[head_size * 3] << ", " << out_ptr[head_size * 4] << std::endl;
   return 0;
 }
+
+// int main() {
+//   torch::Device device(torch::kCPU);
+//   torch::Tensor a = torch::tensor({1,2,3,4,5,6}, torch::TensorOptions().device(device));
+//   // std::cout << a.cpu() << std::endl;
+
+//   std::vector<int64_t> split_sizes = {3, 2, 1};
+//   auto split_tensors = torch::split(a, split_sizes, 0);
+//   for (size_t i = 0; i < split_tensors.size(); ++i) {
+//     std::cout << split_tensors[i].storage_offset() << std::endl;
+//     int64_t* ptr = split_tensors[i].data_ptr<int64_t>();
+//     std::cout << "first val: " << *ptr << std::endl;
+//   }
+//   // torch::Tensor tensor = torch::randn({6, 3});
+//   // std::cout << "原始张量形状: " << tensor.sizes() << std::endl;
+
+//   // // 指定分割大小为 [2, 3, 1]，总和为 6
+//   // std::vector<int64_t> split_sizes = {2, 3, 1};
+//   // auto split_tensors = torch::split(tensor, split_sizes, 0);
+
+//   // for (size_t i = 0; i < split_tensors.size(); ++i) {
+//   //     std::cout << "分割后的张量 " << i << " 形状: " << split_tensors[i].sizes() << std::endl;
+//   // }
+
+//   return 0;
+// }

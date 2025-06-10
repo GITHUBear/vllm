@@ -48,7 +48,7 @@ inline __device__ void apply_token_dca_rotary_embedding(
   const scalar_t* __restrict__ q_inter_c_cos_ptr,
   const scalar_t* __restrict__ q_inter_c_sin_ptr,
   int rot_offset, int embed_dim,
-  int head_stride
+  int split_stride
 ) {
   if (IS_NEOX) {
     // GPT-NeoX style rotary embedding.
@@ -64,29 +64,29 @@ inline __device__ void apply_token_dca_rotary_embedding(
     out[ox_index] = arr[x_index] * cos - arr[y_index] * sin;
     out[oy_index] = arr[y_index] * cos + arr[x_index] * sin;
 
-    ox_index += head_stride;
-    oy_index += head_stride;
+    ox_index += split_stride;
+    oy_index += split_stride;
     cos = VLLM_LDG(q_succ_cos_ptr + x_index);
     sin = VLLM_LDG(q_succ_sin_ptr + x_index);
     out[ox_index] = arr[x_index] * cos - arr[y_index] * sin;
     out[oy_index] = arr[y_index] * cos + arr[x_index] * sin;
 
-    ox_index += head_stride;
-    oy_index += head_stride;
+    ox_index += split_stride;
+    oy_index += split_stride;
     cos = VLLM_LDG(q_inter_cos_ptr + x_index);
     sin = VLLM_LDG(q_inter_sin_ptr + x_index);
     out[ox_index] = arr[x_index] * cos - arr[y_index] * sin;
     out[oy_index] = arr[y_index] * cos + arr[x_index] * sin;
 
-    ox_index += head_stride;
-    oy_index += head_stride;
+    ox_index += split_stride;
+    oy_index += split_stride;
     cos = VLLM_LDG(q_succ_c_cos_ptr + x_index);
     sin = VLLM_LDG(q_succ_c_sin_ptr + x_index);
     out[ox_index] = arr[x_index] * cos - arr[y_index] * sin;
     out[oy_index] = arr[y_index] * cos + arr[x_index] * sin;
 
-    ox_index += head_stride;
-    oy_index += head_stride;
+    ox_index += split_stride;
+    oy_index += split_stride;
     cos = VLLM_LDG(q_inter_c_cos_ptr + x_index);
     sin = VLLM_LDG(q_inter_c_sin_ptr + x_index);
     out[ox_index] = arr[x_index] * cos - arr[y_index] * sin;
@@ -105,29 +105,29 @@ inline __device__ void apply_token_dca_rotary_embedding(
     out[ox_index] = arr[x_index] * cos - arr[y_index] * sin;
     out[oy_index] = arr[y_index] * cos + arr[x_index] * sin;
 
-    ox_index += head_stride;
-    oy_index += head_stride;
+    ox_index += split_stride;
+    oy_index += split_stride;
     cos = VLLM_LDG(q_succ_cos_ptr + x_index / 2);
     sin = VLLM_LDG(q_succ_sin_ptr + x_index / 2);
     out[ox_index] = arr[x_index] * cos - arr[y_index] * sin;
     out[oy_index] = arr[y_index] * cos + arr[x_index] * sin;
 
-    ox_index += head_stride;
-    oy_index += head_stride;
+    ox_index += split_stride;
+    oy_index += split_stride;
     cos = VLLM_LDG(q_inter_cos_ptr + x_index / 2);
     sin = VLLM_LDG(q_inter_sin_ptr + x_index / 2);
     out[ox_index] = arr[x_index] * cos - arr[y_index] * sin;
     out[oy_index] = arr[y_index] * cos + arr[x_index] * sin;
 
-    ox_index += head_stride;
-    oy_index += head_stride;
+    ox_index += split_stride;
+    oy_index += split_stride;
     cos = VLLM_LDG(q_succ_c_cos_ptr + x_index / 2);
     sin = VLLM_LDG(q_succ_c_sin_ptr + x_index / 2);
     out[ox_index] = arr[x_index] * cos - arr[y_index] * sin;
     out[oy_index] = arr[y_index] * cos + arr[x_index] * sin;
 
-    ox_index += head_stride;
-    oy_index += head_stride;
+    ox_index += split_stride;
+    oy_index += split_stride;
     cos = VLLM_LDG(q_inter_c_cos_ptr + x_index / 2);
     sin = VLLM_LDG(q_inter_c_sin_ptr + x_index / 2);
     out[ox_index] = arr[x_index] * cos - arr[y_index] * sin;
@@ -195,7 +195,8 @@ inline __device__ void apply_dca_rotary_embedding(
   const int num_heads, const int num_kv_heads, 
   const int rot_dim, 
   const int token_idx,
-  const int64_t query_stride, const int64_t key_stride, const int64_t head_stride
+  const int64_t query_stride, const int64_t key_stride, const int64_t head_stride,
+  const int64_t out_stride
 ) {
   const int embed_dim = rot_dim / 2;
   const scalar_t* q_cos_ptr = q_cache_ptr;
@@ -214,17 +215,20 @@ inline __device__ void apply_dca_rotary_embedding(
     int head_idx = i / embed_dim;
     const int64_t token_head =
         token_idx * query_stride + head_idx * head_stride;
+    const int64_t out_token_head =
+        token_idx * out_stride + head_idx * head_size;
     const int rot_offset = i % embed_dim;
     apply_token_dca_rotary_embedding<scalar_t, IS_NEOX>(
       query + token_head,
-      qout + 5 * token_head,
+      // FIXIT
+      qout + out_token_head,
       q_cos_ptr, q_sin_ptr,
       q_succ_cos_ptr, q_succ_sin_ptr,
       q_inter_cos_ptr, q_inter_sin_ptr,
       q_succ_c_cos_ptr, q_succ_c_sin_ptr,
       q_inter_c_cos_ptr, q_inter_c_sin_ptr,
       rot_offset, embed_dim,
-      head_stride);
+      out_stride / 5);
   }
 
   const int nk = num_kv_heads * embed_dim;
@@ -282,7 +286,7 @@ __global__ void dca_rotary_embedding_kernel(
   scalar_t* __restrict__ qout,
   const int rot_dim,
   const int64_t query_stride, const int64_t key_stride,
-  const int64_t head_stride, 
+  const int64_t head_stride, const int64_t out_stride,
   const int num_heads, const int num_kv_heads,
   const int head_size,
   const int64_t chunk_len
@@ -311,7 +315,8 @@ __global__ void dca_rotary_embedding_kernel(
     num_heads, num_kv_heads, 
     rot_dim,
     token_idx, 
-    query_stride, key_stride, head_stride
+    query_stride, key_stride, head_stride,
+    out_stride
   );
 }
 
@@ -365,10 +370,9 @@ void dca_rotary_embedding(
   int64_t chunk_len,
   bool is_neox
 ) {
+  // query & key is not contiguous because of torch.split
   TORCH_CHECK(
     positions.is_contiguous() &&
-    query.is_contiguous() &&
-    key.is_contiguous() &&
     cos_sin_q_cache.is_contiguous() &&
     cos_sin_qc_cache.is_contiguous() &&
     cos_sin_qc_no_clamp_cache.is_contiguous() &&
@@ -387,7 +391,7 @@ void dca_rotary_embedding(
     TORCH_CHECK(query.size(0) == positions.size(0) &&
                 out.size(0) == positions.size(0) &&
                 key.size(0) == positions.size(0),
-                "query, key and positions must have the same number of tokens");
+                "query, key, out and positions must have the same number of tokens");
   }
   if (positions_ndim == 2) {
     TORCH_CHECK(
@@ -396,8 +400,8 @@ void dca_rotary_embedding(
         out.size(0) == positions.size(0) &&
         query.size(1) == positions.size(1) &&
         key.size(1) == positions.size(1) &&
-        out.size(2) == positions.size(2),
-        "query, key and positions must have the same batch_size and seq_len");
+        out.size(1) == positions.size(1),
+        "query, key, out and positions must have the same batch_size and seq_len");
   }
   
   int query_hidden_size = query.numel() / num_tokens;
@@ -417,10 +421,13 @@ void dca_rotary_embedding(
     cos_sin_q_inter_cache.size(1) == rot_dim,
     "cos sin cache must have the same rot_dim"
   );
+  TORCH_CHECK(rot_dim == head_size, "rot_dim and head_size must be the same");
 
   int seq_dim_idx = positions_ndim - 1;
   int64_t query_stride = query.stride(seq_dim_idx);
   int64_t key_stride = key.stride(seq_dim_idx);
+  int64_t out_stride = out.stride(seq_dim_idx);
+  TORCH_CHECK(out_stride % 5 == 0);
 
   int query_ndim = query.dim();
   int64_t head_stride =
@@ -443,7 +450,7 @@ void dca_rotary_embedding(
           out.data_ptr<scalar_t>(),
           rot_dim,
           query_stride, key_stride,
-          head_stride,
+          head_stride, out_stride,
           num_heads, num_kv_heads,
           head_size,
           chunk_len);
@@ -460,7 +467,7 @@ void dca_rotary_embedding(
               out.data_ptr<scalar_t>(),
               rot_dim,
               query_stride, key_stride,
-              head_stride,
+              head_stride, out_stride,
               num_heads, num_kv_heads,
               head_size,
               chunk_len);

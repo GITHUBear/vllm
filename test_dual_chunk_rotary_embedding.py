@@ -225,10 +225,10 @@ class DualChunkRotaryEmbedding(nn.Module):
             from vllm import _custom_ops as ops
             chunk_len = self.chunk_size - self.local_size
             query_shape = query.shape
-            out = torch.rand(*query_shape[:-1], query_shape[-1] * 5, device=self.device)
+            out = torch.empty((*query_shape[:-1], query_shape[-1] * 5), device=self.device)
             # print(f"out device: {out.device}")
-            print(f"qtype:{query.dtype} ktype:{key.dtype} otype:{out.dtype} pos:{positions.shape} rot_dim:{self.rotary_dim} {out.shape}\n")
-            print(f"{chunk_len} {self.cos_sin_q_cache.shape} {self.cos_sin_qc_cache.shape} {self.cos_sin_qc_no_clamp_cache.shape} {self.cos_sin_q_inter_cache.shape}")
+            # print(f"qtype:{query.dtype} ktype:{key.dtype} otype:{out.dtype} pos:{positions.shape} rot_dim:{self.rotary_dim} {out.shape}\n")
+            # print(f"{chunk_len} {self.cos_sin_q_cache.shape} {self.cos_sin_qc_cache.shape} {self.cos_sin_qc_no_clamp_cache.shape} {self.cos_sin_q_inter_cache.shape}")
             # cs_q_cache0 = self.cos_sin_q_cache[0][0].item()
             # cs_q_cache1 = self.cos_sin_q_cache[0][self.rotary_dim // 2].item()
             # q0 = query[0][0].item()
@@ -460,7 +460,7 @@ model = DualChunkRotaryEmbedding(
     dtype=dtype,
     chunk_size=chunk_size,
     local_size=local_size,
-    use_cuda=False,
+    use_cuda=True,
 ).to("cuda")
 import time
 import traceback
