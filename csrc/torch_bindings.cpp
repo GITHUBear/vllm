@@ -213,6 +213,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                         Tensor cos_sin_cache_offsets) -> ()");
   ops.impl("batched_rotary_embedding", torch::kCUDA, &batched_rotary_embedding);
 
+  ops.def(
+      "dca_rotary_embedding(Tensor positions, Tensor query,"
+      "                     Tensor! key, int head_size,"
+      "                     Tensor cos_sin_q_cache, Tensor cos_sin_qc_cache,"
+      "                     Tensor cos_sin_qc_no_clamp_cache, Tensor cos_sin_q_inter_cache,"
+      "                     Tensor! out,"
+      "                     int chunk_len, bool is_neox) -> ()");
+  ops.impl("dca_rotary_embedding", torch::kCUDA, &dca_rotary_embedding);
+
   // Quantization ops
 #ifndef USE_ROCM
   // Quantized GEMM for AQLM.

@@ -285,7 +285,7 @@ __global__ void dca_rotary_embedding_kernel(
   const int64_t head_stride, 
   const int num_heads, const int num_kv_heads,
   const int head_size,
-  const int chunk_len
+  const int64_t chunk_len
 ) {
   const int token_idx = blockIdx.x;
   int64_t pos = positions[token_idx];
@@ -362,9 +362,21 @@ void dca_rotary_embedding(
   torch::Tensor& cos_sin_qc_no_clamp_cache,   // [chunk_len, rot_dim]
   torch::Tensor& cos_sin_q_inter_cache,       // [chunk_len, rot_dim]
   torch::Tensor& out,
-  int chunk_len,
+  int64_t chunk_len,
   bool is_neox
 ) {
+  TORCH_CHECK(
+    positions.is_contiguous() &&
+    query.is_contiguous() &&
+    key.is_contiguous() &&
+    cos_sin_q_cache.is_contiguous() &&
+    cos_sin_qc_cache.is_contiguous() &&
+    cos_sin_qc_no_clamp_cache.is_contiguous() &&
+    cos_sin_q_inter_cache.is_contiguous() &&
+    out.is_contiguous(),
+    "all tensor must be contiguous"
+  );
+
   int64_t num_tokens = positions.numel();
   int positions_ndim = positions.dim();
 

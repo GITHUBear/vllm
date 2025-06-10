@@ -120,6 +120,26 @@ void batched_rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                               bool is_neox, int64_t rot_dim,
                               torch::Tensor& cos_sin_cache_offsets);
 
+void dca_rotary_embedding(
+  torch::Tensor& positions,                   // [batch_size, seq_len] or [num_tokens]
+  torch::Tensor& query,                       // [batch_size, seq_len, num_heads * head_size] or
+                                              // [num_tokens, num_heads * head_size] or
+                                              // [batch_size, seq_len, num_heads, head_size] or
+                                              // [num_tokens, num_heads, head_size]
+  torch::Tensor& key,                         // [batch_size, seq_len, num_kv_heads * head_size] or
+                                              // [num_tokens, num_kv_heads * head_size] or
+                                              // [batch_size, seq_len, num_kv_heads, head_size] or
+                                              // [num_tokens, num_kv_heads, head_size]
+  int64_t head_size,
+  torch::Tensor& cos_sin_q_cache,             // [chunk_len, rot_dim]
+  torch::Tensor& cos_sin_qc_cache,            // [chunk_len, rot_dim]
+  torch::Tensor& cos_sin_qc_no_clamp_cache,   // [chunk_len, rot_dim]
+  torch::Tensor& cos_sin_q_inter_cache,       // [chunk_len, rot_dim]
+  torch::Tensor& out,
+  int64_t chunk_len,
+  bool is_neox
+);
+
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
 void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,
