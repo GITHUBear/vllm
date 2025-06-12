@@ -216,6 +216,11 @@ class LLMNeedleHaystackTester:
             os.environ["VLLM_SKIP_DCA_CONFIG"] = "1"
             os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
             os.environ["VLLM_USE_V1"] = "0"
+
+            if config.sparse_prefill_type is not None:
+                print(f"################# SPARSE PREFILL ENABLED {config.sparse_prefill_type}\n")
+                os.environ["VLLM_FA_SPARSE_PREFILL"] = config.sparse_prefill_type
+
             self.model = LLM(
                 model=self.config.model_name,
                 # max_num_seqs=1,

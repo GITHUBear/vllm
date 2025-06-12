@@ -123,6 +123,7 @@ class DualChunkFlashAttentionMetadata(FlashAttentionMetadata):
 
         if self.original_max_position_embeddings > 0:
             assert prefill_metadata.orig_seq_lens_tensor is not None
+            # 这里计算了 YaRN scaling
             prefill_metadata.scaling_factor = (
                 0.1 * torch.log(prefill_metadata.orig_seq_lens_tensor /
                                 self.original_max_position_embeddings) +
@@ -347,6 +348,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             }
             start_head = self.num_heads * get_tensor_model_parallel_rank()
             end_head = start_head + self.num_heads
+            # 当前层 start_head 到 end_head 的 sparse attention 配置
             self.sparse_attention_config = [
                 self.sparse_attention_config[i]
                 for i in range(start_head, end_head)
@@ -460,8 +462,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         query_inter = query_inter[:num_prefill_tokens]
         query_succ_critical = query_succ_critical[:num_prefill_tokens]
         query_inter_critical = query_inter_critical[:num_prefill_tokens]
-        key = key[:num_prefill_tokens]
-        value = value[:num_prefill_tokens]
         assert query.shape[0] == num_prefill_tokens
         assert decode_query.shape[0] == num_decode_tokens
 
@@ -568,7 +568,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
         cu_seqlens_k_cpu = cu_seqlens_k.cpu().tolist()
         all_outputs = []
-
+        
+        # per query
         for i in range(0, len(cu_seqlens_q_cpu) - 1):
             qs = cu_seqlens_q_cpu[i]
             qe = cu_seqlens_q_cpu[i:i + 2][-1]
@@ -625,6 +626,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                     ) = self.sparse_attention_config[head_id]
                     assert ty == "vertical_and_slash", "only support slash mode"
 
+                    # ?
                     if vertical_size == 30:
                         vertical_size += 100
                     heads_vertical_size[head_id] = vertical_size
@@ -723,6 +725,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         if self.original_max_position_embeddings > 0:
             softmax_scale = softmax_scale * scaling_factor
 
+        # k 的最后 qlength 个的起始位置
         begin = k_length - q.shape[0]
         while begin < k_length:
             flash_per_chunk = []
@@ -739,6 +742,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             if block_table is not None:
                 block_tables_intra = _get_block(block_table, block_size,
                                                 prev_chunk_end_pos, end)
+                # chunk len or last chunk
                 k_states_intra = k[block_tables_intra].view(
                     -1, *k.shape[-2:])[:(end - prev_chunk_end_pos)]
                 v_states_intra = v[block_tables_intra].view(
@@ -748,6 +752,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 k_states_intra = k[prev_chunk_end_pos:end]
                 v_states_intra = v[prev_chunk_end_pos:end]
 
+            # 计算 intra chunk 中的 attention map for each head
             if sparse_attn_enabled:
                 last_q_size = min(qend - qbegin, self.sparse_attention_last_q)
                 _, num_device_k_heads, head_dim = k_states_intra.shape
@@ -761,6 +766,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                     (q_states_intra.transpose(0, 1)[:, -last_q_size:] *
                      softmax_scale) @ k_states_intra.permute(1, 2, 0))
 
+            # 计算 success chunk 中的 attention map for each head
+            # 注意这里使用的是改进后的 q_states_succ_critical
             if prev_chunk_end_pos - chunk_len >= 0:
                 q_states_succ = q_succ[qbegin:qend]
                 q_states_succ_critical = q_succ_critical[qbegin:qend]
@@ -791,6 +798,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                         0, 1)[:, -last_q_size:] * softmax_scale)
                                      @ k_states_succ.permute(1, 2, 0))
 
+            # 计算 inter chunks (从0开始) 中的 attention map for each head
+            # 注意这里使用的是改进后的 inter chunks rope
             if prev_chunk_end_pos - chunk_len * 2 >= 0:
                 q_states_inter = q_inter[qbegin:qend]
                 q_states_inter_critical = q_inter_critical[qbegin:qend]
@@ -820,6 +829,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                                      @ k_states_inter.permute(1, 2, 0))
 
             if sparse_attn_enabled:
+                # num_heads, last_q_size, k_seq_len
                 reversed_qk = qk_chunks[::-1]
                 qk = torch.cat(reversed_qk, dim=-1)
 
@@ -830,6 +840,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 qk = F.softmax(qk, dim=-1, dtype=torch.float32)
 
                 vertical = qk.sum(-2, keepdim=True)
+                # 看起来是 first tokens 的 attention sink ？
                 vertical[..., :30] = torch.inf
 
                 # Avoid sorting by using the min/max ints to fill the indexer
@@ -855,6 +866,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                     if head_score.size(1) != 1:
                         # drop right up corner
                         slash_scores = slash_scores[..., :-last_q_size + 1]
+                    # For A shape ?
                     slash_scores[..., -100:] = torch.inf
 
                     head_slash_size = heads_slash_size[head_i]
@@ -923,6 +935,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                         vertical_topk >=
                         prev_chunk_end_pos] - prev_chunk_end_pos
                     if intra_vertical_indices.nelement() == 0:
+                        # 如果 k 尾部没有 topk 被选出
+                        # 对于 vertical 来说也会在尾部保留一些
                         intra_vertical_indices = torch.cat([
                             intra_vertical_indices,
                             torch.arange(0,
@@ -1221,6 +1235,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             # block_table=block_table.unsqueeze(0),
             return_softmax_lse=True,
         )
+        # print(f"===================== softmax_lse_shape: {softmax_lse.shape} {q_len} {q_heads} ==============")
         softmax_lse = softmax_lse.view(q_len, q_heads, 1).transpose(0,
                                                                     2).float()
         return output, softmax_lse
@@ -1240,12 +1255,15 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                     logits_all.append(flash_per_chunk[0][1])
                 continue
 
+            # x, q_lens, num_heads, head_dim
             attn_outputs = torch.stack([
                 flash_attn_output[0] for flash_attn_output in flash_per_chunk
             ])
+            # x, 1, num_heads, q_lens
             logits = torch.stack([
                 flash_attn_output[1] for flash_attn_output in flash_per_chunk
             ])
+            # print(f"==================== attn_outputs: {attn_outputs.shape} logits: {logits.shape} ==============")
             logits = logits.to(torch.float32)
 
             if return_lse:

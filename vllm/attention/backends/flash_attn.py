@@ -30,6 +30,10 @@ from vllm.utils import async_tensor_h2d, make_tensor_with_pad
 from vllm.vllm_flash_attn import (flash_attn_varlen_func,
                                   flash_attn_with_kvcache)
 
+import os
+from enum import IntEnum
+from .x_attn import Xattention_prefill
+
 if TYPE_CHECKING:
     from vllm.worker.model_runner import (ModelInputForGPUBuilder,
                                           ModelInputForGPUWithSamplingMetadata)
@@ -578,6 +582,20 @@ class FlashAttentionMetadataBuilder(
             use_cuda_graph=use_captured_graph,
         )
 
+class SparsePrefillType(IntEnum):
+    FULL_ATTN = 0
+    X_ATTN = 1
+    MINFERENCE = 2
+    FLEX_PREFILL = 3
+    SPARGE_ATTN = 4
+
+@dataclass
+class XAttentionConfig:
+    stride: int = 16
+    threshold: float = 0.9
+    block_size: int = 128
+    chunk_size: int = 2048
+
 
 class FlashAttentionImpl(AttentionImpl):
     """
@@ -659,6 +677,10 @@ class FlashAttentionImpl(AttentionImpl):
                 f"Head size {head_size} is not supported by FlashAttention. "
                 f"Supported head sizes are: {support_head_sizes}.")
         self.attn_type = attn_type
+        self.sparse_prefill_attn_type = SparsePrefillType(int(os.getenv("VLLM_FA_SPARSE_PREFILL", 0)))
+        self.sparse_prefill_attn_config = None
+        if self.sparse_prefill_attn_type == SparsePrefillType.X_ATTN:
+            self.sparse_prefill_attn_config = XAttentionConfig(stride=16)
 
     def forward(
         self,
@@ -825,34 +847,81 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale=layer._v_scale.expand(descale_shape),
                 )
             else:
-                # prefix-enabled attention
-                assert attn_type == AttentionType.DECODER, (
-                    "Only decoder-only models support prefix caching")
-                assert prefill_meta.seq_lens is not None
-                assert prefill_meta.query_start_loc is not None
-                max_seq_len = max(prefill_meta.seq_lens)
-                descale_shape = (prefill_meta.query_start_loc.shape[0] - 1,
-                                 key.shape[1])
-                flash_attn_varlen_func(  # noqa
-                    q=query,
-                    k=key_cache,
-                    v=value_cache,
-                    cu_seqlens_q=prefill_meta.query_start_loc,
-                    max_seqlen_q=prefill_meta.max_query_len,
-                    seqused_k=prefill_meta.seq_lens_tensor,
-                    max_seqlen_k=max_seq_len,
-                    softmax_scale=softmax_scale,
-                    causal=True,
-                    window_size=window_size,
-                    alibi_slopes=alibi_slopes,
-                    block_table=prefill_meta.block_tables,
-                    softcap=logits_soft_cap,
-                    out=prefill_output,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
-                )
+                if self.sparse_prefill_attn_type == SparsePrefillType.FULL_ATTN:
+                    # prefix-enabled attention
+                    assert attn_type == AttentionType.DECODER, (
+                        "Only decoder-only models support prefix caching")
+                    assert prefill_meta.seq_lens is not None
+                    assert prefill_meta.query_start_loc is not None
+                    max_seq_len = max(prefill_meta.seq_lens)
+                    descale_shape = (prefill_meta.query_start_loc.shape[0] - 1,
+                                    key.shape[1])
+                    flash_attn_varlen_func(  # noqa
+                        q=query,
+                        k=key_cache,
+                        v=value_cache,
+                        cu_seqlens_q=prefill_meta.query_start_loc,
+                        max_seqlen_q=prefill_meta.max_query_len,
+                        seqused_k=prefill_meta.seq_lens_tensor,
+                        max_seqlen_k=max_seq_len,
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                        window_size=window_size,
+                        alibi_slopes=alibi_slopes,
+                        block_table=prefill_meta.block_tables,
+                        softcap=logits_soft_cap,
+                        out=prefill_output,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=layer._q_scale.expand(descale_shape),
+                        k_descale=layer._k_scale.expand(descale_shape),
+                        v_descale=layer._v_scale.expand(descale_shape),
+                    )
+                elif self.sparse_prefill_attn_type == SparsePrefillType.X_ATTN:
+                    # X-Attention
+                    # For flash_attn: query -> nhd, while x_attn: query -> 1hnd
+                    # print(f"==================== ENABLE SPARSE PREFILL ==============")
+                    cu_seqlens_q = prefill_meta.query_start_loc
+                    cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+                    assert (prefill_meta.seq_lens_tensor is not None and 
+                            prefill_meta.seq_lens_tensor.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                            prefill_meta.block_tables is not None and
+                            prefill_meta.block_tables.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                            prefill_meta.seq_lens is not None and
+                            len(prefill_meta.seq_lens) == len(cu_seqlens_q_cpu) - 1)
+
+                    # Because x_attn can only handle 1 batch_size now, we should do iteration here.
+                    for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                        qs = cu_seqlens_q_cpu[query_idx]
+                        qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+
+                        current_q = query[qs : qe] # seq_len, num_head, head_dim
+                        current_block_table = prefill_meta.block_tables[query_idx]
+                        current_seq_len = prefill_meta.seq_lens[query_idx]
+                        assert current_q.size(-2) % key_cache.size(-2) == 0
+                        group_size = current_q.size(-2) // key_cache.size(-2)
+                        # kvcache_block_size = key_cache.size(1)
+                        # retrieve key & value from kv_cache
+                        key = key_cache[current_block_table].view(-1, *key_cache.shape[-2:])[: current_seq_len]
+                        value = value_cache[current_block_table].view(-1, *value_cache.shape[-2:])[: current_seq_len]
+                        # x_attn can not handle GQA now, we should repeat key & value
+                        current_q = current_q.permute(1, 0, 2).unsqueeze(0)
+                        key = torch.repeat_interleave(key, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+                        value = torch.repeat_interleave(value, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+                        # copy partial_output to output
+                        # print(f"============== stride={self.sparse_prefill_attn_config.stride} ==========")
+                        partial_output = Xattention_prefill(
+                            query_states=current_q,
+                            key_states=key,
+                            value_states=value,
+                            stride=self.sparse_prefill_attn_config.stride,
+                            threshold=self.sparse_prefill_attn_config.threshold,
+                            block_size=self.sparse_prefill_attn_config.block_size,
+                            chunk_size=self.sparse_prefill_attn_config.chunk_size,
+                        ).squeeze(0)
+                        # print(f"================= partial_output shape: {partial_output.shape} ===========")
+                        output[qs : qe] = partial_output.permute(1, 0, 2)
+                else:
+                    raise ValueError(f"Unsupported sparse prefill type: {self.sparse_prefill_attn_type}")
 
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.

@@ -8,7 +8,7 @@ curl -s $API_ENDPOINT \
     "model": "Qwen/Qwen2.5-7B-Instruct-1M",
     "messages": [
       {"role": "system", "content": "你是一个乐于助人的AI助手。"},
-      {"role": "user", "content": "你好"}
+      {"role": "user", "content": "OceanBase是什么？"}
     ],
     "temperature": 0
   }' | jq

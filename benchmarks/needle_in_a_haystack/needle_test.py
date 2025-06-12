@@ -33,6 +33,7 @@ class Config:
     tensor_parallel_size: int = 4
     enforce_eager: bool = False
     enable_chunked_prefill: bool = False
+    sparse_prefill_type: str = None
 
     def __post_init__(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -61,6 +62,7 @@ def main(
     tensor_parallel_size: int = 4,
     enforce_eager: bool = False,
     enable_chunked_prefill: bool = False,
+    sparse_prefill_type = None,
 ):
     config = Config(
         model_name=model_name,
@@ -80,6 +82,7 @@ def main(
         tensor_parallel_size=tensor_parallel_size,
         enforce_eager=enforce_eager,
         enable_chunked_prefill=enable_chunked_prefill,
+        sparse_prefill_type=sparse_prefill_type,
     )
     # kwargs = {
     #     "max_model_len": 1048576,
@@ -124,6 +127,7 @@ if __name__ == "__main__":
     args.add_argument("--tensor_parallel_size", type=int, default=4)
     args.add_argument("--enforce_eager", action="store_true")
     args.add_argument("--enable_chunked_prefill", action="store_true")
+    args.add_argument("--sparse_prefill_type", type=str, default=None)
     args = args.parse_args()
 
     main(
@@ -143,4 +147,5 @@ if __name__ == "__main__":
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
         enable_chunked_prefill=args.enable_chunked_prefill,
+        sparse_prefill_type=args.sparse_prefill_type,
     )

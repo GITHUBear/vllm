@@ -1678,7 +1678,7 @@ class DualChunkRotaryEmbedding(CustomOp):
             # print(f"================= after rotary {query.shape} {key.shape} ========")
             return query, key
         else:
-            # print(f"==================== use dca_rotary_embedding cuda ==============")
+            # print(f"==================== use dca_rotary_embedding cuda {positions} ==============")
             assert offsets is None
             assert self.head_size == self.rotary_dim
             chunk_len = self.chunk_size - self.local_size
