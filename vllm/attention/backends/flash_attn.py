@@ -879,7 +879,6 @@ class FlashAttentionImpl(AttentionImpl):
                 elif self.sparse_prefill_attn_type == SparsePrefillType.X_ATTN:
                     # X-Attention
                     # For flash_attn: query -> nhd, while x_attn: query -> 1hnd
-                    # print(f"==================== ENABLE SPARSE PREFILL ==============")
                     cu_seqlens_q = prefill_meta.query_start_loc
                     cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
                     assert (prefill_meta.seq_lens_tensor is not None and 

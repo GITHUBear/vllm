@@ -56,4 +56,5 @@ def parse_args() -> Namespace:
     p.add_argument("--enforce_eager", action="store_true")
     p.add_argument("--enable_chunked_prefill", action="store_true")
     p.add_argument("--enable_dca", action="store_true")
+    p.add_argument("--sparse_prefill_type", type=str, default=None)
     return p.parse_args()

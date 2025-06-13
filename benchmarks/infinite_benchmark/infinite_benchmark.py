@@ -100,6 +100,7 @@ def load_model(
     enforce_eager: bool = False,
     enable_chunked_prefill: bool = False,
     enable_dca: bool = False,
+    sparse_prefill_type: str = None,
 ):
     tok = AutoTokenizer.from_pretrained(
         model_name, resume_download=None, trust_remote_code=trust_remote_code
@@ -122,6 +123,11 @@ def load_model(
         os.environ["VLLM_SKIP_DCA_CONFIG"] = "1"
         os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
         os.environ["VLLM_USE_V1"] = "0"
+
+        if sparse_prefill_type is not None:
+            os.environ["VLLM_FA_SPARSE_PREFILL"] = sparse_prefill_type
+            print(f"================ SPARSE PREFILL ENABLED: {sparse_prefill_type} ================")
+
         llm = LLM(
             model=model_name,
             # max_num_seqs=1,
@@ -135,6 +141,14 @@ def load_model(
     print("Model and tokenizer loaded.")
     return llm, tok
 
+def gen_test_tag(enable_dca: bool, sparse_prefill_type):
+    if enable_dca:
+        return "DCA"
+    if sparse_prefill_type is None:
+        return "woDCA"
+    if sparse_prefill_type == "1":
+        return "XATTN"
+    raise ValueError(f"Invalid sparse prefill type")
 
 if __name__ == "__main__":
     args = parse_args()
@@ -161,6 +175,7 @@ if __name__ == "__main__":
         enforce_eager=args.enforce_eager,
         enable_chunked_prefill=args.enable_chunked_prefill,
         enable_dca=args.enable_dca,
+        sparse_prefill_type=args.sparse_prefill_type,
     )
     results = {}
 
@@ -175,8 +190,8 @@ if __name__ == "__main__":
         )
         
         # Data
-        dca_tag = "DCA" if args.enable_dca else "woDCA"
-        result_dir = Path(args.output_dir, f"{real_model_name}_{dca_tag}")
+        tag = gen_test_tag(args.enable_dca, sparse_prefill_type=args.sparse_prefill_type)
+        result_dir = Path(args.output_dir, f"{real_model_name}_{tag}")
         result_dir.mkdir(exist_ok=True, parents=True)
         output_path = result_dir / f"prediction_{data_name}.jsonl"
         examples = load_data(data_name, data_dir=args.data_dir)

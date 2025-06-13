@@ -5,6 +5,9 @@ from urllib.request import urlopen
 from vllm import LLM, SamplingParams
 
 # os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
+# os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+# os.environ["VLLM_USE_V1"] = "0"
+
 os.environ["VLLM_FA_SPARSE_PREFILL"] = "1"
 os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
 os.environ["VLLM_SKIP_DCA_CONFIG"] = "1"
@@ -31,7 +34,7 @@ def load_prompt() -> str:
 def process_requests(llm: LLM, prompts: list[str]) -> None:
     # Create a sampling params object.
     sampling_params = SamplingParams(
-        temperature=0.7,
+        temperature=0,
         top_p=0.8,
         top_k=20,
         repetition_penalty=1.05,
