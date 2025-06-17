@@ -31,8 +31,11 @@ from vllm.vllm_flash_attn import (flash_attn_varlen_func,
                                   flash_attn_with_kvcache)
 
 import os
+import math
 from enum import IntEnum
 from .x_attn import Xattention_prefill
+from .flex_prefill_attention import flex_prefill_attention
+from spas_sage_attn import spas_sage2_attn_meansim_cuda
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import (ModelInputForGPUBuilder,
@@ -591,11 +594,24 @@ class SparsePrefillType(IntEnum):
 
 @dataclass
 class XAttentionConfig:
-    stride: int = 16
-    threshold: float = 0.9
+    stride: int = 8
+    threshold: float = 0.95
     block_size: int = 128
     chunk_size: int = 2048
 
+@dataclass
+class FlexPrefillConfig:
+    block_size: int = 128
+    min_budget: int = 1024
+    max_budget: int = None
+    gamma: float = 0.9
+    tau: float = 0
+
+@dataclass
+class SpargeAttnConfig:
+    simthreshd1: float = 0.6
+    cdfthreshd: float = 0.98
+    pvthreshd: int = 50
 
 class FlashAttentionImpl(AttentionImpl):
     """
@@ -681,6 +697,10 @@ class FlashAttentionImpl(AttentionImpl):
         self.sparse_prefill_attn_config = None
         if self.sparse_prefill_attn_type == SparsePrefillType.X_ATTN:
             self.sparse_prefill_attn_config = XAttentionConfig(stride=16)
+        if self.sparse_prefill_attn_type == SparsePrefillType.FLEX_PREFILL:
+            self.sparse_prefill_attn_config = FlexPrefillConfig()
+        if self.sparse_prefill_attn_type == SparsePrefillType.SPARGE_ATTN:
+            self.sparse_prefill_attn_config = SpargeAttnConfig()
 
     def forward(
         self,
@@ -919,6 +939,133 @@ class FlashAttentionImpl(AttentionImpl):
                         ).squeeze(0)
                         # print(f"================= partial_output shape: {partial_output.shape} ===========")
                         output[qs : qe] = partial_output.permute(1, 0, 2)
+                elif self.sparse_prefill_attn_type == SparsePrefillType.FLEX_PREFILL:
+                    # Flex Prefill
+                    max_seq_len = max(prefill_meta.seq_lens)
+                    block_size = self.sparse_prefill_attn_config.block_size
+                    
+                    if max_seq_len <= max(2 * block_size, math.ceil(self.sparse_prefill_attn_config.min_budget / block_size) * block_size):
+                        flash_attn_varlen_func(  # noqa
+                            q=query,
+                            k=key_cache,
+                            v=value_cache,
+                            cu_seqlens_q=prefill_meta.query_start_loc,
+                            max_seqlen_q=prefill_meta.max_query_len,
+                            seqused_k=prefill_meta.seq_lens_tensor,
+                            max_seqlen_k=max_seq_len,
+                            softmax_scale=softmax_scale,
+                            causal=True,
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            block_table=prefill_meta.block_tables,
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                        )
+                    else:
+                        assert logits_soft_cap == 0.0
+                        cu_seqlens_q = prefill_meta.query_start_loc
+                        cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+                        assert (prefill_meta.seq_lens_tensor is not None and 
+                                prefill_meta.seq_lens_tensor.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                                prefill_meta.block_tables is not None and
+                                prefill_meta.block_tables.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                                prefill_meta.seq_lens is not None and
+                                len(prefill_meta.seq_lens) == len(cu_seqlens_q_cpu) - 1)
+
+                        for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                            qs = cu_seqlens_q_cpu[query_idx]
+                            qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                            current_q = query[qs : qe] # seq_len, num_head, head_dim
+                            current_block_table = prefill_meta.block_tables[query_idx]
+                            current_seq_len = prefill_meta.seq_lens[query_idx]
+                            assert current_q.size(-2) % key_cache.size(-2) == 0
+                            # retrieve key & value from kv_cache
+                            key = key_cache[current_block_table].view(-1, *key_cache.shape[-2:])[: current_seq_len]
+                            value = value_cache[current_block_table].view(-1, *value_cache.shape[-2:])[: current_seq_len]
+
+                            current_q = current_q.unsqueeze(0)
+                            key = key.unsqueeze(0)
+                            value = value.unsqueeze(0)
+                            partial_output = flex_prefill_attention(
+                                q=current_q,
+                                k=key,
+                                v=value,
+                                gamma=self.sparse_prefill_attn_config.gamma,
+                                tau=self.sparse_prefill_attn_config.tau,
+                                min_budget=self.sparse_prefill_attn_config.min_budget,
+                                max_budget=self.sparse_prefill_attn_config.max_budget,
+                                softmax_scale=softmax_scale,
+                                block_size=self.sparse_prefill_attn_config.block_size,
+                            ).squeeze(0)
+                            output[qs : qe] = partial_output
+                elif self.sparse_prefill_attn_type == SparsePrefillType.SPARGE_ATTN:
+                    # Sparge Attention
+                    assert logits_soft_cap == 0.0
+                    cu_seqlens_q = prefill_meta.query_start_loc
+                    cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+                    assert (prefill_meta.seq_lens_tensor is not None and 
+                            prefill_meta.seq_lens_tensor.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                            prefill_meta.block_tables is not None and
+                            prefill_meta.block_tables.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                            prefill_meta.seq_lens is not None and
+                            len(prefill_meta.seq_lens) == len(cu_seqlens_q_cpu) - 1)
+                    
+                    max_seq_len = max(prefill_meta.seq_lens)
+                    has_short_query = False
+                    for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                        qs = cu_seqlens_q_cpu[query_idx]
+                        qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                        if qe - qs < 128:
+                            has_short_query = True
+                            break
+                    
+                    if has_short_query:
+                        flash_attn_varlen_func(  # noqa
+                            q=query,
+                            k=key_cache,
+                            v=value_cache,
+                            cu_seqlens_q=prefill_meta.query_start_loc,
+                            max_seqlen_q=prefill_meta.max_query_len,
+                            seqused_k=prefill_meta.seq_lens_tensor,
+                            max_seqlen_k=max_seq_len,
+                            softmax_scale=softmax_scale,
+                            causal=True,
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            block_table=prefill_meta.block_tables,
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                        )
+                    else:
+                        for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                            qs = cu_seqlens_q_cpu[query_idx]
+                            qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+
+                            current_q = query[qs : qe] # seq_len, num_head, head_dim
+                            current_block_table = prefill_meta.block_tables[query_idx]
+                            current_seq_len = prefill_meta.seq_lens[query_idx]
+                            assert current_q.size(-2) % key_cache.size(-2) == 0
+                            group_size = current_q.size(-2) // key_cache.size(-2)
+                            key = key_cache[current_block_table].view(-1, *key_cache.shape[-2:])[: current_seq_len]
+                            value = value_cache[current_block_table].view(-1, *value_cache.shape[-2:])[: current_seq_len]
+
+                            key = torch.repeat_interleave(key, repeats=group_size, dim=1).unsqueeze(0)
+                            value = torch.repeat_interleave(value, repeats=group_size, dim=1).unsqueeze(0)
+                            current_q = current_q.unsqueeze(0)
+
+                            partial_output = spas_sage2_attn_meansim_cuda(
+                                q=current_q,
+                                k=key,
+                                v=value,
+                                is_causal=True,
+                                simthreshd1=self.sparse_prefill_attn_config.simthreshd1,
+                                cdfthreshd=self.sparse_prefill_attn_config.cdfthreshd,
+                                pvthreshd=self.sparse_prefill_attn_config.pvthreshd,
+                                tensor_layout="NHD"
+                            ).squeeze(0)
+                            output[qs : qe] = partial_output
                 else:
                     raise ValueError(f"Unsupported sparse prefill type: {self.sparse_prefill_attn_type}")
 

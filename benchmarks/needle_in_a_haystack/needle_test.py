@@ -30,6 +30,7 @@ class Config:
     enable_dca: bool = False
     max_model_len: int = 1048576
     max_num_batched_tokens: int = 131072
+    max_num_seqs: int = None
     tensor_parallel_size: int = 4
     enforce_eager: bool = False
     enable_chunked_prefill: bool = False
@@ -59,6 +60,7 @@ def main(
     enable_dca: bool = False,
     max_model_len: int = 1048576,
     max_num_batched_tokens: int = 131072,
+    max_num_seqs: int = None,
     tensor_parallel_size: int = 4,
     enforce_eager: bool = False,
     enable_chunked_prefill: bool = False,
@@ -79,6 +81,7 @@ def main(
         enable_dca=enable_dca,
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=max_num_seqs,
         tensor_parallel_size=tensor_parallel_size,
         enforce_eager=enforce_eager,
         enable_chunked_prefill=enable_chunked_prefill,
@@ -124,6 +127,7 @@ if __name__ == "__main__":
     args.add_argument("--trust_remote_code", action="store_true")
     args.add_argument("--max_model_len", type=int, default=1048576)
     args.add_argument("--max_num_batched_tokens", type=int, default=131072)
+    args.add_argument("--max_num_seqs", type=int, default=None)
     args.add_argument("--tensor_parallel_size", type=int, default=4)
     args.add_argument("--enforce_eager", action="store_true")
     args.add_argument("--enable_chunked_prefill", action="store_true")
@@ -144,6 +148,7 @@ if __name__ == "__main__":
         enable_dca=args.enable_dca,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
         enable_chunked_prefill=args.enable_chunked_prefill,

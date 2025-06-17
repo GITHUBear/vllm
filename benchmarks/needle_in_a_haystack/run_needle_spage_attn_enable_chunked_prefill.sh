@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=4,5,6,7 python ./needle_test.py --model_name Qwen/Qwen2.5-7B-Instruct-1M --max_length 400000 --min_length 10000 --trust_remote_code --tensor_parallel_size 4 --enforce_eager --sparse_prefill_type 4 --run_name sparge_attn_chunked --max_model_len 1010000 --max_num_batched_tokens 131072 --enable_chunked_prefill

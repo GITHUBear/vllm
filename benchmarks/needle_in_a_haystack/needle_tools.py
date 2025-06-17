@@ -202,15 +202,27 @@ class LLMNeedleHaystackTester:
             print("################# ENABLE DCA\n")
             os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
             os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-            self.model = LLM(
-                model=self.config.model_name,
-                # max_num_seqs=1,
-                max_num_batched_tokens=config.max_num_batched_tokens,
-                max_model_len=config.max_model_len,
-                tensor_parallel_size=config.tensor_parallel_size,
-                enforce_eager=config.enforce_eager,
-                enable_chunked_prefill=config.enable_chunked_prefill,
-            )
+            if config.max_num_seqs is None:
+                self.model = LLM(
+                    model=self.config.model_name,
+                    # max_num_seqs=1,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    max_model_len=config.max_model_len,
+                    tensor_parallel_size=config.tensor_parallel_size,
+                    enforce_eager=config.enforce_eager,
+                    enable_chunked_prefill=config.enable_chunked_prefill,
+                )
+            else:
+                self.model = LLM(
+                    model=self.config.model_name,
+                    # max_num_seqs=1,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    max_model_len=config.max_model_len,
+                    max_num_seqs=config.max_num_seqs,
+                    tensor_parallel_size=config.tensor_parallel_size,
+                    enforce_eager=config.enforce_eager,
+                    enable_chunked_prefill=config.enable_chunked_prefill,
+                )
         else:
             print("################# DCA DISABLED\n")
             os.environ["VLLM_SKIP_DCA_CONFIG"] = "1"
@@ -221,15 +233,27 @@ class LLMNeedleHaystackTester:
                 print(f"################# SPARSE PREFILL ENABLED {config.sparse_prefill_type}\n")
                 os.environ["VLLM_FA_SPARSE_PREFILL"] = config.sparse_prefill_type
 
-            self.model = LLM(
-                model=self.config.model_name,
-                # max_num_seqs=1,
-                max_num_batched_tokens=config.max_num_batched_tokens,
-                max_model_len=config.max_model_len,
-                tensor_parallel_size=config.tensor_parallel_size,
-                enforce_eager=config.enforce_eager,
-                enable_chunked_prefill=config.enable_chunked_prefill,
-            )
+            if config.max_num_seqs is None:
+                self.model = LLM(
+                    model=self.config.model_name,
+                    # max_num_seqs=1,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    max_model_len=config.max_model_len,
+                    tensor_parallel_size=config.tensor_parallel_size,
+                    enforce_eager=config.enforce_eager,
+                    enable_chunked_prefill=config.enable_chunked_prefill,
+                )
+            else:
+                self.model = LLM(
+                    model=self.config.model_name,
+                    # max_num_seqs=1,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    max_model_len=config.max_model_len,
+                    max_num_seqs=config.max_num_seqs,
+                    tensor_parallel_size=config.tensor_parallel_size,
+                    enforce_eager=config.enforce_eager,
+                    enable_chunked_prefill=config.enable_chunked_prefill,
+                )
         self.generation_config = SamplingParams(temperature=0, max_tokens=64)
 
     def generate_random_number(self, num_digits):

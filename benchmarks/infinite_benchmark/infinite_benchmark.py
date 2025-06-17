@@ -92,7 +92,6 @@ def get_pred(
 
 def load_model(
     model_name: str,
-    max_seq_length: int = None,
     trust_remote_code: bool = False,
     tensor_parallel_size: int = 1,
     max_model_len: int = 1048576,
@@ -101,6 +100,7 @@ def load_model(
     enable_chunked_prefill: bool = False,
     enable_dca: bool = False,
     sparse_prefill_type: str = None,
+    max_num_seqs: int = None,
 ):
     tok = AutoTokenizer.from_pretrained(
         model_name, resume_download=None, trust_remote_code=trust_remote_code
@@ -112,7 +112,7 @@ def load_model(
         os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
         llm = LLM(
             model=model_name,
-            # max_num_seqs=1,
+            max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=max_model_len,
             tensor_parallel_size=tensor_parallel_size,
@@ -130,7 +130,7 @@ def load_model(
 
         llm = LLM(
             model=model_name,
-            # max_num_seqs=1,
+            max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=max_model_len,
             tensor_parallel_size=tensor_parallel_size,
@@ -148,6 +148,10 @@ def gen_test_tag(enable_dca: bool, sparse_prefill_type):
         return "woDCA"
     if sparse_prefill_type == "1":
         return "XATTN"
+    if sparse_prefill_type == "3":
+        return "FLEX_PREFILL"
+    if sparse_prefill_type == "4":
+        return "SPARGE_ATTN"
     raise ValueError(f"Invalid sparse prefill type")
 
 if __name__ == "__main__":
@@ -167,7 +171,6 @@ if __name__ == "__main__":
     # Model
     model, tok = load_model(
         model_name,
-        max_seq_length=max_seq_length,
         trust_remote_code=args.trust_remote_code,
         tensor_parallel_size=args.tensor_parallel_size,
         max_model_len=max_seq_length,
@@ -176,6 +179,7 @@ if __name__ == "__main__":
         enable_chunked_prefill=args.enable_chunked_prefill,
         enable_dca=args.enable_dca,
         sparse_prefill_type=args.sparse_prefill_type,
+        max_num_seqs=args.max_num_seqs,
     )
     results = {}
 

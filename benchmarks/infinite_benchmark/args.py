@@ -53,6 +53,7 @@ def parse_args() -> Namespace:
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--tensor_parallel_size", type=int, default=1)
     p.add_argument("--max_num_batched_tokens", type=int, default=131072)
+    p.add_argument("--max_num_seqs", type=int, default=None)
     p.add_argument("--enforce_eager", action="store_true")
     p.add_argument("--enable_chunked_prefill", action="store_true")
     p.add_argument("--enable_dca", action="store_true")

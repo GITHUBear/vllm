@@ -8,7 +8,7 @@ from vllm import LLM, SamplingParams
 # os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
 # os.environ["VLLM_USE_V1"] = "0"
 
-os.environ["VLLM_FA_SPARSE_PREFILL"] = "1"
+os.environ["VLLM_FA_SPARSE_PREFILL"] = "4"
 os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
 os.environ["VLLM_SKIP_DCA_CONFIG"] = "1"
 os.environ["VLLM_USE_V1"] = "0"
@@ -23,8 +23,9 @@ def load_prompt() -> str:
     # https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-1M/test-data/1m.txt
 
     with urlopen(
-            "https://qianwen-res.oss-cn-beijing.aliyuncs.com"
-            "/Qwen2.5-1M/test-data/600k.txt",
+            # "https://qianwen-res.oss-cn-beijing.aliyuncs.com"
+            # "/Qwen2.5-1M/test-data/600k.txt",
+            "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-1M/test-data/200k.txt",
             timeout=5) as response:
         prompt = response.read().decode('utf-8')
     return prompt
@@ -54,11 +55,12 @@ def process_requests(llm: LLM, prompts: list[str]) -> None:
 # Create an LLM.
 def initialize_engine() -> LLM:
     llm = LLM(model="Qwen/Qwen2.5-7B-Instruct-1M",
-              max_model_len=1048576,
+              max_model_len=1010000,
               tensor_parallel_size=4,
               enforce_eager=True,
               enable_chunked_prefill=True,
-              max_num_batched_tokens=131072)
+              max_num_batched_tokens=131072,
+              max_num_seqs=1)
     return llm
 
 
