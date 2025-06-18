@@ -200,8 +200,16 @@ class LLMNeedleHaystackTester:
 
         if self.config.enable_dca:
             print("################# ENABLE DCA\n")
-            os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
             os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+
+            if config.sparse_prefill_type is not None:
+                assert config.sparse_prefill_type == "2"
+                print(f"################# SPARSE PREFILL ENABLED {config.sparse_prefill_type}\n")
+                os.environ["VLLM_FA_SPARSE_PREFILL"] = config.sparse_prefill_type
+                os.environ["VLLM_USE_V1"] = "0"
+            else:
+                os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
+            
             if config.max_num_seqs is None:
                 self.model = LLM(
                     model=self.config.model_name,

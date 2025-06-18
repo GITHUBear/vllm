@@ -8,7 +8,8 @@ from vllm import LLM, SamplingParams
 # os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
 # os.environ["VLLM_USE_V1"] = "0"
 
-os.environ["VLLM_FA_SPARSE_PREFILL"] = "4"
+os.environ["VLLM_FA_SPARSE_PREFILL"] = "1"
+os.environ["VLLM_ENABLE_ATTN_OUT_DUMP"] = "1"
 os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
 os.environ["VLLM_SKIP_DCA_CONFIG"] = "1"
 os.environ["VLLM_USE_V1"] = "0"
@@ -54,6 +55,13 @@ def process_requests(llm: LLM, prompts: list[str]) -> None:
 
 # Create an LLM.
 def initialize_engine() -> LLM:
+    # llm = LLM(model="Qwen/Qwen2.5-7B-Instruct-1M",
+    #           max_model_len=402320,
+    #           tensor_parallel_size=4,
+    #           enforce_eager=True,
+    #           enable_chunked_prefill=True,
+    #           max_num_batched_tokens=402320,
+    #           max_num_seqs=1)
     llm = LLM(model="Qwen/Qwen2.5-7B-Instruct-1M",
               max_model_len=1010000,
               tensor_parallel_size=4,
@@ -66,7 +74,7 @@ def initialize_engine() -> LLM:
 
 def main():
     llm = initialize_engine()
-    process_requests(llm, ["Hello, world!"])
+    # process_requests(llm, ["Hello, world!"])
     prompt = load_prompt()
     process_requests(llm, [prompt])
 

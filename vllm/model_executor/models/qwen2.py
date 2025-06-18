@@ -23,6 +23,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
+import os
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
@@ -154,14 +155,37 @@ class Qwen2Attention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=self.rope_theta,
-            rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
-        )
+        vllm_fa_sparse_prefill = os.getenv("VLLM_FA_SPARSE_PREFILL", None)
+        if vllm_fa_sparse_prefill is not None and vllm_fa_sparse_prefill == "2":
+            assert dual_chunk_attention_config is not None
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position,
+                base=self.rope_theta,
+                rope_scaling=rope_scaling,
+            )
+        else:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position,
+                base=self.rope_theta,
+                rope_scaling=rope_scaling,
+                dual_chunk_attention_config=dual_chunk_attention_config,
+            )
+
+        enable_attn_out_dump = os.getenv("VLLM_ENABLE_ATTN_OUT_DUMP", None) is not None
+        extra_args = {}
+        if dual_chunk_attention_config:
+            extra_args = {
+                "layer_idx": extract_layer_index(prefix),
+                "dual_chunk_attention_config": dual_chunk_attention_config,
+            }
+        if enable_attn_out_dump:
+            extra_args["layer_idx"] = extract_layer_index(prefix)
+            extra_args["enable_attn_out_dump"] = True
+        
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -171,10 +195,7 @@ class Qwen2Attention(nn.Module):
             quant_config=quant_config,
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
-            **{
-                "layer_idx": extract_layer_index(prefix),
-                "dual_chunk_attention_config": dual_chunk_attention_config,
-            } if dual_chunk_attention_config else {})
+            **extra_args)
 
     def forward(
         self,

@@ -215,3 +215,8 @@ benchmarks/needle_in_a_haystack/*.out
 benchmarks/infinite_benchmark/*.out
 benchmarks/infinite_benchmark/*.output
 nohup.out
+diff_fig
+diff_chunk_fig
+attn_out_dump
+xattn_chunked_out_dump
+xattn_out_dump

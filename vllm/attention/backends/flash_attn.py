@@ -34,6 +34,7 @@ import os
 import math
 from enum import IntEnum
 from .x_attn import Xattention_prefill
+from .minference import Minference_prefill
 from .flex_prefill_attention import flex_prefill_attention
 from spas_sage_attn import spas_sage2_attn_meansim_cuda
 
@@ -652,6 +653,9 @@ class FlashAttentionImpl(AttentionImpl):
         logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
         use_irope: bool = False,
+        layer_idx: int = -1,
+        dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
+        enable_attn_out_dump: bool = False,
     ) -> None:
         if blocksparse_params is not None:
             raise ValueError(
@@ -693,6 +697,34 @@ class FlashAttentionImpl(AttentionImpl):
                 f"Head size {head_size} is not supported by FlashAttention. "
                 f"Supported head sizes are: {support_head_sizes}.")
         self.attn_type = attn_type
+
+        self.layer_idx = layer_idx
+        self.enable_attn_out_dump = enable_attn_out_dump
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.dual_chunk_attention_config = dual_chunk_attention_config
+        self.vertical_slash_config = None
+        self.sparse_attention_threshold = None
+        if self.dual_chunk_attention_config is not None:
+            self.vertical_slash_config = self.dual_chunk_attention_config.get(
+                "sparse_attention_config", None)
+            self.sparse_attention_threshold = dual_chunk_attention_config.get(
+                "sparse_attention_threshold", 32768)
+            assert self.vertical_slash_config is not None
+        
+        if self.vertical_slash_config:
+            self.vertical_slash_config = {
+                int(i): j
+                for i, j in self.vertical_slash_config[self.layer_idx].items()
+            }
+            start_head = self.num_heads * self.tp_rank
+            end_head = start_head + self.num_heads
+            # 当前层 start_head 到 end_head 的 sparse attention 配置
+            self.vertical_slash_config = [
+                self.vertical_slash_config[i]
+                for i in range(start_head, end_head)
+            ]
+
         self.sparse_prefill_attn_type = SparsePrefillType(int(os.getenv("VLLM_FA_SPARSE_PREFILL", 0)))
         self.sparse_prefill_attn_config = None
         if self.sparse_prefill_attn_type == SparsePrefillType.X_ATTN:
@@ -876,6 +908,7 @@ class FlashAttentionImpl(AttentionImpl):
                     max_seq_len = max(prefill_meta.seq_lens)
                     descale_shape = (prefill_meta.query_start_loc.shape[0] - 1,
                                     key.shape[1])
+
                     flash_attn_varlen_func(  # noqa
                         q=query,
                         k=key_cache,
@@ -896,6 +929,74 @@ class FlashAttentionImpl(AttentionImpl):
                         k_descale=layer._k_scale.expand(descale_shape),
                         v_descale=layer._v_scale.expand(descale_shape),
                     )
+
+                    if self.enable_attn_out_dump:
+                        print(f"================== ENABLE ATTN OUT DUMP {self.tp_rank} {self.layer_idx} ================")
+                        assert len(prefill_meta.seq_lens) == 1
+                        import h5py
+                        file_name = f"/data/shanhaikang.shk/vllm/attn_out_dump/tensor_{self.tp_rank}.hdf5"
+                        with h5py.File(file_name, 'a') as f:
+                            f.create_dataset(f'{self.layer_idx}', data=prefill_output.clone().detach().float().cpu().numpy())
+
+                elif self.sparse_prefill_attn_type == SparsePrefillType.MINFERENCE:
+                    assert self.sparse_attention_threshold is not None
+                    assert self.vertical_slash_config is not None
+
+                    min_seq_len = min(prefill_meta.seq_lens)
+                    max_seq_len = max(prefill_meta.seq_lens)
+                    if min_seq_len <= self.sparse_attention_threshold:
+                        flash_attn_varlen_func(  # noqa
+                            q=query,
+                            k=key_cache,
+                            v=value_cache,
+                            cu_seqlens_q=prefill_meta.query_start_loc,
+                            max_seqlen_q=prefill_meta.max_query_len,
+                            seqused_k=prefill_meta.seq_lens_tensor,
+                            max_seqlen_k=max_seq_len,
+                            softmax_scale=softmax_scale,
+                            causal=True,
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            block_table=prefill_meta.block_tables,
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                        )
+                    else:
+                        cu_seqlens_q = prefill_meta.query_start_loc
+                        cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+                        assert (prefill_meta.seq_lens_tensor is not None and 
+                                prefill_meta.seq_lens_tensor.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                                prefill_meta.block_tables is not None and
+                                prefill_meta.block_tables.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                                prefill_meta.seq_lens is not None and
+                                len(prefill_meta.seq_lens) == len(cu_seqlens_q_cpu) - 1)
+
+                        for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                            qs = cu_seqlens_q_cpu[query_idx]
+                            qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+
+                            current_q = query[qs : qe] # seq_len, num_head, head_dim
+                            current_block_table = prefill_meta.block_tables[query_idx]
+                            current_seq_len = prefill_meta.seq_lens[query_idx]
+                            assert current_q.size(-2) % key_cache.size(-2) == 0
+                            group_size = current_q.size(-2) // key_cache.size(-2)
+
+                            key = key_cache[current_block_table].view(-1, *key_cache.shape[-2:])[: current_seq_len]
+                            value = value_cache[current_block_table].view(-1, *value_cache.shape[-2:])[: current_seq_len]
+
+                            current_q = current_q.permute(1, 0, 2).unsqueeze(0)
+                            key = torch.repeat_interleave(key, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+                            value = torch.repeat_interleave(value, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+
+                            partial_output = Minference_prefill(
+                                query_states=current_q,
+                                key_states=key,
+                                value_states=value,
+                                vertical_slash_config=self.vertical_slash_config,
+                            ).squeeze(0)
+                            # print(f"================= partial_output shape: {partial_output.shape} ===========")
+                            output[qs : qe] = partial_output.permute(1, 0, 2)
                 elif self.sparse_prefill_attn_type == SparsePrefillType.X_ATTN:
                     # X-Attention
                     # For flash_attn: query -> nhd, while x_attn: query -> 1hnd
@@ -909,13 +1010,17 @@ class FlashAttentionImpl(AttentionImpl):
                             len(prefill_meta.seq_lens) == len(cu_seqlens_q_cpu) - 1)
 
                     # Because x_attn can only handle 1 batch_size now, we should do iteration here.
+                    qlen = None
+                    seqlen = None
                     for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
                         qs = cu_seqlens_q_cpu[query_idx]
                         qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                        qlen = qe - qs
 
                         current_q = query[qs : qe] # seq_len, num_head, head_dim
                         current_block_table = prefill_meta.block_tables[query_idx]
                         current_seq_len = prefill_meta.seq_lens[query_idx]
+                        seqlen = current_seq_len
                         assert current_q.size(-2) % key_cache.size(-2) == 0
                         group_size = current_q.size(-2) // key_cache.size(-2)
                         # kvcache_block_size = key_cache.size(1)
@@ -939,6 +1044,14 @@ class FlashAttentionImpl(AttentionImpl):
                         ).squeeze(0)
                         # print(f"================= partial_output shape: {partial_output.shape} ===========")
                         output[qs : qe] = partial_output.permute(1, 0, 2)
+
+                    if self.enable_attn_out_dump:
+                        print(f"================== ENABLE XATTN CHUNKED OUT DUMP {self.tp_rank} {self.layer_idx} {prefill_output.shape} {qlen} {seqlen} ================")
+                        assert len(prefill_meta.seq_lens) == 1
+                        import h5py
+                        file_name = f"/data/shanhaikang.shk/vllm/xattn_chunked_out_dump/tensor_{self.tp_rank}.hdf5"
+                        with h5py.File(file_name, 'a') as f:
+                            f.create_dataset(f'{self.layer_idx}_{seqlen - qlen}', data=prefill_output.clone().detach().float().cpu().numpy())
                 elif self.sparse_prefill_attn_type == SparsePrefillType.FLEX_PREFILL:
                     # Flex Prefill
                     max_seq_len = max(prefill_meta.seq_lens)
