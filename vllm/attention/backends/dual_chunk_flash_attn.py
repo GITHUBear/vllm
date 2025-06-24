@@ -725,7 +725,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         if self.original_max_position_embeddings > 0:
             softmax_scale = softmax_scale * scaling_factor
 
-        # k 的最后 qlength 个的起始位置
+        # 处理 q 的每一个 chunk 块
         begin = k_length - q.shape[0]
         while begin < k_length:
             flash_per_chunk = []
@@ -762,6 +762,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 v_states_intra = (v_states_intra.unsqueeze(2).repeat(
                     1, 1, group_size,
                     1).reshape(-1, num_device_k_heads * group_size, head_dim))
+                # [n_head, last_q_size, k_len]
                 qk_chunks.append(
                     (q_states_intra.transpose(0, 1)[:, -last_q_size:] *
                      softmax_scale) @ k_states_intra.permute(1, 2, 0))
@@ -959,6 +960,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                     vertical_buffer[head_i, :v_count].copy_(
                         intra_vertical_indices)
                     slash_buffer[head_i, :s_count].copy_(intra_slash_indices)
+                    
                     # succ
                     if prev_chunk_end_pos - chunk_len >= 0:
                         succ_vertical_indices = vertical_topk[

@@ -1,0 +1,1 @@
+VLLM_USE_V1=0 VLLM_FA_SPARSE_PREFILL=1 vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-14B --tensor-parallel-size 8 --enable-chunked-prefill --max-num-batched-tokens 131072 --enforce-eager

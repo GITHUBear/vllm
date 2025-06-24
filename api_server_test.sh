@@ -5,10 +5,10 @@ curl -s $API_ENDPOINT \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $API_KEY" \
   -d '{
-    "model": "Qwen/Qwen2.5-7B-Instruct-1M",
+    "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
     "messages": [
       {"role": "system", "content": "你是一个乐于助人的AI助手。"},
-      {"role": "user", "content": "OceanBase是什么？"}
+      {"role": "user", "content": "OceanBase是什么"}
     ],
     "temperature": 0
   }' | jq

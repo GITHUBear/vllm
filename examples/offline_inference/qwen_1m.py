@@ -4,15 +4,16 @@ from urllib.request import urlopen
 
 from vllm import LLM, SamplingParams
 
-# os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
-# os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-# os.environ["VLLM_USE_V1"] = "0"
-
-os.environ["VLLM_FA_SPARSE_PREFILL"] = "1"
-os.environ["VLLM_ENABLE_ATTN_OUT_DUMP"] = "1"
+os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
 os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-os.environ["VLLM_SKIP_DCA_CONFIG"] = "1"
 os.environ["VLLM_USE_V1"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"]="4,5,6,7"
+
+# os.environ["VLLM_FA_SPARSE_PREFILL"] = "1"
+# # os.environ["VLLM_ENABLE_ATTN_OUT_DUMP"] = "1"
+# os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+# os.environ["VLLM_SKIP_DCA_CONFIG"] = "1"
+# os.environ["VLLM_USE_V1"] = "0"
 
 
 def load_prompt() -> str:
@@ -74,7 +75,7 @@ def initialize_engine() -> LLM:
 
 def main():
     llm = initialize_engine()
-    # process_requests(llm, ["Hello, world!"])
+    process_requests(llm, ["Hello, world!"])
     prompt = load_prompt()
     process_requests(llm, [prompt])
 

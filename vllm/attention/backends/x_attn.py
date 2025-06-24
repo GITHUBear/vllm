@@ -177,12 +177,17 @@ def xattn_estimate(
     batch_size, num_q_head, q_len, head_dim = query_states.shape
     assert num_q_head == num_kv_head
 
+    # 将 k q padding 到 chunk size 对齐大小
     k_num_to_pad = ((k_len + chunk_size - 1) // chunk_size) * chunk_size - k_len
     q_num_to_pad = ((q_len + chunk_size - 1) // chunk_size) * chunk_size - q_len
     k_chunk_num = (k_len + k_num_to_pad) // chunk_size
     k_block_num = (k_len + k_num_to_pad) // block_size
     q_chunk_num = (q_len + q_num_to_pad) // chunk_size
     q_block_num = (q_len + q_num_to_pad) // block_size
+    assert k_chunk_num >= q_chunk_num
+    offset_token_chunk_num = k_chunk_num - q_chunk_num
+    # assert k_block_num >= q_block_num
+    # offset_token_block_num = k_block_num - q_block_num
 
     if k_num_to_pad > 0:
         pad_key_states = F.pad(key_states, (0, 0, 0, k_num_to_pad), value=0).to("cuda")
@@ -228,6 +233,7 @@ def xattn_estimate(
             )
         elif select_mode == "inverse" or select_mode == "":
             reshaped_key = torch.cat(
+                # bh(key_pad_len // stride)(d * stride)
                 [(pad_key_states[:, :, k::stride, :]) for k in range(stride)], dim=-1
             )
             reshaped_query = torch.cat(
@@ -316,6 +322,7 @@ def xattn_estimate(
                 is_causal=causal,
             )
         else:
+            # chunked query stride
             chunked_query = reshaped_query[
                 :,
                 :,
@@ -324,6 +331,7 @@ def xattn_estimate(
                 // kdb,
                 :,
             ]
+            # 计算一个chunk内每个stride分块的qk和
             attn_weights_slice = torch.matmul(
                 chunked_query,
                 reshaped_key.transpose(2, 3),
@@ -343,9 +351,13 @@ def xattn_estimate(
                     ),
                     device=key_states.device,
                 )
+                # 剔除 k_pad 的部分
                 causal_mask[:, :, :, (-k_reshaped_num_to_pad):] = float("-inf")
-                chunk_start = chunk_idx * reshaped_chunk_size
+                # 注意这里的chunk idx是通过query来分块的，这可能是导致 chunked prefill 失效的关键原因
+                # TODO: 使用 key 的 index 作为索引
+                chunk_start = (chunk_idx + offset_token_chunk_num) * reshaped_chunk_size
                 chunk_end = chunk_start + reshaped_chunk_size
+                # 剔除上对角线的部分
                 causal_mask[:, :, :, chunk_start:chunk_end] = torch.triu(
                     torch.ones(
                         1,
@@ -358,11 +370,13 @@ def xattn_estimate(
                     diagonal=1,
                 )
 
+                # 如果是最后一个块，那么需要剔除 q_pad 的部分
                 if chunk_idx == q_chunk_num - 1 and q_reshaped_num_to_pad != 0:
                     causal_mask[:, :, (-(q_reshaped_num_to_pad // kdb)) :, :] = float(
                         "-inf"
                     )
 
+                # 最后一小段的剔除
                 causal_mask[:, :, :, chunk_end:] = float("-inf")
                 causal_mask = causal_mask[:, :, kdb - 1 :: kdb, :]
                 attn_weights_slice = attn_weights_slice + causal_mask.to(
@@ -382,6 +396,7 @@ def xattn_estimate(
             if chunk_idx == q_chunk_num - 1 and q_reshaped_num_to_pad != 0:
                 attn_weights_slice[:, :, (-(q_reshaped_num_to_pad // kdb)) :, :] = 0
 
+            # block内求和
             attn_sum = (
                 attn_weights_slice.view(
                     batch_size,
@@ -397,6 +412,7 @@ def xattn_estimate(
             )
             del chunked_query
         
+        # 选取合适的block
         simple_mask = find_blocks_chunked(
             attn_sum,
             k_block_num - q_block_num + chunk_idx * num_blocks_per_chunk,
@@ -418,6 +434,7 @@ def xattn_estimate(
     simple_masks = torch.cat(simple_mask_list, dim=-2)
 
     if causal:
+        # 这里我们不需要修改，因为是负数索引
         simple_masks[:, :, -q_block_num:, -q_block_num:] = torch.where(
             torch.tril(
                 torch.ones(
@@ -459,6 +476,7 @@ def Xattention_prefill(
     keep_sink=False,
     keep_recent=False,
 ):
+    # bhnd
     batch_size, num_heads, k_len, head_dim = key_states.shape
     _, _, q_len, _ = query_states.shape
 
@@ -500,6 +518,7 @@ def Xattention_prefill(
     ####################
     assert block_size == 128
     assert batch_size == 1
+    # bnhd
     query_states = query_states.transpose(1, 2).view(q_len, num_heads, head_dim)
     key_states = key_states.transpose(1, 2).view(k_len, num_heads, head_dim)
     value_states = value_states.transpose(1, 2).view(k_len, num_heads, head_dim)
