@@ -292,6 +292,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         attn_type: str = AttentionType.DECODER,
         layer_idx: int = -1,
         dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
+        dca_recover_rate: Optional[float] = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -327,18 +328,23 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             "original_max_position_embeddings", 0)
         self.sparse_attention_config = dual_chunk_attention_config.get(
             "sparse_attention_config", None)
-        if not self.sparse_attention_config:
+        self.dca_recover_rate = dca_recover_rate
+        if not self.sparse_attention_config and not self.dca_recover_rate:
             logger.warning_once("Sparse attention will not be enabled as "
                                 "sparse attention config is not provided.")
         self.sparse_attention_enabled = dual_chunk_attention_config.get(
             "sparse_attention_enabled", self.sparse_attention_config
-            is not None)
+            is not None or self.dca_recover_rate is not None)
         self.sparse_attention_threshold = dual_chunk_attention_config.get(
             "sparse_attention_threshold", 32768)
         self.sparse_attention_last_q = dual_chunk_attention_config.get(
             "sparse_attention_last_q", 64)
         self.layer_idx = layer_idx
         self.dual_chunk_attention_config = dual_chunk_attention_config
+
+        if self.dca_recover_rate is not None:
+            print("============= DISABLE sparse_attention_config ============")
+            self.sparse_attention_config = None
 
         if self.sparse_attention_config:
             self.sparse_attention_config = {
@@ -617,20 +623,22 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                                                   dtype=torch.int32)
                 heads_slash_size = torch.empty(size=(num_device_q_heads, ),
                                                dtype=torch.int32)
-                for head_id in range(current_q.size(-2)):
-                    (
-                        ty,
-                        vertical_size,
-                        slash_size,
-                        _,
-                    ) = self.sparse_attention_config[head_id]
-                    assert ty == "vertical_and_slash", "only support slash mode"
+                
+                if self.dca_recover_rate is None:
+                    for head_id in range(current_q.size(-2)):
+                        (
+                            ty,
+                            vertical_size,
+                            slash_size,
+                            _,
+                        ) = self.sparse_attention_config[head_id]
+                        assert ty == "vertical_and_slash", "only support slash mode"
 
-                    # ?
-                    if vertical_size == 30:
-                        vertical_size += 100
-                    heads_vertical_size[head_id] = vertical_size
-                    heads_slash_size[head_id] = slash_size
+                        # ?
+                        if vertical_size == 30:
+                            vertical_size += 100
+                        heads_vertical_size[head_id] = vertical_size
+                        heads_slash_size[head_id] = slash_size
 
                 current_output = self._dual_chunk_flash_attn_prefill_func(
                     current_q,  # allheads
@@ -841,6 +849,25 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 qk = F.softmax(qk, dim=-1, dtype=torch.float32)
 
                 vertical = qk.sum(-2, keepdim=True)
+                if self.dca_recover_rate is not None:
+                    # print("=================== CALCULATE Vertical & Slash size with DCA_RECOVER_RATE ==============")
+                    num_heads = qk.shape[0]
+
+                    slash = _sum_all_diagonal_matrix(qk, all_head=True)
+                    vertical_sorted = vertical.squeeze(-2).sort(dim=-1, descending=True).values
+                    cum_vertical_sorted = vertical_sorted.cumsum(dim=-1)
+                    vertical_targets = torch.ones((num_heads,), device=qk.device) * cum_vertical_sorted[..., -1] * self.dca_recover_rate
+                    vindices = torch.searchsorted(cum_vertical_sorted, vertical_targets.view(num_heads, 1), side='left')
+                    heads_vertical_size[:] = vindices[..., 0] + 30
+                    heads_vertical_size = torch.clamp(heads_vertical_size, max=32768)
+
+                    slash_sorted = slash.sort(dim=-1, descending=True).values
+                    cum_slash_sorted = slash_sorted.cumsum(dim=-1)
+                    slash_targets = torch.ones((num_heads,), device=qk.device) * cum_slash_sorted[..., -1] * self.dca_recover_rate
+                    sindices = torch.searchsorted(cum_slash_sorted, slash_targets.view(num_heads, 1), side='left')
+                    heads_slash_size[:] = sindices[..., 0] + 100
+                    heads_slash_size = torch.clamp(heads_slash_size, max=32768)
+
                 # 看起来是 first tokens 的 attention sink ？
                 vertical[..., :30] = torch.inf
 
@@ -863,7 +890,10 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 for head_i in range(n_heads):
                     #  (nqheads=1, lastq, k_len)
                     head_score = qk[head_i:head_i + 1, :, :]
-                    slash_scores = _sum_all_diagonal_matrix(head_score)
+                    if self.dca_recover_rate is None:
+                        slash_scores = _sum_all_diagonal_matrix(head_score)
+                    else:
+                        slash_scores = slash[head_i : head_i + 1, :]
                     if head_score.size(1) != 1:
                         # drop right up corner
                         slash_scores = slash_scores[..., :-last_q_size + 1]
@@ -1493,14 +1523,14 @@ def _vertical_slash_sparse_attention(
             softmax_lse[..., :context_size, :])
 
 
-def _sum_all_diagonal_matrix(mat: torch.tensor):
+def _sum_all_diagonal_matrix(mat: torch.tensor, all_head: bool = False):
     h, n, m = mat.shape
     # Zero matrix used for padding
     zero_mat = torch.zeros((h, n, n), device=mat.device)
     # pads the matrix on left and right
     mat_padded = torch.cat((zero_mat, mat, zero_mat), -1)
     # Change the strides
-    mat_strided = mat_padded.as_strided((1, n, n + m),
+    mat_strided = mat_padded.as_strided((1 if not all_head else h, n, n + m),
                                         (n * (2 * n + m), 2 * n + m + 1, 1))
     # Sums the resulting matrix's columns
     sum_diags = torch.sum(mat_strided, 1)

@@ -656,6 +656,8 @@ class FlashAttentionImpl(AttentionImpl):
         layer_idx: int = -1,
         dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
         enable_attn_out_dump: bool = False,
+        enable_last_attn_map_dump: bool = False,
+        dump_last_query_len: int = 64,
     ) -> None:
         if blocksparse_params is not None:
             raise ValueError(
@@ -700,6 +702,8 @@ class FlashAttentionImpl(AttentionImpl):
 
         self.layer_idx = layer_idx
         self.enable_attn_out_dump = enable_attn_out_dump
+        self.enable_last_attn_map_dump = enable_last_attn_map_dump
+        self.dump_last_query_len = dump_last_query_len
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
         self.tp_rank = get_tensor_model_parallel_rank()
         self.dual_chunk_attention_config = dual_chunk_attention_config
@@ -937,6 +941,19 @@ class FlashAttentionImpl(AttentionImpl):
                         file_name = f"/data/shanhaikang.shk/vllm/attn_out_dump/tensor_{self.tp_rank}.hdf5"
                         with h5py.File(file_name, 'a') as f:
                             f.create_dataset(f'{self.layer_idx}', data=prefill_output.clone().detach().float().cpu().numpy())
+                    
+                    if self.enable_last_attn_map_dump:
+                        print(f"================== ENABLE LAST ATTN MAP DUMP {self.tp_rank} {self.layer_idx} ================")
+                        assert len(prefill_meta.seq_lens) == 1
+                        current_seq_len = prefill_meta.seq_lens[0]
+                        current_block_table = prefill_meta.block_tables[0]
+                        key = key_cache[current_block_table].view(-1, *key_cache.shape[-2:])[: current_seq_len]
+                        last_query = query[-self.dump_last_query_len:, ...].transpose(0, 1)
+                        last_attn_map = last_query @ key.permute(1, 2, 0)
+                        file_name = f"/data/shanhaikang.shk/vllm/attn_map_dump2/tensor_{self.tp_rank}.hdf5"
+                        import h5py
+                        with h5py.File(file_name, 'a') as f:
+                            f.create_dataset(f'{self.layer_idx}', data=last_attn_map.float().cpu().numpy())
 
                 elif self.sparse_prefill_attn_type == SparsePrefillType.MINFERENCE:
                     assert self.sparse_attention_threshold is not None
@@ -1000,6 +1017,7 @@ class FlashAttentionImpl(AttentionImpl):
                 elif self.sparse_prefill_attn_type == SparsePrefillType.X_ATTN:
                     # X-Attention
                     # For flash_attn: query -> nhd, while x_attn: query -> 1hnd
+                    # print("============== ENABLE X_ATTN ============")
                     cu_seqlens_q = prefill_meta.query_start_loc
                     cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
                     assert (prefill_meta.seq_lens_tensor is not None and 

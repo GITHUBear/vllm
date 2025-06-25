@@ -176,15 +176,25 @@ class Qwen2Attention(nn.Module):
             )
 
         enable_attn_out_dump = os.getenv("VLLM_ENABLE_ATTN_OUT_DUMP", None) is not None
+        enable_last_attn_map_dump = os.getenv("VLLM_ENABLE_LAST_ATTN_MAP_DUMP", False)
+        dump_last_query_len = os.getenv("VLLM_ATTN_DUMP_LAST_QUERY_LEN", 64)
+        dca_recover_rate = os.getenv("VLLM_DCA_RECOVER_RATE", None)
+        if dca_recover_rate is not None:
+            dca_recover_rate = float(dca_recover_rate)
         extra_args = {}
         if dual_chunk_attention_config:
             extra_args = {
                 "layer_idx": extract_layer_index(prefix),
                 "dual_chunk_attention_config": dual_chunk_attention_config,
+                "dca_recover_rate": dca_recover_rate,
             }
         if enable_attn_out_dump:
             extra_args["layer_idx"] = extract_layer_index(prefix)
             extra_args["enable_attn_out_dump"] = True
+        if enable_last_attn_map_dump:
+            extra_args["layer_idx"] = extract_layer_index(prefix)
+            extra_args["enable_last_attn_map_dump"] = True
+            extra_args["dump_last_query_len"] = dump_last_query_len
         
         self.attn = Attention(
             self.num_heads,
