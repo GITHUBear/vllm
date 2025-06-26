@@ -210,6 +210,9 @@ class LLMNeedleHaystackTester:
             else:
                 os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
             
+            if config.dca_recover_rate is not None:
+                os.environ["VLLM_DCA_RECOVER_RATE"] = str(config.dca_recover_rate)
+            
             if config.max_num_seqs is None:
                 self.model = LLM(
                     model=self.config.model_name,

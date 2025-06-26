@@ -6,7 +6,7 @@ from vllm import LLM, SamplingParams
 
 os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
 os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-os.environ["VLLM_USE_V1"] = "0"
+# os.environ["VLLM_USE_V1"] = "0"
 # os.environ["VLLM_DCA_RECOVER_RATE"] = "0.9"
 # os.environ["CUDA_VISIBLE_DEVICES"]="4,5,6,7"
 

@@ -99,6 +99,7 @@ def load_model(
     enforce_eager: bool = False,
     enable_chunked_prefill: bool = False,
     enable_dca: bool = False,
+    dca_recover_rate: float = None,
     sparse_prefill_type: str = None,
     max_num_seqs: int = None,
 ):
@@ -110,6 +111,8 @@ def load_model(
     if enable_dca:
         os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
         os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+        os.environ["VLLM_USE_V1"] = "0"
+        os.environ["VLLM_DCA_RECOVER_RATE"] = str(dca_recover_rate)
         llm = LLM(
             model=model_name,
             max_num_seqs=max_num_seqs,
@@ -141,9 +144,12 @@ def load_model(
     print("Model and tokenizer loaded.")
     return llm, tok
 
-def gen_test_tag(enable_dca: bool, sparse_prefill_type):
+def gen_test_tag(enable_dca: bool, sparse_prefill_type, dca_recover_rate = None):
     if enable_dca:
-        return "DCA"
+        if dca_recover_rate is None:
+            return "DCA"
+        else:
+            return f"DCA_wo_sparse_attn_config_{dca_recover_rate}"
     if sparse_prefill_type is None:
         return "woDCA"
     if sparse_prefill_type == "1":
@@ -176,6 +182,7 @@ if __name__ == "__main__":
         max_model_len=max_seq_length,
         max_num_batched_tokens=args.max_num_batched_tokens,
         enforce_eager=args.enforce_eager,
+        dca_recover_rate=args.dca_recover_rate,
         enable_chunked_prefill=args.enable_chunked_prefill,
         enable_dca=args.enable_dca,
         sparse_prefill_type=args.sparse_prefill_type,
@@ -194,7 +201,7 @@ if __name__ == "__main__":
         )
         
         # Data
-        tag = gen_test_tag(args.enable_dca, sparse_prefill_type=args.sparse_prefill_type)
+        tag = gen_test_tag(args.enable_dca, sparse_prefill_type=args.sparse_prefill_type, dca_recover_rate=args.dca_recover_rate)
         result_dir = Path(args.output_dir, f"{real_model_name}_{tag}")
         result_dir.mkdir(exist_ok=True, parents=True)
         output_path = result_dir / f"prediction_{data_name}.jsonl"

@@ -859,14 +859,14 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                     vertical_targets = torch.ones((num_heads,), device=qk.device) * cum_vertical_sorted[..., -1] * self.dca_recover_rate
                     vindices = torch.searchsorted(cum_vertical_sorted, vertical_targets.view(num_heads, 1), side='left')
                     heads_vertical_size[:] = vindices[..., 0] + 30
-                    heads_vertical_size = torch.clamp(heads_vertical_size, max=32768)
+                    heads_vertical_size = torch.clamp(heads_vertical_size, max=25000)
 
                     slash_sorted = slash.sort(dim=-1, descending=True).values
                     cum_slash_sorted = slash_sorted.cumsum(dim=-1)
                     slash_targets = torch.ones((num_heads,), device=qk.device) * cum_slash_sorted[..., -1] * self.dca_recover_rate
                     sindices = torch.searchsorted(cum_slash_sorted, slash_targets.view(num_heads, 1), side='left')
                     heads_slash_size[:] = sindices[..., 0] + 100
-                    heads_slash_size = torch.clamp(heads_slash_size, max=32768)
+                    heads_slash_size = torch.clamp(heads_slash_size, max=25000)
 
                 # 看起来是 first tokens 的 attention sink ？
                 vertical[..., :30] = torch.inf

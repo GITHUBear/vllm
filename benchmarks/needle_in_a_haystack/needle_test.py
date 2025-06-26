@@ -28,6 +28,7 @@ class Config:
     # kv_cache_cpu_device: str = "cpu"
     # kv_type: str = "dense"
     enable_dca: bool = False
+    dca_recover_rate: float = None
     max_model_len: int = 1048576
     max_num_batched_tokens: int = 131072
     max_num_seqs: int = None
@@ -58,6 +59,7 @@ def main(
     # kv_cache_cpu_device: str = "cpu",
     # kv_type: str = "dense",
     enable_dca: bool = False,
+    dca_recover_rate: float = None,
     max_model_len: int = 1048576,
     max_num_batched_tokens: int = 131072,
     max_num_seqs: int = None,
@@ -79,6 +81,7 @@ def main(
         # kv_cache_cpu_device=kv_cache_cpu_device,
         # kv_type=kv_type,
         enable_dca=enable_dca,
+        dca_recover_rate=dca_recover_rate,
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=max_num_seqs,
@@ -122,6 +125,7 @@ if __name__ == "__main__":
     args.add_argument("--max_length", type=int, default=100000)
     args.add_argument("--min_length", type=int, default=1000)
     args.add_argument("--enable_dca", action="store_true")
+    args.add_argument("--dca_recover_rate", type=float, default=None)
     # args.add_argument("--kv_cache_cpu", action="store_true")
     # args.add_argument("--kv_cache_cpu_device", type=str, default="cpu")
     args.add_argument("--trust_remote_code", action="store_true")
@@ -146,6 +150,7 @@ if __name__ == "__main__":
         trust_remote_code=args.trust_remote_code,
         # kv_cache_cpu_device=args.kv_cache_cpu_device,
         enable_dca=args.enable_dca,
+        dca_recover_rate=args.dca_recover_rate,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,

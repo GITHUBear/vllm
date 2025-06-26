@@ -1,0 +1,1 @@
+python ./needle_test.py --model_name Qwen/Qwen2.5-7B-Instruct-1M --run_name dca_wo_spa_config --max_length 400000 --min_length 10000 --trust_remote_code --enable_chunked_prefill --tensor_parallel_size 4 --enable_dca --enforce_eager --dca_recover_rate 0.9

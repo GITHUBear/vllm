@@ -970,6 +970,7 @@ class ModelConfig:
             from vllm.model_executor.model_loader.weight_utils import (
                 get_sparse_attention_config)
             sparse_attn_config = get_sparse_attention_config(self, load_config)
+            
             if sparse_attn_config:
                 self.hf_config.dual_chunk_attention_config[
                     "sparse_attention_config"] = sparse_attn_config
