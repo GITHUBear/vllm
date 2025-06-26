@@ -22,6 +22,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
+import os
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
@@ -112,6 +113,7 @@ class LlamaAttention(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
@@ -143,6 +145,7 @@ class LlamaAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.dual_chunk_attention_config = dual_chunk_attention_config
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
@@ -175,6 +178,7 @@ class LlamaAttention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
             partial_rotary_factor=self.partial_rotary_factor,
+            dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
 
         if hasattr(config, "interleaved_sliding_window"):
@@ -190,6 +194,17 @@ class LlamaAttention(nn.Module):
         else:
             sliding_window = None
 
+        dca_recover_rate = os.getenv("VLLM_DCA_RECOVER_RATE", None)
+        if dca_recover_rate is not None:
+            dca_recover_rate = float(dca_recover_rate)
+        extra_args = {}
+        if dual_chunk_attention_config:
+            extra_args = {
+                "layer_idx": extract_layer_index(prefix),
+                "dual_chunk_attention_config": dual_chunk_attention_config,
+                "dca_recover_rate": dca_recover_rate,
+            }
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -200,6 +215,7 @@ class LlamaAttention(nn.Module):
             per_layer_sliding_window=sliding_window,
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
+            **extra_args,
         )
 
     def forward(
@@ -243,6 +259,10 @@ class LlamaDecoderLayer(nn.Module):
         if hasattr(config, 'qkv_bias'):
             attention_bias = config.qkv_bias
 
+        dual_chunk_attention_config = getattr(config,
+                                              "dual_chunk_attention_config",
+                                              None)
+
         # By default, Llama uses causal attention as it is a decoder-only model.
         # You can override the HF config with `is_causal=False` to enable
         # bidirectional attention, which is used in some embedding models
@@ -267,6 +287,7 @@ class LlamaDecoderLayer(nn.Module):
             cache_config=cache_config,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,

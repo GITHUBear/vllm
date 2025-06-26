@@ -970,7 +970,7 @@ class ModelConfig:
             from vllm.model_executor.model_loader.weight_utils import (
                 get_sparse_attention_config)
             sparse_attn_config = get_sparse_attention_config(self, load_config)
-            
+
             if sparse_attn_config:
                 self.hf_config.dual_chunk_attention_config[
                     "sparse_attention_config"] = sparse_attn_config
@@ -978,6 +978,22 @@ class ModelConfig:
                         self.hf_config.dual_chunk_attention_config:
                     self.hf_config.dual_chunk_attention_config[
                         "sparse_attention_enabled"] = True
+        elif (dca_recover_rate := os.getenv("VLLM_DCA_RECOVER_RATE", None)) is not None:
+            print("============== SET DUMMY DCA RECOVER RATE ================")
+            assert hasattr(self.hf_config, "max_position_embeddings")
+            origin_max_position_embeddings = self.hf_config.max_position_embeddings
+            self.hf_config.max_position_embeddings = 1000000
+            setattr(self.hf_config, "dual_chunk_attention_config", {
+                "chunk_size": 8192,
+                "local_size": 1024,
+                "original_max_position_embeddings": origin_max_position_embeddings
+            })
+            self.hf_config.dual_chunk_attention_config[
+                    "sparse_attention_config"] = None
+            self.hf_config.dual_chunk_attention_config[
+                    "sparse_attention_enabled"] = True
+
+        
 
     def verify_async_output_proc(self, parallel_config, speculative_config,
                                  device_config) -> None:
