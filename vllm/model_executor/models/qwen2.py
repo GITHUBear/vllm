@@ -181,7 +181,9 @@ class Qwen2Attention(nn.Module):
         dca_recover_rate = os.getenv("VLLM_DCA_RECOVER_RATE", None)
         if dca_recover_rate is not None:
             dca_recover_rate = float(dca_recover_rate)
-        extra_args = {}
+        extra_args = {
+            "layer_idx": extract_layer_index(prefix),
+        }
         if dual_chunk_attention_config:
             extra_args = {
                 "layer_idx": extract_layer_index(prefix),

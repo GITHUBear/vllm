@@ -31,7 +31,7 @@ for i in range(tp_size):
     attn_dataname = dirname + file_name
 
     with h5py.File(attn_dataname, 'r') as f_attn:
-        for j in range(27, layer_num, 1):
+        for j in range(0, layer_num, 1):
             key = f"{j}"
             attn_np = np.array(f_attn[key])
             attn_tensor = torch.from_numpy(attn_np).to(device="cuda:0")
@@ -66,25 +66,25 @@ for i in range(tp_size):
                 sidx = np.searchsorted(cum_slash_desc_np[head_id], s_total * recover_rate)
                 print(f"Layer {j} Head {actual_head_id} need {vidx} {vidx / klen * 100}% verticals & {sidx} {sidx / klen * 100}% slashes to recover")
 
-                vdatas = cum_vertical[head_id, ...].cpu().numpy()
-                sdatas = cum_slash[head_id, ...].cpu().numpy()
-                assert len(vdatas == sdatas)
-                x = np.arange(len(vdatas))
-                vy = vdatas
-                sy = sdatas
+                # vdatas = cum_vertical[head_id, ...].cpu().numpy()
+                # sdatas = cum_slash[head_id, ...].cpu().numpy()
+                # assert len(vdatas == sdatas)
+                # x = np.arange(len(vdatas))
+                # vy = vdatas
+                # sy = sdatas
 
-                plt.figure(figsize=(12, 6))
-                plt.plot(x, vy, color='blue', linewidth=1.5, label='Vertical CumSum')
-                plt.plot(x, sy, color='red', linewidth=1.5, label='Slash CumSum')
+                # plt.figure(figsize=(12, 6))
+                # plt.plot(x, vy, color='blue', linewidth=1.5, label='Vertical CumSum')
+                # plt.plot(x, sy, color='red', linewidth=1.5, label='Slash CumSum')
 
-                plt.title(f"Layer_{j} Head_{actual_head_id} Vertical & Slash Cumulative Sum")
-                plt.xlabel('Index')
-                plt.ylabel('Value')
-                plt.grid(True, linestyle='--', alpha=0.6)
-                plt.legend()
+                # plt.title(f"Layer_{j} Head_{actual_head_id} Vertical & Slash Cumulative Sum")
+                # plt.xlabel('Index')
+                # plt.ylabel('Value')
+                # plt.grid(True, linestyle='--', alpha=0.6)
+                # plt.legend()
 
-                plt.tight_layout()
-                print(f"save Layer {j} Head {actual_head_id} ...")
-                plt.savefig(f"./minference_fig2/vertical_L{j}_H{actual_head_id}_{recover_rate}.jpg")
-                plt.close()
-            exit(0)
+                # plt.tight_layout()
+                # print(f"save Layer {j} Head {actual_head_id} ...")
+                # plt.savefig(f"./minference_fig2/vertical_L{j}_H{actual_head_id}_{recover_rate}.jpg")
+                # plt.close()
+            # exit(0)

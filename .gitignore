@@ -228,3 +228,5 @@ attn_map_dump
 attn_map_dump2
 benchmarks/math/outputs
 benchmarks/math/*.out
+decode_attn_dump
+decode_attn_visual

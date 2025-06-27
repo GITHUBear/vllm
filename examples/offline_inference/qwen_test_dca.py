@@ -4,10 +4,10 @@ from urllib.request import urlopen
 
 from vllm import LLM, SamplingParams
 
-os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
+# os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
 os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
 os.environ["VLLM_USE_V1"] = "0"
-os.environ["VLLM_DCA_RECOVER_RATE"] = "0.9"
+# os.environ["VLLM_DCA_RECOVER_RATE"] = "0.9"
 # os.environ["VLLM_DCA_RECOVER_RATE"] = "0.9"
 # os.environ["CUDA_VISIBLE_DEVICES"]="4,5,6,7"
 
@@ -66,9 +66,9 @@ def initialize_engine() -> LLM:
     #           enable_chunked_prefill=True,
     #           max_num_batched_tokens=131072,
     #           trust_remote_code=True)
-    llm = LLM(model="unsloth/Meta-Llama-3.1-8B-Instruct",
+    llm = LLM(model="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
               max_model_len=1000000,
-              tensor_parallel_size=8,
+              tensor_parallel_size=4,
               enforce_eager=True,
               enable_chunked_prefill=True,
               max_num_batched_tokens=131072,
@@ -78,9 +78,9 @@ def initialize_engine() -> LLM:
 
 def main():
     llm = initialize_engine()
-    # process_requests(llm, ["Hello, world!"])
-    prompt = load_prompt()
-    process_requests(llm, [prompt])
+    process_requests(llm, ["Hello, world!"])
+    # prompt = load_prompt()
+    # process_requests(llm, [prompt])
 
 
 if __name__ == '__main__':
