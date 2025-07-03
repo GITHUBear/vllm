@@ -2,6 +2,7 @@
 
 import dataclasses
 import os
+import copy
 import time
 from abc import abstractmethod
 from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
@@ -129,6 +130,59 @@ class WorkerBase:
         """Get vocabulary size from model configuration."""
         return self.model_config.get_vocab_size()
 
+class RefWorkerBase(WorkerBase):
+    """
+    """
+    worker: WorkerBase
+
+    def __init__(
+        self,
+        referred_worker: WorkerBase,
+    ):
+        # Swallow-copy the refered worker to share KVCache and
+        # other configurations.
+        self.worker = copy.copy(referred_worker)
+
+    def init_device(self) -> None:
+        # Do nothing because referred_worker did it.
+        pass
+
+    def determine_num_available_blocks(self) -> Tuple[int, int]:
+        return 0, 0
+    
+    def initialize_cache(self, num_gpu_blocks: int,
+                         num_cpu_blocks: int) -> None:
+        pass
+
+    def load_model(self) -> None:
+        pass
+
+    def get_model(self) -> nn.Module:
+        return self.worker.get_model()
+
+    def execute_model(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None
+    ) -> Optional[List[SamplerOutput]]:
+        return self.worker.execute_model(execute_model_req)
+
+    def get_cache_block_size_bytes(self) -> int:
+        return self.worker.get_cache_block_size_bytes()
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        pass
+
+    def remove_lora(self, lora_id: int) -> bool:
+        pass
+
+    def pin_lora(self, lora_id: int) -> bool:
+        pass
+
+    def list_loras(self) -> Set[int]:
+        return self.worker.list_loras()
+
+    def __getattr__(self, attr):
+        return getattr(self.worker, attr)
 
 class DelegateWorkerBase(WorkerBase):
     """
@@ -390,7 +444,6 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         """Executes at least one model step on the given sequences, unless no
         sequences are provided."""
         start_time = time.perf_counter()
-
         inputs = self.prepare_input(execute_model_req)
         if inputs is None:
             return None

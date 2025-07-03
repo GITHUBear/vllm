@@ -1272,6 +1272,7 @@ def get_all_seq_ids_and_request_ids(
     return seq_ids, request_id_seq_ids_mapping
 
 
+# 这个类用于从 scorer 向 proposer 传递信息
 class HiddenStates(msgspec.Struct, array_like=True,
                    omit_defaults=True):  # type: ignore[call-arg]
     """Hidden states corresponding to in-progress sequences.

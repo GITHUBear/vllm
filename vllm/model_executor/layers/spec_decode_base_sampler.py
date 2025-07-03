@@ -102,7 +102,7 @@ class SpecDecodeBaseSampler(nn.Module):
         limits[~(accepted == 0).any(1)] = k
 
         # Create masks using the indices.
-        indices = torch.arange(k, device=accepted.device).unsqueeze(0)
+        indices = torch.arange(k, device=accepted.device).unsqueeze(0) # 1 * k
         accepted_mask = indices < limits.unsqueeze(1)
         after_false_mask = indices == limits.unsqueeze(1)
 

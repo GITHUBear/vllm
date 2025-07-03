@@ -2273,7 +2273,7 @@ class DeviceConfig:
 
 
 SpeculativeMethod = Literal["ngram", "eagle", "medusa", "mlp_speculator",
-                            "draft_model"]
+                            "draft_model", "standalone"]
 SpeculativeAcceptanceMethod = Literal["rejection_sampler",
                                       "typical_acceptance_sampler"]
 
@@ -2346,6 +2346,11 @@ class SpeculativeConfig:
     prompt_lookup_min: Optional[int] = None
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
+
+    # Standalone proposer configuration
+    kv_compress_recover_rate: Optional[float] = None
+    """KVCache compression recover rate, required when method is set
+    to standalone."""
 
     # Typical acceptance sampler configuration
     posterior_threshold: Optional[float] = None
@@ -2448,7 +2453,8 @@ class SpeculativeConfig:
                 (self.target_model_config.hf_text_config.model_type \
                         == "deepseek_v3" or
                     self.target_model_config.hf_text_config.model_type \
-                        == "mimo"):
+                        == "mimo" or
+                    self.method == "standalone"):
                 # use the draft model from the same model:
                 self.model = self.target_model_config.model
             elif self.method in ("ngram", "[ngram]"):
@@ -2494,6 +2500,19 @@ class SpeculativeConfig:
             # TODO: current we still need extract vocab_size from target model
             # config, in future, we may try refactor it out, and set
             # draft related config as None here.
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+        elif self.method == "standalone":
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            
+            if self.kv_compress_recover_rate is None:
+                self.kv_compress_recover_rate = 0.8
+            
+            if self.kv_compress_recover_rate <= 0 or self.kv_compress_recover_rate > 1:
+                raise ValueError(
+                    f"kv_compress_recover_rate={self.kv_compress_recover_rate} must be in range (0,1]")
+
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
         else:

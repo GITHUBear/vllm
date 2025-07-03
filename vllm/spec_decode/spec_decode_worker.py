@@ -38,6 +38,7 @@ from vllm.spec_decode.mlp_speculator_worker import MLPSpeculatorWorker
 from vllm.spec_decode.mqa_scorer import MQAScorer
 from vllm.spec_decode.multi_step_worker import MultiStepWorker
 from vllm.spec_decode.ngram_worker import NGramWorker
+from vllm.spec_decode.standalone_multi_step_worker import StandaloneMultiStepWorker
 from vllm.spec_decode.proposer_worker_base import ProposerWorkerBase
 from vllm.spec_decode.smaller_tp_proposer_worker import SmallerTpProposerWorker
 from vllm.spec_decode.target_model_runner import TargetModelRunner
@@ -47,7 +48,7 @@ from vllm.spec_decode.util import (Timer, create_logprobs_output,
                                    get_sampled_token_logprobs, nvtx_range,
                                    split_batch_by_proposal_len)
 from vllm.utils import resolve_obj_by_qualname
-from vllm.worker.worker_base import LoRANotSupportedWorkerBase, WorkerBase
+from vllm.worker.worker_base import LoRANotSupportedWorkerBase, WorkerBase, RefWorkerBase
 
 logger = init_logger(__name__)
 
@@ -79,21 +80,27 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
          speculative_config.disable_logprobs
 
     draft_worker_config = copy.deepcopy(vllm_config)
-    draft_worker_config.model_config = speculative_config.draft_model_config
-    draft_worker_config.quant_config = VllmConfig._get_quantization_config(
-        draft_worker_config.model_config,
-        vllm_config.load_config,
-    )
-    speculative_config.draft_parallel_config.worker_cls =\
-        draft_worker_config.parallel_config.sd_worker_cls
-    draft_worker_config.parallel_config = speculative_config.draft_parallel_config  # noqa
-    # TODO allow draft-model specific load config.
+    if speculative_config.method == "standalone":
+        draft_worker_config.model_config = None
+        draft_worker_config.quant_config = None
+        draft_worker_config.parallel_config = None
+    else:
+        draft_worker_config.model_config = speculative_config.draft_model_config
+        draft_worker_config.quant_config = VllmConfig._get_quantization_config(
+            draft_worker_config.model_config,
+            vllm_config.load_config,
+        )
+        speculative_config.draft_parallel_config.worker_cls =\
+            draft_worker_config.parallel_config.sd_worker_cls
+        draft_worker_config.parallel_config = speculative_config.draft_parallel_config  # noqa
+        # TODO allow draft-model specific load config.
 
     # Override draft-model specific worker args.
     draft_worker_kwargs.update(
         vllm_config=draft_worker_config,
         ngram_prompt_lookup_max=speculative_config.prompt_lookup_max,
         ngram_prompt_lookup_min=speculative_config.prompt_lookup_min,
+        standalone_kv_compress_recover_rate=speculative_config.kv_compress_recover_rate,
     )
 
     spec_decode_worker = SpecDecodeWorker.create_worker(
@@ -164,6 +171,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             draft_worker_kwargs.pop("ngram_prompt_lookup_max"))
         ngram_prompt_lookup_min = (
             draft_worker_kwargs.pop("ngram_prompt_lookup_min"))
+        standalone_kv_compress_recover_rate = (
+            draft_worker_kwargs.pop("standalone_kv_compress_recover_rate"))
         draft_model_config = draft_worker_kwargs["vllm_config"].model_config
         draft_parallel_config: ParallelConfig = draft_worker_kwargs[
             'vllm_config'].parallel_config
@@ -173,6 +182,11 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             proposer_worker = NGramWorker(**draft_worker_kwargs)
             proposer_worker.set_ngram_window_size(ngram_prompt_lookup_min,
                                                   ngram_prompt_lookup_max)
+        elif standalone_kv_compress_recover_rate is not None:
+            proposer_worker = StandaloneMultiStepWorker(
+                referred_worker=scorer_worker,
+                standalone_kv_compress_recover_rate=standalone_kv_compress_recover_rate,
+            )
         else:
             draft_tp = draft_parallel_config.tensor_parallel_size
             target_tp = scorer_worker.parallel_config.tensor_parallel_size
@@ -309,6 +323,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         """
         self.proposer_worker = proposer_worker
         self.scorer_worker = scorer_worker
+        self.is_standalone_mode = isinstance(self.proposer_worker, StandaloneMultiStepWorker)
         scorer_runner = getattr(self.scorer_worker, "model_runner", None)
         self.generators = scorer_runner.get_generators(
         ) if scorer_runner else None
@@ -427,7 +442,10 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         """
         num_gpu_blocks, num_cpu_blocks = (
             self.scorer_worker.determine_num_available_blocks())
-
+        
+        if issubclass(type(self.proposer_worker), RefWorkerBase):
+            return num_gpu_blocks, num_cpu_blocks
+        
         scorer_cache_block_size_bytes = (
             self.scorer_worker.get_cache_block_size_bytes())
         proposer_cache_block_size_bytes = (
@@ -458,6 +476,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         """Perform speculative decoding on the input batch.
         """
         if self.rank != self._driver_rank:
+            # 非 driver worker 的路径
             self._run_non_driver_rank()
             return []
 
@@ -538,7 +557,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
 
         if no_spec:
             return self._run_no_spec(execute_model_req,
-                                     skip_proposer=disable_all_speculation)
+                                     skip_proposer=(
+                                    disable_all_speculation or self.is_standalone_mode))
         return self._run_speculative_decoding_step(execute_model_req,
                                                    num_lookahead_slots)
 
@@ -740,13 +760,15 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             self.scorer_worker.execute_model()
 
         if not data["disable_all_speculation"]:
-            # Even if num_lookahead_slots is zero, we want to run the
-            # proposer model as it may have KV.
-            #
-            # We run the proposer once per lookahead slot. In the future we
-            # should delegate how many times it runs to the proposer.
-            for _ in range(max(num_lookahead_slots, 1)):
-                self.proposer_worker.execute_model()
+            # handle standalone mode
+            if not (data["no_spec"] and self.is_standalone_mode):
+                # Even if num_lookahead_slots is zero, we want to run the
+                # proposer model as it may have KV.
+                #
+                # We run the proposer once per lookahead slot. In the future we
+                # should delegate how many times it runs to the proposer.
+                for _ in range(max(num_lookahead_slots, 1)):
+                    self.proposer_worker.execute_model()
 
         if not data["no_spec"]:
             self.scorer_worker.execute_model()
