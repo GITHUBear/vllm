@@ -2,7 +2,9 @@
 
 import copy
 from collections import defaultdict
+from contextlib import contextmanager
 from functools import cached_property
+import math
 from typing import Any, Dict, List, Optional, Set, Tuple, Type
 
 import torch
@@ -101,6 +103,8 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
         ngram_prompt_lookup_max=speculative_config.prompt_lookup_max,
         ngram_prompt_lookup_min=speculative_config.prompt_lookup_min,
         standalone_kv_compress_recover_rate=speculative_config.kv_compress_recover_rate,
+        standalone_kv_compress_trigger_threshold=speculative_config.kv_compress_trigger_threshold,
+        sparse_index_gpu_memory_ratio=speculative_config.sparse_index_gpu_memory_ratio,
     )
 
     spec_decode_worker = SpecDecodeWorker.create_worker(
@@ -120,6 +124,17 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
 
     return spec_decode_worker
 
+@contextmanager
+def sparse_block_index_flag(execute_model_req: ExecuteModelRequest, standalone_mode: bool):
+    try:
+        if standalone_mode:
+            for sgm in execute_model_req.seq_group_metadata_list:
+                sgm.return_sparse_block_index = True
+        yield
+    finally:
+        if standalone_mode:
+            for sgm in execute_model_req.seq_group_metadata_list:
+                sgm.return_sparse_block_index = False
 
 # Reminder: Please update docs/source/features/compatibility_matrix.md
 # If the feature combo become valid
@@ -173,6 +188,10 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             draft_worker_kwargs.pop("ngram_prompt_lookup_min"))
         standalone_kv_compress_recover_rate = (
             draft_worker_kwargs.pop("standalone_kv_compress_recover_rate"))
+        standalone_kv_compress_trigger_threshold = (
+            draft_worker_kwargs.pop("standalone_kv_compress_trigger_threshold"))
+        sparse_index_gpu_memory_ratio = (
+            draft_worker_kwargs.pop("sparse_index_gpu_memory_ratio"))
         draft_model_config = draft_worker_kwargs["vllm_config"].model_config
         draft_parallel_config: ParallelConfig = draft_worker_kwargs[
             'vllm_config'].parallel_config
@@ -269,7 +288,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             spec_decode_sampler=spec_decode_sampler,
             allow_zero_draft_token_step=allow_zero_draft_token_step,
             enable_lm_head_weight_load=enable_lm_head_weight_load,
-            num_spec_prefill_steps=num_spec_prefill_steps)
+            num_spec_prefill_steps=num_spec_prefill_steps,
+            standalone_kv_compress_trigger_threshold=standalone_kv_compress_trigger_threshold,
+            sparse_index_gpu_memory_ratio=sparse_index_gpu_memory_ratio)
 
     def __init__(
         self,
@@ -284,6 +305,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         allow_zero_draft_token_step: Optional[bool] = True,
         enable_lm_head_weight_load: Optional[bool] = False,
         num_spec_prefill_steps: int = 1,
+        standalone_kv_compress_trigger_threshold: Optional[int] = None,
+        sparse_index_gpu_memory_ratio: Optional[float] = None,
     ):
         """
         Create a SpecDecodeWorker.
@@ -324,6 +347,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         self.proposer_worker = proposer_worker
         self.scorer_worker = scorer_worker
         self.is_standalone_mode = isinstance(self.proposer_worker, StandaloneMultiStepWorker)
+        self.standalone_kv_compress_trigger_threshold = (
+            standalone_kv_compress_trigger_threshold)
+        self.sparse_index_gpu_memory_ratio = sparse_index_gpu_memory_ratio
         scorer_runner = getattr(self.scorer_worker, "model_runner", None)
         self.generators = scorer_runner.get_generators(
         ) if scorer_runner else None
@@ -443,13 +469,32 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         num_gpu_blocks, num_cpu_blocks = (
             self.scorer_worker.determine_num_available_blocks())
         
-        if issubclass(type(self.proposer_worker), RefWorkerBase):
-            return num_gpu_blocks, num_cpu_blocks
-        
         scorer_cache_block_size_bytes = (
             self.scorer_worker.get_cache_block_size_bytes())
         proposer_cache_block_size_bytes = (
             self.proposer_worker.get_cache_block_size_bytes())
+        
+        if isinstance(self.proposer_worker, StandaloneMultiStepWorker):
+            total_gpu_mem_for_cache = num_gpu_blocks * scorer_cache_block_size_bytes
+            ratio = self.sparse_index_gpu_memory_ratio
+            gpu_mem_for_scorer = math.floor(total_gpu_mem_for_cache * (1 - ratio))
+            gpu_mem_for_standalone_proposer = math.floor(total_gpu_mem_for_cache * ratio)
+            new_num_gpu_blocks = gpu_mem_for_scorer // scorer_cache_block_size_bytes
+            proposer_num_gpu_blocks = gpu_mem_for_standalone_proposer // proposer_cache_block_size_bytes
+            # We set sparse_index_num_gpu_blocks here to avoid inconsistent interface.
+            proposer_num_gpu_blocks_tensor = torch.tensor([proposer_num_gpu_blocks], device=self.device)
+            torch.distributed.all_reduce(proposer_num_gpu_blocks_tensor, op=torch.distributed.ReduceOp.MIN)
+            self.proposer_worker.speculative_config.sparse_index_num_gpu_blocks = proposer_num_gpu_blocks_tensor.item()
+
+            msg = (f"Reserve {ratio * 10}% gpu memory from kvcache for sparse index blocks"
+                   "the current vLLM instance can use "
+                   f"{new_num_gpu_blocks} kvcache blocks "
+                   f"{proposer_num_gpu_blocks}(local) "
+                   f"{self.proposer_worker.speculative_config.sparse_index_num_gpu_blocks}(global) "
+                   "sparse index blocks")
+            logger.info(msg)
+
+            return new_num_gpu_blocks, num_cpu_blocks
 
         new_num_gpu_blocks = split_num_cache_blocks_evenly(
             scorer_cache_block_size_bytes, proposer_cache_block_size_bytes,
@@ -460,10 +505,12 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                          num_cpu_blocks: int) -> None:
         """Initialize the cache engine of the scorer and proposer workers.
         """
+        self.proposer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
+                                            num_cpu_blocks=num_cpu_blocks)
+        # Put scorer worker kvcache initialization after proposer worker.
+        # We need the sparse index cache to warmup cuda graph.
         self.scorer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
                                             num_cpu_blocks=num_cpu_blocks)
-        self.proposer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
-                                              num_cpu_blocks=num_cpu_blocks)
 
     def get_model(self) -> nn.Module:
         return self.scorer_worker.get_model()
@@ -690,7 +737,11 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         updated, so they cannot enable spec decode in the rest decoding.
         """
 
-        sampler_output = self.scorer_worker.execute_model(execute_model_req)
+        # TODO: Standalone Mode:
+        #  Retrieve slash & vertical index for each sequence group.
+        # TODO: return sparse block index when sequence length exceed threshold.        
+        with sparse_block_index_flag(execute_model_req, self.is_standalone_mode):
+            sampler_output = self.scorer_worker.execute_model(execute_model_req)
         assert len(sampler_output) == 1
         sampler_output = sampler_output[0]
 
@@ -812,8 +863,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                                "workers generate no tokens")
 
         execute_model_req.previous_hidden_states = None
-
-        with Timer() as scoring_timer:
+        with Timer() as scoring_timer, sparse_block_index_flag(execute_model_req, self.is_standalone_mode):
             proposal_scores = self.scorer.score_proposals(
                 execute_model_req,
                 proposals,

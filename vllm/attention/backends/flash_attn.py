@@ -1262,6 +1262,8 @@ class FlashAttentionImpl(AttentionImpl):
                 ) = get_seq_len_block_table_args(decode_meta, False, attn_type)
                 descale_shape = (seq_lens_arg.shape[0], key_cache.shape[-2])
 
+
+                # TODO
                 if self.dump_decode_attn:
                     assert seq_lens_arg.shape[0] == 1
                     decode_seq_len = seq_lens_arg[0].item()

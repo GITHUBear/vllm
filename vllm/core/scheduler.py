@@ -11,6 +11,7 @@ from typing import Sequence as GenericSequence
 from typing import Set, Tuple, Union
 
 from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
+from vllm.core.sparse_index_block_manager import SparseIndexBlockManager
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -431,6 +432,8 @@ class Scheduler:
         lora_config: Optional[LoRAConfig],
         pipeline_parallel_size: int = 1,
         output_proc_callback: Optional[Callable] = None,
+        sparse_index_num_gpu_blocks: int = None,
+        sparse_index_alloc_seqlen_threshold: int = None,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -463,6 +466,14 @@ class Scheduler:
             sliding_window=self.cache_config.sliding_window,
             enable_caching=self.cache_config.enable_prefix_caching,
         )
+
+        self.sparse_index_block_manager: SparseIndexBlockManager = None
+        if (sparse_index_num_gpu_blocks is not None and 
+            sparse_index_alloc_seqlen_threshold is not None):
+            self.sparse_index_block_manager = SparseIndexBlockManager(
+                sparse_index_num_gpu_blocks,
+                sparse_index_alloc_seqlen_threshold,
+            )
 
         # Sequence groups in the WAITING state.
         # Contain new prefill or preempted requests.
@@ -735,7 +746,9 @@ class Scheduler:
 
             # NOTE(woosuk): Preemption happens only when there is no available
             # slot to keep all the sequence groups in the RUNNING state.
-            while not self._can_append_slots(seq_group, enable_chunking):
+            while not (self._can_append_slots(seq_group, enable_chunking) and
+                       (self.sparse_index_block_manager is None or 
+                        self.sparse_index_block_manager.can_allocate(seq_group) == AllocStatus.OK)):
                 budget.subtract_num_batched_tokens(seq_group.request_id,
                                                    num_running_tokens)
                 num_running_seqs = seq_group.get_max_num_running_seqs()
@@ -786,6 +799,8 @@ class Scheduler:
                     break
             else:
                 self._append_slots(seq_group, blocks_to_copy, enable_chunking)
+                if self.sparse_index_block_manager is not None:
+                    self.sparse_index_block_manager.allocate(seq_group)
                 is_prefill = seq_group.is_prefill()
 
                 scheduled_seq_group: ScheduledSequenceGroup = (
@@ -875,6 +890,17 @@ class Scheduler:
                 swapped_queue.popleft()
                 continue
 
+            if self.sparse_index_block_manager is not None:
+                alloc_status = self.sparse_index_block_manager.can_allocate(seq_group)
+                if alloc_status == AllocStatus.LATER:
+                    break
+                elif alloc_status == AllocStatus.NEVER:
+                    for seq in seq_group.get_seqs():
+                        seq.status = SequenceStatus.FINISHED_IGNORED
+                    infeasible_seq_groups.append(seq_group)
+                    swapped_queue.popleft()
+                    continue
+
             lora_int_id = 0
             if self.lora_enabled:
                 lora_int_id = seq_group.lora_int_id
@@ -907,6 +933,9 @@ class Scheduler:
             swapped_queue.popleft()
             self._swap_in(seq_group, blocks_to_swap_in)
             self._append_slots(seq_group, blocks_to_copy, enable_chunking)
+            if self.sparse_index_block_manager is not None:
+                self.sparse_index_block_manager.allocate(seq_group)
+            
             if is_prefill:
                 prefill_seq_groups.append(
                     ScheduledSequenceGroup(
@@ -1139,6 +1168,17 @@ class Scheduler:
                 waiting_queue.popleft()
                 continue
 
+            if self.sparse_index_block_manager is not None:
+                can_allocate = self.sparse_index_block_manager.can_allocate(seq_group)
+                if can_allocate == AllocStatus.LATER:
+                    break
+                elif can_allocate == AllocStatus.NEVER:
+                    for seq in waiting_seqs:
+                        seq.status = SequenceStatus.FINISHED_IGNORED
+                    ignored_seq_groups.append(seq_group)
+                    waiting_queue.popleft()
+                    continue
+
             # We cannot mix sequence groups that use prompt embeds and
             # those that do not.
             if len(seq_groups) == 0:
@@ -1181,6 +1221,8 @@ class Scheduler:
                 curr_loras.add(lora_int_id)
             waiting_queue.popleft()
             self._allocate_and_set_running(seq_group)
+            if self.sparse_index_block_manager is not None:
+                self.sparse_index_block_manager.allocate(seq_group)
 
             if partial_prefill_metadata is not None:
                 partial_prefill_metadata.maybe_increment_partial_prefills(
@@ -1693,6 +1735,9 @@ class Scheduler:
             if seq.is_finished():
                 self.free_seq(seq)
 
+                if self.sparse_index_block_manager is not None:
+                    self.sparse_index_block_manager.free(seq)
+
     def _free_finished_seq_group(self, seq_group: SequenceGroup) -> None:
         if seq_group.is_finished():
             # Free cross-attention block table, if it exists
@@ -1826,6 +1871,8 @@ class Scheduler:
         for seq in seqs:
             seq.status = SequenceStatus.WAITING
             self.free_seq(seq)
+            if self.sparse_index_block_manager is not None:
+                self.sparse_index_block_manager.free(seq)
             seq.reset_state_for_recompute()
         self._free_seq_group_cross_attn_blocks(seq_group)
 
@@ -1835,6 +1882,10 @@ class Scheduler:
         blocks_to_swap_out: List[Tuple[int, int]],
     ) -> None:
         self._swap_out(seq_group, blocks_to_swap_out)
+        # Only swap out kvcache, sparse index should always be recomputed.
+        for seq in seq_group.seqs:
+            if self.sparse_index_block_manager is not None:
+                self.sparse_index_block_manager.free(seq)
 
     def _swap_in(
         self,

@@ -2351,6 +2351,18 @@ class SpeculativeConfig:
     kv_compress_recover_rate: Optional[float] = None
     """KVCache compression recover rate, required when method is set
     to standalone."""
+    kv_compress_trigger_threshold: Optional[int] = None
+    """The sequence length threshold to trigger kv compression.
+    """
+    sparse_index_gpu_memory_ratio: Optional[float] = None
+    """The gpu memory ratio of sparse index.
+    """
+    sparse_index_max_vertical_slash_topk: Optional[int] = None
+    """Max topk for vertical and slash index.
+    """
+    sparse_index_num_gpu_blocks: Optional[int] = None
+    """The number of sparse index gpu blocks need to be allocated.
+    """
 
     # Typical acceptance sampler configuration
     posterior_threshold: Optional[float] = None
@@ -2512,6 +2524,15 @@ class SpeculativeConfig:
             if self.kv_compress_recover_rate <= 0 or self.kv_compress_recover_rate > 1:
                 raise ValueError(
                     f"kv_compress_recover_rate={self.kv_compress_recover_rate} must be in range (0,1]")
+            
+            if self.kv_compress_trigger_threshold is None:
+                self.kv_compress_trigger_threshold = 1024
+
+            if self.sparse_index_gpu_memory_ratio is None:
+                self.sparse_index_gpu_memory_ratio = 0.1
+            
+            if self.sparse_index_max_vertical_slash_topk is None:
+                self.sparse_index_max_vertical_slash_topk = 25000
 
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config

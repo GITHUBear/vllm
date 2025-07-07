@@ -12,6 +12,7 @@ from vllm.spec_decode.interfaces import (SpeculativeProposals,
 from vllm.spec_decode.proposer_worker_base import ProposerWorkerBase
 from vllm.spec_decode.top1_proposer import Top1Proposer
 from vllm.worker.worker_base import RefWorkerBase, WorkerBase
+from vllm.worker.sparse_index_block_cache_engine import SparseIndexBlockCacheEngine
 
 class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
     def __init__(
@@ -25,6 +26,7 @@ class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
         self.standalone_kv_compress_recover_rate = standalone_kv_compress_recover_rate
         # Lazy initialization list.
         self._proposer: SpeculativeProposer
+        self.sparse_index_gpu_cache = None
     
     def init_device(self) -> None:
         self.worker.init_device()
@@ -33,6 +35,23 @@ class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
             self.device,
             self.vocab_size,
             max_proposal_len=self.max_model_len,
+        )
+    
+    def get_cache_block_size_bytes(self) -> int:
+        return SparseIndexBlockCacheEngine.get_cache_block_size(
+            self.model_config,
+            self.parallel_config,
+            self.speculative_config,
+        )
+    
+    # TODO:initialize_cache
+    def initialize_cache(self, num_gpu_blocks: int,
+                         num_cpu_blocks: int) -> None:
+        self.sparse_index_gpu_cache = (
+            SparseIndexBlockCacheEngine(
+                self.model_config, self.parallel_config,
+                self.device_config, self.speculative_config,
+            )
         )
     
     def set_include_gpu_probs_tensor(self) -> None:
@@ -88,6 +107,7 @@ class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
         # Run model sample_len times.
         model_outputs: List[SamplerOutput] = []
         for _ in range(sample_len):
+            # TODO: Apply vertical & slash index for attention metadata.
             model_output: List[SamplerOutput] = self.worker.execute_model(
                     execute_model_req=new_execute_model_req)
             assert (len(model_output) == 1

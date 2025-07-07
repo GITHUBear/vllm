@@ -358,7 +358,9 @@ class LLMEngine:
                 self.scheduler_config, self.cache_config, self.lora_config,
                 self.parallel_config.pipeline_parallel_size,
                 self.async_callbacks[v_id]
-                if self.model_config.use_async_output_proc else None)
+                if self.model_config.use_async_output_proc else None,
+                self.speculative_config.sparse_index_num_gpu_blocks,
+                self.speculative_config.kv_compress_trigger_threshold)
             for v_id in range(self.parallel_config.pipeline_parallel_size)
         ]
 

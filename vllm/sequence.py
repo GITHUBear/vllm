@@ -1047,6 +1047,18 @@ class SequenceGroupMetadata(
     # TODO: We should maintain this states out of the sequence group.
     num_speculative_tokens: Optional[int] = None
 
+    # 
+    return_sparse_block_index: bool = False
+    # Speculative Decoding disables Beam Search, so we use list 
+    # instead of dict.
+    # 
+    # num_layer * num_head * vertical_topk_indices
+    # vertical_indices: Optional[list[list[int]]] = None
+    # vertical_indices_gpu_cached: Optional[torch.Tensor] = None
+    # num_layer * num_head * slash_topk_indices
+    # slash_indices: Optional[list[list[int]]] = None
+    # slash_indices_gpu_cached: 
+
     def __post_init__(self):
         if self.seq_data is not None and self.token_chunk_size is None:
             if self.is_prompt:

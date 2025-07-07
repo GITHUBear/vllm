@@ -1499,6 +1499,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         return self.prompt_adapter_manager.list_adapters()
 
     @torch.inference_mode()
+    # TODO[shk]: capture cuda graph if sparse index is enabled.
     def capture_model(self, kv_caches: List[List[torch.Tensor]]) -> None:
         """Cuda graph capture a model.
 
