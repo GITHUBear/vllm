@@ -434,6 +434,7 @@ class Scheduler:
         output_proc_callback: Optional[Callable] = None,
         sparse_index_num_gpu_blocks: int = None,
         sparse_index_alloc_seqlen_threshold: int = None,
+        sparse_index_recompute_step: int = None,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -473,6 +474,7 @@ class Scheduler:
             self.sparse_index_block_manager = SparseIndexBlockManager(
                 sparse_index_num_gpu_blocks,
                 sparse_index_alloc_seqlen_threshold,
+                sparse_index_recompute_step,
             )
 
         # Sequence groups in the WAITING state.
@@ -1672,6 +1674,10 @@ class Scheduler:
                         if scheduler_outputs.num_prefill_groups > 0 else None),
                     prompt_adapter_request=seq_group.prompt_adapter_request,
                 )
+                if self.sparse_index_block_manager is not None:
+                    self.sparse_index_block_manager.build_seq_group_meta_sparse_index_table(
+                        sgm=seq_group_metadata
+                    )
             else:
                 # When SPMD mode is enabled, we only send delta data except for
                 # the first request to reduce serialization cost.
@@ -1687,11 +1693,48 @@ class Scheduler:
                     token_chunk_size=token_chunk_size,
                     computed_block_nums=common_computed_block_nums,
                 )
+                if self.sparse_index_block_manager is not None:
+                    self.sparse_index_block_manager.build_seq_group_metadelta_sparse_index_table(
+                        seq_data=seq_data,
+                        sgmd=seq_group_metadata,
+                    )
             seq_group_metadata_list.append(seq_group_metadata)
 
             if allow_async_output_proc:
                 allow_async_output_proc = self._allow_async_output_proc(
                     seq_group)
+
+        if self.sparse_index_block_manager is not None:
+            # Sort sequence group metadata in the following order:
+            # prefill -> sparse index need to be recompute -> enable sparse index -> normal decode
+            #            |<--------------- sparse decode ---------------------->|
+            #            |<------------------------------------ decode ------------------------->|
+            prefill_sgm = []
+            sparse_index_recompute_sgm = []
+            sparse_index_sgm = []
+            decode_sgm = []
+            for sgm in seq_group_metadata_list:
+                assert len(sgm.seq_data) == 1
+                seq_data = next(iter(sgm.seq_data.values()))
+
+                if seq_data.stage == SequenceStage.PREFILL:
+                    prefill_sgm.append(sgm)
+                    continue
+
+                if seq_data.need_recompute_sparse_index(self.sparse_index_block_manager.recompute_step):
+                    sparse_index_recompute_sgm.append(sgm)
+                    continue
+
+                if seq_data.enable_sparse_index():
+                    sparse_index_sgm.append(sgm)
+                    continue
+
+                decode_sgm.append(sgm)
+            
+            prefill_sgm.extend(sparse_index_recompute_sgm)
+            prefill_sgm.extend(sparse_index_sgm)
+            prefill_sgm.extend(decode_sgm)
+            seq_group_metadata_list = prefill_sgm
 
         # Now that the batch has been created, we can assume all blocks in the
         # batch will have been computed before the next scheduling invocation.

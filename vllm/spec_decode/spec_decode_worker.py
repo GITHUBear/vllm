@@ -124,17 +124,17 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
 
     return spec_decode_worker
 
-@contextmanager
-def sparse_block_index_flag(execute_model_req: ExecuteModelRequest, standalone_mode: bool):
-    try:
-        if standalone_mode:
-            for sgm in execute_model_req.seq_group_metadata_list:
-                sgm.return_sparse_block_index = True
-        yield
-    finally:
-        if standalone_mode:
-            for sgm in execute_model_req.seq_group_metadata_list:
-                sgm.return_sparse_block_index = False
+# @contextmanager
+# def sparse_block_index_flag(execute_model_req: ExecuteModelRequest, standalone_mode: bool):
+#     try:
+#         if standalone_mode:
+#             for sgm in execute_model_req.seq_group_metadata_list:
+#                 sgm.return_sparse_block_index = True
+#         yield
+#     finally:
+#         if standalone_mode:
+#             for sgm in execute_model_req.seq_group_metadata_list:
+#                 sgm.return_sparse_block_index = False
 
 # Reminder: Please update docs/source/features/compatibility_matrix.md
 # If the feature combo become valid
@@ -565,7 +565,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         # are called normally.
         # We expect `num_speculative_tokens` to be None for prefills.
         no_spec = (num_lookahead_slots == 0 or disable_all_speculation
-                   or all_zero_spec_tokens)
+                   or all_zero_spec_tokens or self.is_standalone_mode)
 
         # Broadcast how many lookahead slots are scheduled for this step, and
         # whether all speculation is disabled, to all non-driver workers.
@@ -726,7 +726,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             output_index += 1
 
         return [SamplerOutput(outputs=completion_seq_group_output_list)]
-
+    
     @nvtx_range("spec_decode_worker._run_no_spec")
     def _run_no_spec(self, execute_model_req: ExecuteModelRequest,
                      skip_proposer: bool) -> List[SamplerOutput]:
@@ -736,12 +736,14 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         not called, meaning that the kv-cache in proposer for requests is not
         updated, so they cannot enable spec decode in the rest decoding.
         """
-
         # TODO: Standalone Mode:
         #  Retrieve slash & vertical index for each sequence group.
         # TODO: return sparse block index when sequence length exceed threshold.        
-        with sparse_block_index_flag(execute_model_req, self.is_standalone_mode):
-            sampler_output = self.scorer_worker.execute_model(execute_model_req)
+        # with sparse_block_index_flag(execute_model_req, self.is_standalone_mode):
+        # if all_seq_forward_with_sparse_index:
+        #     pass
+        # else:
+        sampler_output = self.scorer_worker.execute_model(execute_model_req)
         assert len(sampler_output) == 1
         sampler_output = sampler_output[0]
 
@@ -863,7 +865,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                                "workers generate no tokens")
 
         execute_model_req.previous_hidden_states = None
-        with Timer() as scoring_timer, sparse_block_index_flag(execute_model_req, self.is_standalone_mode):
+        with Timer() as scoring_timer:
             proposal_scores = self.scorer.score_proposals(
                 execute_model_req,
                 proposals,

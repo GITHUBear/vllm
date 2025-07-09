@@ -2363,6 +2363,9 @@ class SpeculativeConfig:
     sparse_index_num_gpu_blocks: Optional[int] = None
     """The number of sparse index gpu blocks need to be allocated.
     """
+    sparse_index_recompute_step: Optional[int] = None
+    """Recompute sparse index after sparse_index_recompute_step decoding.
+    """
 
     # Typical acceptance sampler configuration
     posterior_threshold: Optional[float] = None
@@ -2533,6 +2536,9 @@ class SpeculativeConfig:
             
             if self.sparse_index_max_vertical_slash_topk is None:
                 self.sparse_index_max_vertical_slash_topk = 25000
+            
+            if self.sparse_index_recompute_step is None:
+                self.sparse_index_recompute_step = 128
 
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config

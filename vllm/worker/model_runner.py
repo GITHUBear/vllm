@@ -266,6 +266,9 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             reinit: bool = False,
             reinit_use_defaults: bool = False,
             encoder_seq_len: int = 0,
+            is_sparse_index_recompute: bool = False,
+            is_sparse_index: bool = False,
+            sparse_index_block: Optional[Dict[int, int]] = None
         ):
             if reinit:
                 assert len(self.seq_ids) == len(seq_ids)  # type: ignore
@@ -276,7 +279,12 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
             self.request_id = request_id
             self.is_prompt = is_prompt
+            self.is_sparse_index_recompute = is_sparse_index_recompute
+            self.is_sparse_index = is_sparse_index
             self.block_tables = block_tables
+            self.sparse_index_block = sparse_index_block
+            if self.is_sparse_index or self.is_sparse_index_recompute:
+                assert self.sparse_index_block is not None
             self.computed_block_nums = computed_block_nums
             self.n_seqs = n_seqs
             self.encoder_seq_len = encoder_seq_len
@@ -780,6 +788,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         seq_ids = seq_group_metadata.seq_data.keys()
         n_seqs = len(seq_ids)
         is_prompt = seq_group_metadata.is_prompt
+        is_sparse_index_recompute = seq_group_metadata.need_recompute_sparse_index(
+            recompute_index_step=self.runner.sparse_index_recompute_step,
+        )
+        is_sparse_index = is_sparse_index_recompute or seq_group_metadata.enable_sparse_index()
 
         if is_prompt:
             assert n_seqs == 1
@@ -798,7 +810,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             computed_block_nums=seq_group_metadata.computed_block_nums,
             reinit=True,
             reinit_use_defaults=True,
-            encoder_seq_len=encoder_seq_len)
+            encoder_seq_len=encoder_seq_len,
+            is_sparse_index_recompute=is_sparse_index_recompute,
+            is_sparse_index=is_sparse_index,
+            sparse_index_block=seq_group_metadata.sparse_index_table)
 
         self.inter_data_list.append(inter_data)
 
@@ -1092,6 +1107,13 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.max_seq_len_to_capture = self.model_config.max_seq_len_to_capture
         self.max_batchsize_to_capture = \
             self.vllm_config.compilation_config.max_capture_size
+        self.sparse_index_recompute_step = None
+        self.sparse_index_kv_compress_recover_rate = None
+        if self.vllm_config.speculative_config is not None:
+            self.sparse_index_recompute_step = \
+                self.vllm_config.speculative_config.sparse_index_recompute_step
+            self.sparse_index_kv_compress_recover_rate = \
+                self.vllm_config.speculative_config.kv_compress_recover_rate
 
         #
         self.graph_runners: List[Dict[Tuple[int, bool], CUDAGraphRunner]] = [
@@ -1787,6 +1809,8 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         assert model_input.attn_metadata is not None
         prefill_meta = model_input.attn_metadata.prefill_metadata
         decode_meta = model_input.attn_metadata.decode_metadata
+        if decode_meta is None:
+            decode_meta = model_input.attn_metadata.sparse_index_decode_metadata
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine

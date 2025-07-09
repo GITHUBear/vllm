@@ -105,6 +105,7 @@ class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
         new_execute_model_req.seq_group_metadata_list = seq_group_metadata_list_copy
 
         # Run model sample_len times.
+        # TODO: optimize it.
         model_outputs: List[SamplerOutput] = []
         for _ in range(sample_len):
             # TODO: Apply vertical & slash index for attention metadata.

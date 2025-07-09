@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from collections.abc import Sequence as GenericSequence
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, Tuple
 
 import msgspec
 import torch
@@ -144,6 +144,7 @@ class SequenceDataDelta(
     new_num_computed_tokens: int
     # Overwriting existing `stage`.
     new_stage: SequenceStage
+    num_computed_tokens_when_enable_sparse_index: Optional[int] = None
 
 
 class SequenceData(msgspec.Struct,
@@ -187,6 +188,25 @@ class SequenceData(msgspec.Struct,
 
     # It is used to compute mrope_position_ids.
     _mrope_position_delta: Optional[int] = None
+    _num_computed_tokens_when_enable_sparse_index: Optional[int] = None
+
+    def need_recompute_sparse_index(self, recompute_index_step: int) -> bool:
+        if self._num_computed_tokens_when_enable_sparse_index is None:
+            return False
+        if self._num_computed_tokens < self._num_computed_tokens_when_enable_sparse_index:
+            return False
+        return (self._num_computed_tokens - self._num_computed_tokens_when_enable_sparse_index) % recompute_index_step == 0
+    
+    def enable_sparse_index(self) -> bool:
+        if self._num_computed_tokens_when_enable_sparse_index is None:
+            return False
+        return self._num_computed_tokens >= self._num_computed_tokens_when_enable_sparse_index
+    
+    def set_num_computed_tokens_when_enable_sparse_index(self):
+        self._num_computed_tokens_when_enable_sparse_index = self._num_computed_tokens
+
+    def reset_num_computed_tokens_when_enable_sparse_index(self):
+        self._num_computed_tokens_when_enable_sparse_index = None
 
     @staticmethod
     def from_prompt_token_counts(
@@ -423,7 +443,8 @@ class SequenceData(msgspec.Struct,
     def get_delta_and_reset(self) -> SequenceDataDelta:
         delta = SequenceDataDelta(self._new_appended_tokens,
                                   self._cumulative_logprob,
-                                  self.get_num_computed_tokens(), self.stage)
+                                  self.get_num_computed_tokens(), self.stage,
+                                  self._num_computed_tokens_when_enable_sparse_index)
         # Reset delta state.
         self._new_appended_tokens = []
         return delta
@@ -432,6 +453,7 @@ class SequenceData(msgspec.Struct,
         self._num_computed_tokens = delta.new_num_computed_tokens
         self._cumulative_logprob = delta.new_cumulative_logprob
         self._stage = delta.new_stage
+        self._num_computed_tokens_when_enable_sparse_index = delta.num_computed_tokens_when_enable_sparse_index
         self._output_token_ids.extend(delta.new_output_token_ids)
         self._cached_all_token_ids.extend(delta.new_output_token_ids)
 
@@ -982,6 +1004,7 @@ class SequenceGroupMetadataDelta(
     computed_block_nums: Optional[list[int]] = None
     state: Optional[SequenceGroupState] = msgspec.field(
         default_factory=lambda: SequenceGroupState())
+    sparse_index_table: dict[int, int] = None
 
 
 class SequenceGroupMetadata(
@@ -1046,18 +1069,8 @@ class SequenceGroupMetadata(
     # Zero means speculative decoding is disabled for some reasons.
     # TODO: We should maintain this states out of the sequence group.
     num_speculative_tokens: Optional[int] = None
-
-    # 
-    return_sparse_block_index: bool = False
-    # Speculative Decoding disables Beam Search, so we use list 
-    # instead of dict.
-    # 
-    # num_layer * num_head * vertical_topk_indices
-    # vertical_indices: Optional[list[list[int]]] = None
-    # vertical_indices_gpu_cached: Optional[torch.Tensor] = None
-    # num_layer * num_head * slash_topk_indices
-    # slash_indices: Optional[list[list[int]]] = None
-    # slash_indices_gpu_cached: 
+    # seq_id -> sparse_blk_id
+    sparse_index_table: dict[int, int] = None
 
     def __post_init__(self):
         if self.seq_data is not None and self.token_chunk_size is None:
@@ -1066,6 +1079,20 @@ class SequenceGroupMetadata(
                     self.seq_data.values())).get_len()
             else:
                 self.token_chunk_size = 1
+
+    def need_recompute_sparse_index(self, recompute_index_step: Optional[int]) -> bool:
+        if recompute_index_step is None:
+            return False
+        if len(self.seq_data) != 1:
+            return False
+        data = next(iter(self.seq_data.values()))
+        return data.need_recompute_sparse_index(recompute_index_step)
+    
+    def enable_sparse_index(self) -> bool:
+        if len(self.seq_data) != 1:
+            return False
+        data = next(iter(self.seq_data.values()))
+        return data.enable_sparse_index()
 
     @property
     def lora_int_id(self) -> int:
@@ -1104,6 +1131,7 @@ class SequenceGroupMetadata(
         self.token_chunk_size = sequence_group_metadata_delta.token_chunk_size
         self.do_sample = sequence_group_metadata_delta.do_sample
         self.is_prompt = sequence_group_metadata_delta.is_prompt
+        self.sparse_index_table = sequence_group_metadata_delta.sparse_index_table
 
     def finish_step(self) -> None:
         assert self.state is not None

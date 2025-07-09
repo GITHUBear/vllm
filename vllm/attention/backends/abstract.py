@@ -139,6 +139,11 @@ class AttentionMetadata:
         """Return the attention metadata that's required to run prefill
         attention."""
         pass
+    
+    @property
+    @abstractmethod
+    def sparse_index_decode_metadata(self) -> Optional["AttentionMetadata"]:
+        return None
 
     @property
     @abstractmethod

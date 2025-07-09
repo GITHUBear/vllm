@@ -173,8 +173,12 @@ class FlashAttentionMetadata(AttentionMetadata):
 
     prompt_lens: Optional[List[int]] = None
 
+    max_sparse_index_decode_seq_len: Optional[int] = None
+    max_sparse_index_decode_query_len: Optional[int] = None
+
     _cached_prefill_metadata: Optional["FlashAttentionMetadata"] = None
     _cached_decode_metadata: Optional["FlashAttentionMetadata"] = None
+    _cached_sparse_index_decode_metadata: Optional["FlashAttentionMetadata"] = None
 
     # Begin encoder attn & enc/dec cross-attn fields...
 
@@ -194,6 +198,11 @@ class FlashAttentionMetadata(AttentionMetadata):
     # and block tables
     cross_slot_mapping: Optional[torch.Tensor] = None
     cross_block_tables: Optional[torch.Tensor] = None
+
+    num_sparse_index_recomputes: int = 0
+    num_sparse_index_recompute_tokens: int = 0
+    num_sparse_index_decodes: int = 0
+    num_sparse_index_tokens: int = 0
 
     @property
     def is_all_encoder_attn_metadata_set(self):
@@ -270,6 +279,55 @@ class FlashAttentionMetadata(AttentionMetadata):
             cross_slot_mapping=self.cross_slot_mapping,
             cross_block_tables=self.cross_block_tables)
         return self._cached_prefill_metadata
+    
+    @property
+    def sparse_index_decode_metadata(self) -> Optional["FlashAttentionMetadata"]:
+        if self.num_sparse_index_tokens == 0:
+            return None
+        
+        if self._cached_sparse_index_decode_metadata is not None:
+            return self._cached_sparse_index_decode_metadata
+        
+        assert ((self.seq_lens_tensor is not None)
+                or (self.encoder_seq_lens_tensor is not None))
+        
+        token_ed = self.num_prefill_tokens + self.num_sparse_index_tokens
+        query_ed = self.num_prefills + self.num_sparse_index_decodes
+        slot_mapping = (None if self.slot_mapping is None else
+                        self.slot_mapping[self.num_prefill_tokens:token_ed])
+        seq_lens_tensor = (None if self.seq_lens_tensor is None else
+                           self.seq_lens_tensor[self.num_prefills:query_ed])
+        block_tables = (None if self.block_tables is None else
+                        self.block_tables[self.num_prefills:query_ed])
+        prompt_lens = (None if self.prompt_lens is None else
+                       self.prompt_lens[self.num_prefills:query_ed])
+        
+        self._cached_sparse_index_decode_metadata = FlashAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decode_tokens=self.num_sparse_index_tokens,
+            slot_mapping=slot_mapping,
+            multi_modal_placeholder_index_maps=None,
+            enable_kv_scales_calculation=True,
+            seq_lens=None,
+            seq_lens_tensor=seq_lens_tensor,
+            max_decode_query_len=self.max_sparse_index_decode_query_len,
+            max_query_len=self.max_query_len,
+            max_prefill_seq_len=0,
+            max_decode_seq_len=self.max_sparse_index_decode_seq_len,
+            # Batch may be composed of prefill|decodes, adjust query start
+            # indices to refer to the start of decodes. E.g.
+            # in tokens:[3 prefills|6 decodes], query_start_loc=[3,9] => [0,6].
+            query_start_loc=(self.query_start_loc[self.num_prefills:query_ed] -
+                             self.query_start_loc[self.num_prefills])
+            if self.query_start_loc is not None else None,
+            seq_start_loc=self.seq_start_loc[self.num_prefills:query_ed]
+            if self.seq_start_loc is not None else None,
+            prompt_lens=prompt_lens,
+            context_lens_tensor=None,
+            block_tables=block_tables,
+            use_cuda_graph=self.use_cuda_graph)
+        return self._cached_sparse_index_decode_metadata
 
     @property
     def decode_metadata(self) -> Optional["FlashAttentionMetadata"]:
@@ -283,13 +341,13 @@ class FlashAttentionMetadata(AttentionMetadata):
 
         # Compute some attn_metadata fields which default to None
         slot_mapping = (None if self.slot_mapping is None else
-                        self.slot_mapping[self.num_prefill_tokens:])
+                        self.slot_mapping[self.num_prefill_tokens+self.num_sparse_index_tokens:])
         seq_lens_tensor = (None if self.seq_lens_tensor is None else
-                           self.seq_lens_tensor[self.num_prefills:])
+                           self.seq_lens_tensor[self.num_prefills+self.num_sparse_index_decodes:])
         block_tables = (None if self.block_tables is None else
-                        self.block_tables[self.num_prefills:])
+                        self.block_tables[self.num_prefills+self.num_sparse_index_decodes:])
         prompt_lens = (None if self.prompt_lens is None else
-                       self.prompt_lens[self.num_prefills:])
+                       self.prompt_lens[self.num_prefills+self.num_sparse_index_decodes:])
 
         self._cached_decode_metadata = FlashAttentionMetadata(
             num_prefills=0,
@@ -307,10 +365,10 @@ class FlashAttentionMetadata(AttentionMetadata):
             # Batch may be composed of prefill|decodes, adjust query start
             # indices to refer to the start of decodes. E.g.
             # in tokens:[3 prefills|6 decodes], query_start_loc=[3,9] => [0,6].
-            query_start_loc=(self.query_start_loc[self.num_prefills:] -
-                             self.query_start_loc[self.num_prefills])
+            query_start_loc=(self.query_start_loc[self.num_prefills+self.num_sparse_index_decodes:] -
+                             self.query_start_loc[self.num_prefills+self.num_sparse_index_decodes])
             if self.query_start_loc is not None else None,
-            seq_start_loc=self.seq_start_loc[self.num_prefills:]
+            seq_start_loc=self.seq_start_loc[self.num_prefills+self.num_sparse_index_decodes:]
             if self.seq_start_loc is not None else None,
             prompt_lens=prompt_lens,
             context_lens_tensor=None,
@@ -418,10 +476,15 @@ class FlashAttentionMetadataBuilder(
             str,
             MultiModalPlaceholderMap] = defaultdict(MultiModalPlaceholderMap)
         self.num_prefills = 0
+        self.num_sparse_index_decodes = 0
+        self.num_sparse_index_recomputes = 0
         self.num_prefill_tokens = 0
         self.num_decode_tokens = 0
         self.has_prefix_cache_hit = False
         self.prompt_lens: List[int] = []
+        self.num_sparse_index_recompute_tokens = 0
+        self.num_sparse_index_tokens = 0
+        self.use_sparse_index_seq_lens: List[int] = []
 
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
@@ -432,6 +495,8 @@ class FlashAttentionMetadataBuilder(
         3. slot mapping.
         """
         is_prompt = inter_data.is_prompt
+        is_sparse_index_recompute = inter_data.is_sparse_index_recompute
+        is_sparse_index = inter_data.is_sparse_index
         block_tables = inter_data.block_tables
 
         for (seq_id, token_len, seq_len, curr_seq_len, query_len, context_len,
@@ -454,6 +519,13 @@ class FlashAttentionMetadataBuilder(
                 self.num_prefills += 1
                 self.num_prefill_tokens += token_len
                 self.prefill_seq_lens.append(seq_len)
+            elif is_sparse_index:
+                self.num_sparse_index_decodes += 1
+                self.num_sparse_index_tokens += query_len
+                self.use_sparse_index_seq_lens.append(curr_seq_len)
+                if is_sparse_index_recompute:
+                    self.num_sparse_index_recomputes += 1
+                    self.num_sparse_index_recompute_tokens += query_len
             else:
                 self.num_decode_tokens += query_len
                 self.curr_seq_lens.append(curr_seq_len)
@@ -533,13 +605,23 @@ class FlashAttentionMetadataBuilder(
         use_captured_graph = cuda_graph_pad_size != -1
 
         max_query_len = max(query_lens)
-        decode_query_lens = query_lens[self.num_prefills:]
+        
+        sparse_index_decode_query_lens = query_lens[self.num_prefills : self.num_prefills+self.num_sparse_index_decodes]
+        if len(sparse_index_decode_query_lens) > 0:
+            max_sparse_index_decode_query_len = max(sparse_index_decode_query_lens)
+        else:
+            max_sparse_index_decode_query_len = 1
+        
+        decode_query_lens = query_lens[self.num_prefills+self.num_sparse_index_decodes:]
         if len(decode_query_lens) > 0:
             max_decode_query_len = max(decode_query_lens)
         else:
             max_decode_query_len = 1
+        
         max_prefill_seq_len = max(self.prefill_seq_lens, default=0)
+        max_sparse_index_decode_seq_len = max(self.use_sparse_index_seq_lens, default=0)
         max_decode_seq_len = max(self.curr_seq_lens, default=0)
+
         num_decode_tokens = self.num_decode_tokens
         query_start_loc = list(accumulate(query_lens, initial=0))
         seq_start_loc = list(accumulate(seq_lens, initial=0))
@@ -597,6 +679,12 @@ class FlashAttentionMetadataBuilder(
             context_lens_tensor=context_lens_tensor,
             block_tables=block_tables,
             use_cuda_graph=use_captured_graph,
+            num_sparse_index_recomputes=self.num_sparse_index_recomputes,
+            num_sparse_index_decodes=self.num_sparse_index_decodes,
+            num_sparse_index_recompute_tokens=self.num_sparse_index_recompute_tokens,
+            num_sparse_index_tokens=self.num_sparse_index_tokens,
+            max_sparse_index_decode_seq_len=max_sparse_index_decode_seq_len,
+            max_sparse_index_decode_query_len=max_sparse_index_decode_query_len,
         )
 
 class SparsePrefillType(IntEnum):
@@ -864,8 +952,10 @@ class FlashAttentionImpl(AttentionImpl):
         (num_prefill_query_tokens, num_prefill_kv_tokens,
         num_decode_query_tokens) = \
             get_num_prefill_decode_query_kv_tokens(attn_metadata, attn_type)
-        decode_query = query[num_prefill_query_tokens:]
-        decode_output = output[num_prefill_query_tokens:]
+        sparse_index_decode_query = query[num_prefill_query_tokens:]
+        sparse_index_decode_output = output[num_prefill_query_tokens:]
+        decode_query = query[num_prefill_query_tokens + attn_metadata.num_sparse_index_tokens:]
+        decode_output = output[num_prefill_query_tokens + attn_metadata.num_sparse_index_tokens:]
         # QKV for prefill.
         query = query[:num_prefill_query_tokens]
         prefill_output = output[:num_prefill_query_tokens]
@@ -1218,6 +1308,61 @@ class FlashAttentionImpl(AttentionImpl):
                             output[qs : qe] = partial_output
                 else:
                     raise ValueError(f"Unsupported sparse prefill type: {self.sparse_prefill_attn_type}")
+
+        if sparse_index_decode_meta := attn_metadata.sparse_index_decode_metadata:
+            assert attn_type == AttentionType.DECODER, (
+                "Only decoder-only models support sparse index decode"
+            )
+
+            assert sparse_index_decode_meta.max_decode_query_len is not None
+            if sparse_index_decode_meta.max_decode_query_len > 1:
+                assert attn_type == AttentionType.DECODER, (
+                    "Only decoder-only models support max_decode_query_len > 1"
+                )
+                assert sparse_index_decode_meta.query_start_loc is not None
+                descale_shape = (sparse_index_decode_meta.query_start_loc.shape[0] - 1,
+                                 key.shape[1])
+                flash_attn_varlen_func(
+                    q=sparse_index_decode_query,
+                    k=key_cache,
+                    v=value_cache,
+                    cu_seqlens_q=sparse_index_decode_meta.query_start_loc,
+                    max_seqlen_q=sparse_index_decode_meta.max_decode_query_len,
+                    seqused_k=sparse_index_decode_meta.seq_lens_tensor,
+                    max_seqlen_k=sparse_index_decode_meta.max_decode_seq_len,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    window_size=window_size,
+                    alibi_slopes=alibi_slopes,
+                    softcap=logits_soft_cap,
+                    block_table=sparse_index_decode_meta.block_tables,
+                    out=sparse_index_decode_output,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=layer._q_scale.expand(descale_shape),
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                )
+            else:
+                seq_lens_arg = sparse_index_decode_meta.seq_lens_tensor
+                block_tables_arg = sparse_index_decode_meta.block_tables
+                descale_shape = (seq_lens_arg.shape[0], key_cache.shape[-2])
+                flash_attn_with_kvcache(
+                    q=sparse_index_decode_query.unsqueeze(1),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    block_table=block_tables_arg,
+                    cache_seqlens=seq_lens_arg,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    window_size=window_size,
+                    alibi_slopes=alibi_slopes,
+                    softcap=logits_soft_cap,
+                    out=sparse_index_decode_output.unsqueeze(1),
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=layer._q_scale.expand(descale_shape),
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                )
 
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
