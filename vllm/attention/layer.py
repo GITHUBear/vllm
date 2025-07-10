@@ -159,6 +159,10 @@ class Attention(nn.Module):
             torch.tensor([]) for _ in range(get_current_vllm_config(
             ).parallel_config.pipeline_parallel_size)
         ]
+        self.block_count_gpu_cache = torch.tensor([])
+        self.block_index_gpu_cache = torch.tensor([])
+        self.column_count_gpu_cache = torch.tensor([])
+        self.column_index_gpu_cache = torch.tensor([])
 
         self.q_range = torch.tensor(envs.Q_SCALE_CONSTANT, dtype=torch.float32)
         self.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
@@ -183,6 +187,7 @@ class Attention(nn.Module):
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
+        enable_sparse_index_block = self.block_count_gpu_cache.shape[0] > 0
         if self.calculate_kv_scales:
             attn_metadata = get_forward_context().attn_metadata
             if attn_metadata.enable_kv_scales_calculation:
@@ -213,16 +218,37 @@ class Attention(nn.Module):
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-                self.impl.forward(self,
-                                  query,
-                                  key,
-                                  value,
-                                  self_kv_cache,
-                                  attn_metadata,
-                                  output=output)
+                if enable_sparse_index_block:
+                    self.impl.forward(self,
+                                    query,
+                                    key,
+                                    value,
+                                    self_kv_cache,
+                                    attn_metadata,
+                                    output=output,
+                                    block_count_gpu_cache=self.block_count_gpu_cache,
+                                    block_index_gpu_cache=self.block_index_gpu_cache,
+                                    column_count_gpu_cache=self.column_count_gpu_cache,
+                                    column_index_gpu_cache=self.column_index_gpu_cache,)
+                else:
+                    self.impl.forward(self,
+                                    query,
+                                    key,
+                                    value,
+                                    self_kv_cache,
+                                    attn_metadata,
+                                    output=output)
             else:
-                torch.ops.vllm.unified_attention_with_output(
-                    query, key, value, output, self.layer_name)
+                if enable_sparse_index_block:
+                    torch.ops.vllm.unified_attention_with_output(
+                        query, key, value, output, self.layer_name,
+                        block_count_gpu_cache=self.block_count_gpu_cache,
+                        block_index_gpu_cache=self.block_index_gpu_cache,
+                        column_count_gpu_cache=self.column_count_gpu_cache,
+                        column_index_gpu_cache=self.column_index_gpu_cache,)
+                else:
+                    torch.ops.vllm.unified_attention_with_output(
+                        query, key, value, output, self.layer_name)
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:
@@ -231,11 +257,26 @@ class Attention(nn.Module):
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                if enable_sparse_index_block:
+                    return self.impl.forward(self, query, key, value,
+                                        self_kv_cache, attn_metadata,
+                                        block_count_gpu_cache=self.block_count_gpu_cache,
+                                        block_index_gpu_cache=self.block_index_gpu_cache,
+                                        column_count_gpu_cache=self.column_count_gpu_cache,
+                                        column_index_gpu_cache=self.column_index_gpu_cache,)
                 return self.impl.forward(self, query, key, value,
                                          self_kv_cache, attn_metadata)
             else:
-                return torch.ops.vllm.unified_attention(
-                    query, key, value, self.layer_name)
+                if enable_sparse_index_block:
+                    return torch.ops.vllm.unified_attention(
+                        query, key, value, self.layer_name,
+                        block_count_gpu_cache=self.block_count_gpu_cache,
+                        block_index_gpu_cache=self.block_index_gpu_cache,
+                        column_count_gpu_cache=self.column_count_gpu_cache,
+                        column_index_gpu_cache=self.column_index_gpu_cache,)
+                else:
+                    return torch.ops.vllm.unified_attention(
+                        query, key, value, self.layer_name)
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
@@ -374,6 +415,10 @@ def unified_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
+    block_count_gpu_cache: Optional[torch.Tensor] = None,
+    block_index_gpu_cache: Optional[torch.Tensor] = None,
+    column_count_gpu_cache: Optional[torch.Tensor] = None,
+    column_index_gpu_cache: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     wait_for_kv_layer_from_connector(layer_name)
 
@@ -384,7 +429,11 @@ def unified_attention(
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
     output = self.impl.forward(self, query, key, value, kv_cache,
-                               attn_metadata)
+                               attn_metadata,
+                               block_count_gpu_cache=self.block_count_gpu_cache,
+                               block_index_gpu_cache=self.block_index_gpu_cache,
+                               column_count_gpu_cache=self.column_count_gpu_cache,
+                               column_index_gpu_cache=self.column_index_gpu_cache,)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
     return output
@@ -407,13 +456,16 @@ direct_register_custom_op(
     dispatch_key=current_platform.dispatch_key,
 )
 
-
 def unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
+    block_count_gpu_cache: Optional[torch.Tensor] = None,
+    block_index_gpu_cache: Optional[torch.Tensor] = None,
+    column_count_gpu_cache: Optional[torch.Tensor] = None,
+    column_index_gpu_cache: Optional[torch.Tensor] = None
 ) -> None:
     wait_for_kv_layer_from_connector(layer_name)
     forward_context: ForwardContext = get_forward_context()
@@ -428,7 +480,11 @@ def unified_attention_with_output(
                       value,
                       kv_cache,
                       attn_metadata,
-                      output=output)
+                      output=output,
+                      block_count_gpu_cache=self.block_count_gpu_cache,
+                      block_index_gpu_cache=self.block_index_gpu_cache,
+                      column_count_gpu_cache=self.column_count_gpu_cache,
+                      column_index_gpu_cache=self.column_index_gpu_cache,)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 

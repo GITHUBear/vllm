@@ -29,7 +29,7 @@ class SparseIndexBlockCacheEngine:
 
         # slash & vertical index
         (self.block_count_gpu_cache, self.block_index_gpu_cache,
-         self.column_count_gpu_cach, self.column_index_gpu_cache) = self._allocate_sparse_index_cache(
+         self.column_count_gpu_cache, self.column_index_gpu_cache) = self._allocate_sparse_index_cache(
             device=self.device_config.device_type
         )
 
@@ -37,48 +37,62 @@ class SparseIndexBlockCacheEngine:
         self,
         device: str,
     ) -> List[torch.Tensor]:
+        block_count_gpu_cache = []
+        block_index_gpu_cache = []
+        column_count_gpu_cache = []
+        column_index_gpu_cache = []
+
         block_count_cache_shape = (
             self.sparse_index_num_gpu_blocks,
-            self.num_attention_layers,
             self.num_kv_heads,
         )
         block_index_cache_shape = (
             self.sparse_index_num_gpu_blocks,
-            self.num_attention_layers,
             self.num_kv_heads,
             self.sparse_index_max_vertical_slash_topk,
         )
         column_count_cache_shape = (
             self.sparse_index_num_gpu_blocks,
-            self.num_attention_layers,
             self.num_kv_heads,
         )
         column_index_cache_shape = (
             self.sparse_index_num_gpu_blocks,
-            self.num_attention_layers,
             self.num_kv_heads,
             self.sparse_index_max_vertical_slash_topk,
         )
-        block_count_gpu_cache = torch.zeros(
-            block_count_cache_shape,
-            dtype=self.dtype,
-            device=device,
-        )
-        block_index_gpu_cache = torch.zeros(
-            block_index_cache_shape,
-            dtype=self.dtype,
-            device=device,
-        )
-        column_count_gpu_cache = torch.zeros(
-            column_count_cache_shape,
-            dtype=self.dtype,
-            device=device,
-        )
-        column_index_gpu_cache = torch.zeros(
-            column_index_cache_shape,
-            dtype=self.dtype,
-            device=device,
-        )
+
+        for _ in range(self.num_attention_layers):
+            layer_block_count_gpu_cache = torch.zeros(
+                block_count_cache_shape,
+                dtype=self.dtype,
+                device=device,
+            )
+            block_count_gpu_cache.append(layer_block_count_gpu_cache)
+
+        for _ in range(self.num_attention_layers):
+            layer_block_index_gpu_cache = torch.zeros(
+                block_index_cache_shape,
+                dtype=self.dtype,
+                device=device,
+            )
+            block_index_gpu_cache.append(layer_block_index_gpu_cache)
+
+        for _ in range(self.num_attention_layers):
+            layer_column_count_gpu_cache = torch.zeros(
+                column_count_cache_shape,
+                dtype=self.dtype,
+                device=device,
+            )
+            column_count_gpu_cache.append(layer_column_count_gpu_cache)
+        
+        for _ in range(self.num_attention_layers):
+            layer_column_index_gpu_cache = torch.zeros(
+                column_index_cache_shape,
+                dtype=self.dtype,
+                device=device,
+            )
+            column_index_gpu_cache.append(layer_column_index_gpu_cache)
+
         return (
             block_count_gpu_cache, block_index_gpu_cache,
             column_count_gpu_cache, column_index_gpu_cache,

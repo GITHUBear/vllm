@@ -557,6 +557,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             context_len = seq_len - 1
         else:
             context_len = seq_data.get_num_computed_tokens()
+            if inter_data.is_sparse_index_recompute:
+                context_len -= (self.runner.sparse_index_kv_compress_num_sample_token - 1)
 
         # Compute tokens.
         if seq_data.prompt_embeds is None:
@@ -1114,6 +1116,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 self.vllm_config.speculative_config.sparse_index_recompute_step
             self.sparse_index_kv_compress_recover_rate = \
                 self.vllm_config.speculative_config.kv_compress_recover_rate
+            self.sparse_index_kv_compress_num_sample_token = \
+                self.vllm_config.speculative_config.kv_compress_num_sample_tokens
 
         #
         self.graph_runners: List[Dict[Tuple[int, bool], CUDAGraphRunner]] = [

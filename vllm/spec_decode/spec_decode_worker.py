@@ -23,7 +23,7 @@ from vllm.model_executor.layers.spec_decode_base_sampler import (
 from vllm.model_executor.layers.typical_acceptance_sampler import (
     TypicalAcceptanceSampler)
 from vllm.platforms import current_platform
-from vllm.sequence import (VLLM_INVALID_TOKEN_ID,
+from vllm.sequence import (VLLM_INVALID_TOKEN_ID, SequenceData,
                            CompletionSequenceGroupOutput, ExecuteModelRequest,
                            HiddenStates, SequenceGroupMetadata,
                            get_all_seq_ids_and_request_ids)
@@ -120,6 +120,8 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
         disable_logprobs=speculative_config.disable_logprobs,
         disable_log_stats=speculative_config.disable_log_stats,
         num_speculative_tokens=speculative_config.num_speculative_tokens,
+        sparse_index_recompute_step=speculative_config.sparse_index_recompute_step,
+        kv_compress_num_sample_tokens=speculative_config.kv_compress_num_sample_tokens,
     )
 
     return spec_decode_worker
@@ -177,6 +179,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         disable_logprobs: bool,
         disable_log_stats: bool,
         num_speculative_tokens: int,
+        sparse_index_recompute_step: int,
+        kv_compress_num_sample_tokens: int,
     ) -> "SpecDecodeWorker":
 
         allow_zero_draft_token_step = True
@@ -290,7 +294,10 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             enable_lm_head_weight_load=enable_lm_head_weight_load,
             num_spec_prefill_steps=num_spec_prefill_steps,
             standalone_kv_compress_trigger_threshold=standalone_kv_compress_trigger_threshold,
-            sparse_index_gpu_memory_ratio=sparse_index_gpu_memory_ratio)
+            sparse_index_gpu_memory_ratio=sparse_index_gpu_memory_ratio,
+            sparse_index_recompute_step=sparse_index_recompute_step,
+            kv_compress_num_sample_tokens=kv_compress_num_sample_tokens,
+            )
 
     def __init__(
         self,
@@ -307,6 +314,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         num_spec_prefill_steps: int = 1,
         standalone_kv_compress_trigger_threshold: Optional[int] = None,
         sparse_index_gpu_memory_ratio: Optional[float] = None,
+        sparse_index_recompute_step: Optional[int] = None,
+        kv_compress_num_sample_tokens: Optional[int] = None,
     ):
         """
         Create a SpecDecodeWorker.
@@ -381,6 +390,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         self._disable_logprobs = disable_logprobs
         self._disable_log_stats = disable_log_stats
         self._num_spec_prefill_steps = num_spec_prefill_steps
+        self.sparse_index_recompute_step = sparse_index_recompute_step
+        self.kv_compress_num_sample_tokens = kv_compress_num_sample_tokens
 
     def init_device(self) -> None:
         """Initialize both scorer and proposer models.
@@ -486,7 +497,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             torch.distributed.all_reduce(proposer_num_gpu_blocks_tensor, op=torch.distributed.ReduceOp.MIN)
             self.proposer_worker.speculative_config.sparse_index_num_gpu_blocks = proposer_num_gpu_blocks_tensor.item()
 
-            msg = (f"Reserve {ratio * 10}% gpu memory from kvcache for sparse index blocks"
+            msg = (f"Reserve {ratio * 10}% gpu memory from kvcache for sparse index blocks, "
                    "the current vLLM instance can use "
                    f"{new_num_gpu_blocks} kvcache blocks "
                    f"{proposer_num_gpu_blocks}(local) "
@@ -712,18 +723,22 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                     CompletionSequenceGroupOutput(
                         samples=[], prompt_logprobs=prompt_logprobs))
                 continue
+            
+            sampled_token_ids_len = 1
+            if self.is_standalone_mode and seq_data.need_recompute_sparse_index(self.sparse_index_recompute_step):
+                sampled_token_ids_len = self.kv_compress_num_sample_tokens
 
             # Sequence with output.
             completion_seq_group_output_list.append(
                 create_sequence_group_output(
-                    token_id=sampled_token_ids_list[output_index][0],
+                    token_id=sampled_token_ids_list[output_index+sampled_token_ids_len-1][0],
                     token_id_logprob_rank=-1,
                     token_id_logprob=0.0,
                     seq_id=seq_id,
                     topk_token_ids=[],
                     topk_logprobs=[],
                     prompt_logprobs=prompt_logprobs))
-            output_index += 1
+            output_index += sampled_token_ids_len
 
         return [SamplerOutput(outputs=completion_seq_group_output_list)]
     

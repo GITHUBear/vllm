@@ -2354,6 +2354,9 @@ class SpeculativeConfig:
     kv_compress_trigger_threshold: Optional[int] = None
     """The sequence length threshold to trigger kv compression.
     """
+    kv_compress_num_sample_tokens: Optional[int] = None
+    """The sample tokens to calculate sparse index.
+    """
     sparse_index_gpu_memory_ratio: Optional[float] = None
     """The gpu memory ratio of sparse index.
     """
@@ -2522,7 +2525,7 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
             
             if self.kv_compress_recover_rate is None:
-                self.kv_compress_recover_rate = 0.8
+                self.kv_compress_recover_rate = 0.9
             
             if self.kv_compress_recover_rate <= 0 or self.kv_compress_recover_rate > 1:
                 raise ValueError(
@@ -2530,6 +2533,9 @@ class SpeculativeConfig:
             
             if self.kv_compress_trigger_threshold is None:
                 self.kv_compress_trigger_threshold = 1024
+
+            if self.kv_compress_num_sample_tokens is None:
+                self.kv_compress_num_sample_tokens = 65
 
             if self.sparse_index_gpu_memory_ratio is None:
                 self.sparse_index_gpu_memory_ratio = 0.1

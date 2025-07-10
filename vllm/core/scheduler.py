@@ -435,6 +435,7 @@ class Scheduler:
         sparse_index_num_gpu_blocks: int = None,
         sparse_index_alloc_seqlen_threshold: int = None,
         sparse_index_recompute_step: int = None,
+        kv_compress_num_sample_tokens: int = None,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -475,6 +476,7 @@ class Scheduler:
                 sparse_index_num_gpu_blocks,
                 sparse_index_alloc_seqlen_threshold,
                 sparse_index_recompute_step,
+                kv_compress_num_sample_tokens,
             )
 
         # Sequence groups in the WAITING state.

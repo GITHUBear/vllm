@@ -203,6 +203,10 @@ class FlashAttentionMetadata(AttentionMetadata):
     num_sparse_index_recompute_tokens: int = 0
     num_sparse_index_decodes: int = 0
     num_sparse_index_tokens: int = 0
+    sparse_index_kv_compress_recover_rate: Optional[float] = None
+    # TODO: build sparse index block
+    sparse_index_block: Optional[List[int]] = None
+    sparse_index_block_tensor: Optional[torch.Tensor] = None
 
     @property
     def is_all_encoder_attn_metadata_set(self):
@@ -318,15 +322,20 @@ class FlashAttentionMetadata(AttentionMetadata):
             # Batch may be composed of prefill|decodes, adjust query start
             # indices to refer to the start of decodes. E.g.
             # in tokens:[3 prefills|6 decodes], query_start_loc=[3,9] => [0,6].
-            query_start_loc=(self.query_start_loc[self.num_prefills:query_ed] -
+            query_start_loc=(self.query_start_loc[self.num_prefills:query_ed+1] -
                              self.query_start_loc[self.num_prefills])
             if self.query_start_loc is not None else None,
-            seq_start_loc=self.seq_start_loc[self.num_prefills:query_ed]
+            seq_start_loc=self.seq_start_loc[self.num_prefills:query_ed+1]
             if self.seq_start_loc is not None else None,
             prompt_lens=prompt_lens,
             context_lens_tensor=None,
             block_tables=block_tables,
-            use_cuda_graph=self.use_cuda_graph)
+            use_cuda_graph=self.use_cuda_graph,
+            sparse_index_kv_compress_recover_rate=self.sparse_index_kv_compress_recover_rate,
+            num_sparse_index_recomputes=self.num_sparse_index_recomputes,
+            num_sparse_index_recompute_tokens=self.num_sparse_index_recompute_tokens,
+            sparse_index_block=self.sparse_index_block,
+            sparse_index_block_tensor=self.sparse_index_block_tensor)
         return self._cached_sparse_index_decode_metadata
 
     @property
@@ -485,6 +494,8 @@ class FlashAttentionMetadataBuilder(
         self.num_sparse_index_recompute_tokens = 0
         self.num_sparse_index_tokens = 0
         self.use_sparse_index_seq_lens: List[int] = []
+        # We assume that each sequence group has only one sequence.
+        self.sparse_index_blocks: List[int] = []
 
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
@@ -498,6 +509,11 @@ class FlashAttentionMetadataBuilder(
         is_sparse_index_recompute = inter_data.is_sparse_index_recompute
         is_sparse_index = inter_data.is_sparse_index
         block_tables = inter_data.block_tables
+        sparse_index_block = inter_data.sparse_index_block
+
+        if sparse_index_block and len(sparse_index_block) > 0:
+            assert len(sparse_index_block) == 1
+            sparse_index_block_id = next(iter(sparse_index_block.values()))
 
         for (seq_id, token_len, seq_len, curr_seq_len, query_len, context_len,
              curr_sliding_window_block, prompt_len) in zip(
@@ -547,6 +563,8 @@ class FlashAttentionMetadataBuilder(
                     block_table = block_tables[seq_id][
                         -curr_sliding_window_block:]
             self.block_tables.append(block_table)
+            if sparse_index_block and len(sparse_index_block) > 0:
+                self.sparse_index_blocks.append(sparse_index_block_id)
 
             # Compute slot mapping.
             is_profile_run = is_block_tables_empty(block_tables)
@@ -611,6 +629,7 @@ class FlashAttentionMetadataBuilder(
             max_sparse_index_decode_query_len = max(sparse_index_decode_query_lens)
         else:
             max_sparse_index_decode_query_len = 1
+        sparse_index_kv_compress_reover_rate = self.input_builder.runner.sparse_index_kv_compress_recover_rate
         
         decode_query_lens = query_lens[self.num_prefills+self.num_sparse_index_decodes:]
         if len(decode_query_lens) > 0:
@@ -641,6 +660,12 @@ class FlashAttentionMetadataBuilder(
                 device=device,
             )
         assert max_query_len > 0, ("query_lens: {}".format(query_lens))
+
+        sparse_index_block = None if len(self.sparse_index_blocks) == 0 else self.sparse_index_blocks
+        sparse_index_block_tensor = None
+        if sparse_index_block is not None:
+            sparse_index_block_tensor = async_tensor_h2d(sparse_index_block, torch.int,
+                                                         device, self.runner.pin_memory)
 
         assert device is not None
         context_lens_tensor = async_tensor_h2d(self.context_lens, torch.int,
@@ -685,6 +710,9 @@ class FlashAttentionMetadataBuilder(
             num_sparse_index_tokens=self.num_sparse_index_tokens,
             max_sparse_index_decode_seq_len=max_sparse_index_decode_seq_len,
             max_sparse_index_decode_query_len=max_sparse_index_decode_query_len,
+            sparse_index_kv_compress_recover_rate=sparse_index_kv_compress_reover_rate,
+            sparse_index_block=sparse_index_block,
+            sparse_index_block_tensor=sparse_index_block_tensor,
         )
 
 class SparsePrefillType(IntEnum):
@@ -854,6 +882,10 @@ class FlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
         output: Optional[torch.Tensor] = None,
+        block_count_gpu_cache: Optional[torch.Tensor] = None,
+        block_index_gpu_cache: Optional[torch.Tensor] = None,
+        column_count_gpu_cache: Optional[torch.Tensor] = None,
+        column_index_gpu_cache: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 
@@ -952,8 +984,8 @@ class FlashAttentionImpl(AttentionImpl):
         (num_prefill_query_tokens, num_prefill_kv_tokens,
         num_decode_query_tokens) = \
             get_num_prefill_decode_query_kv_tokens(attn_metadata, attn_type)
-        sparse_index_decode_query = query[num_prefill_query_tokens:]
-        sparse_index_decode_output = output[num_prefill_query_tokens:]
+        sparse_index_decode_query = query[num_prefill_query_tokens: num_prefill_query_tokens + attn_metadata.num_sparse_index_tokens]
+        sparse_index_decode_output = output[num_prefill_query_tokens: num_prefill_query_tokens + attn_metadata.num_sparse_index_tokens]
         decode_query = query[num_prefill_query_tokens + attn_metadata.num_sparse_index_tokens:]
         decode_output = output[num_prefill_query_tokens + attn_metadata.num_sparse_index_tokens:]
         # QKV for prefill.
@@ -1313,6 +1345,11 @@ class FlashAttentionImpl(AttentionImpl):
             assert attn_type == AttentionType.DECODER, (
                 "Only decoder-only models support sparse index decode"
             )
+            recover_rate = sparse_index_decode_meta.sparse_index_kv_compress_recover_rate
+            sparse_index_block = sparse_index_decode_meta.sparse_index_block
+            sparse_index_block_tensor = sparse_index_decode_meta.sparse_index_block_tensor
+            assert (recover_rate is not None and sparse_index_block is not None and
+                    sparse_index_block_tensor is not None)
 
             assert sparse_index_decode_meta.max_decode_query_len is not None
             if sparse_index_decode_meta.max_decode_query_len > 1:

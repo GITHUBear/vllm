@@ -16,10 +16,12 @@ class SparseIndexBlockManager:
         num_gpu_blocks: int,
         seqlen_threshold: int,
         recompute_step: int,
+        num_sample_tokens: int,
     ):
         self.num_gpu_blocks = num_gpu_blocks
         self.seqlen_threshold = seqlen_threshold
         self.recompute_step = recompute_step
+        self.num_sample_tokens = num_sample_tokens
         self.free_block_ids = [
             i for i in range(self.num_gpu_blocks)
         ]
@@ -51,7 +53,7 @@ class SparseIndexBlockManager:
                 continue
             if seq.get_num_computed_tokens() < self.seqlen_threshold:
                 continue
-            if seq.get_num_computed_tokens() - seq.get_prompt_len() < 64:
+            if seq.get_num_computed_tokens() - seq.get_prompt_len() < self.num_sample_tokens:
                 continue
 
             blk_id = self.free_block_ids[0]
