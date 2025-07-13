@@ -2357,6 +2357,15 @@ class SpeculativeConfig:
     kv_compress_num_sample_tokens: Optional[int] = None
     """The sample tokens to calculate sparse index.
     """
+    block_sparse_mode: bool = False
+    """Enable LServe kv compress mode.
+    """
+    block_sparse_token_budget: Optional[int] = None
+    """LServe token budget.
+    """
+    block_sparse_recompute_step: Optional[int] = None
+    """LServe recompute step.
+    """
     sparse_index_gpu_memory_ratio: Optional[float] = None
     """The gpu memory ratio of sparse index.
     """
@@ -2524,27 +2533,37 @@ class SpeculativeConfig:
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
             
-            if self.kv_compress_recover_rate is None:
-                self.kv_compress_recover_rate = 0.9
-            
-            if self.kv_compress_recover_rate <= 0 or self.kv_compress_recover_rate > 1:
-                raise ValueError(
-                    f"kv_compress_recover_rate={self.kv_compress_recover_rate} must be in range (0,1]")
-            
-            if self.kv_compress_trigger_threshold is None:
-                self.kv_compress_trigger_threshold = 1024
+            if not self.block_sparse_mode:
+                if self.kv_compress_recover_rate is None:
+                    self.kv_compress_recover_rate = 0.9
+                
+                if self.kv_compress_recover_rate <= 0 or self.kv_compress_recover_rate > 1:
+                    raise ValueError(
+                        f"kv_compress_recover_rate={self.kv_compress_recover_rate} must be in range (0,1]")
+                
+                if self.kv_compress_trigger_threshold is None:
+                    self.kv_compress_trigger_threshold = 1024
 
-            if self.kv_compress_num_sample_tokens is None:
-                self.kv_compress_num_sample_tokens = 65
+                if self.kv_compress_num_sample_tokens is None:
+                    self.kv_compress_num_sample_tokens = 65
 
-            if self.sparse_index_gpu_memory_ratio is None:
-                self.sparse_index_gpu_memory_ratio = 0.1
-            
-            if self.sparse_index_max_vertical_slash_topk is None:
-                self.sparse_index_max_vertical_slash_topk = 25000
-            
-            if self.sparse_index_recompute_step is None:
-                self.sparse_index_recompute_step = 128
+                if self.sparse_index_gpu_memory_ratio is None:
+                    self.sparse_index_gpu_memory_ratio = 0.1
+                
+                if self.sparse_index_max_vertical_slash_topk is None:
+                    self.sparse_index_max_vertical_slash_topk = 25000
+                
+                if self.sparse_index_recompute_step is None:
+                    self.sparse_index_recompute_step = 128
+            else:
+                if self.block_sparse_token_budget is None:
+                    self.block_sparse_token_budget = 2048
+                
+                if self.block_sparse_recompute_step is None:
+                    self.block_sparse_recompute_step = 4
+
+                if self.sparse_index_gpu_memory_ratio is None:
+                    self.sparse_index_gpu_memory_ratio = 0.1
 
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config

@@ -159,6 +159,10 @@ class Attention(nn.Module):
             torch.tensor([]) for _ in range(get_current_vllm_config(
             ).parallel_config.pipeline_parallel_size)
         ]
+        self.key_meta_cache = [
+            torch.tensor([]) for _ in range(get_current_vllm_config(
+            ).parallel_config.pipeline_parallel_size)
+        ]
         self.block_count_gpu_cache = torch.tensor([])
         self.block_index_gpu_cache = torch.tensor([])
         self.column_count_gpu_cache = torch.tensor([])

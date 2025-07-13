@@ -105,6 +105,9 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
         standalone_kv_compress_recover_rate=speculative_config.kv_compress_recover_rate,
         standalone_kv_compress_trigger_threshold=speculative_config.kv_compress_trigger_threshold,
         sparse_index_gpu_memory_ratio=speculative_config.sparse_index_gpu_memory_ratio,
+        block_sparse_mode=speculative_config.block_sparse_mode,
+        block_sparse_token_budget=speculative_config.block_sparse_token_budget,
+        block_sparse_recompute_step=speculative_config.block_sparse_recompute_step,
     )
 
     spec_decode_worker = SpecDecodeWorker.create_worker(
@@ -196,6 +199,12 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             draft_worker_kwargs.pop("standalone_kv_compress_trigger_threshold"))
         sparse_index_gpu_memory_ratio = (
             draft_worker_kwargs.pop("sparse_index_gpu_memory_ratio"))
+        block_sparse_mode = (
+            draft_worker_kwargs.pop("block_sparse_mode"))
+        block_sparse_token_budget = (
+            draft_worker_kwargs.pop("block_sparse_token_budget"))
+        block_sparse_recompute_step = (
+            draft_worker_kwargs.pop("block_sparse_recompute_step"))
         draft_model_config = draft_worker_kwargs["vllm_config"].model_config
         draft_parallel_config: ParallelConfig = draft_worker_kwargs[
             'vllm_config'].parallel_config
@@ -205,10 +214,11 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             proposer_worker = NGramWorker(**draft_worker_kwargs)
             proposer_worker.set_ngram_window_size(ngram_prompt_lookup_min,
                                                   ngram_prompt_lookup_max)
-        elif standalone_kv_compress_recover_rate is not None:
+        elif block_sparse_mode or (standalone_kv_compress_recover_rate is not None):
             proposer_worker = StandaloneMultiStepWorker(
                 referred_worker=scorer_worker,
                 standalone_kv_compress_recover_rate=standalone_kv_compress_recover_rate,
+                block_sparse_mode=block_sparse_mode,
             )
         else:
             draft_tp = draft_parallel_config.tensor_parallel_size
@@ -297,6 +307,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             sparse_index_gpu_memory_ratio=sparse_index_gpu_memory_ratio,
             sparse_index_recompute_step=sparse_index_recompute_step,
             kv_compress_num_sample_tokens=kv_compress_num_sample_tokens,
+            block_sparse_mode=block_sparse_mode,
+            block_sparse_token_budget=block_sparse_token_budget,
+            block_sparse_recompute_step=block_sparse_recompute_step,
             )
 
     def __init__(
@@ -316,6 +329,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         sparse_index_gpu_memory_ratio: Optional[float] = None,
         sparse_index_recompute_step: Optional[int] = None,
         kv_compress_num_sample_tokens: Optional[int] = None,
+        block_sparse_mode: bool = False,
+        block_sparse_token_budget: Optional[int] = None,
+        block_sparse_recompute_step: Optional[int] = None
     ):
         """
         Create a SpecDecodeWorker.
@@ -355,6 +371,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         """
         self.proposer_worker = proposer_worker
         self.scorer_worker = scorer_worker
+        self.block_sparse_mode = block_sparse_mode
+        self.block_sparse_token_budget = block_sparse_token_budget
+        self.block_sparse_recompute_step = block_sparse_recompute_step
         self.is_standalone_mode = isinstance(self.proposer_worker, StandaloneMultiStepWorker)
         self.standalone_kv_compress_trigger_threshold = (
             standalone_kv_compress_trigger_threshold)
@@ -479,6 +498,10 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         """
         num_gpu_blocks, num_cpu_blocks = (
             self.scorer_worker.determine_num_available_blocks())
+        
+        if self.block_sparse_mode:
+            # TODO:[shk]: enable index cache later.
+            return num_gpu_blocks, num_cpu_blocks
         
         scorer_cache_block_size_bytes = (
             self.scorer_worker.get_cache_block_size_bytes())
@@ -725,7 +748,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                 continue
             
             sampled_token_ids_len = 1
-            if self.is_standalone_mode and seq_data.need_recompute_sparse_index(self.sparse_index_recompute_step):
+            if self.is_standalone_mode and (not self.block_sparse_mode) and seq_data.need_recompute_sparse_index(self.sparse_index_recompute_step):
                 sampled_token_ids_len = self.kv_compress_num_sample_tokens
 
             # Sequence with output.

@@ -20,6 +20,7 @@ def bind_sparse_index_block(
     block_index_gpu_cache: List[torch.Tensor],
     column_count_gpu_cache: List[torch.Tensor],
     column_index_gpu_cache: List[torch.Tensor],
+    block_sparse_mode: bool = False,
 ):
     from vllm.attention import AttentionType
     from vllm.model_executor.models.utils import extract_layer_index
@@ -38,14 +39,16 @@ def bind_sparse_index_block(
         forward_ctx = ctx[layer_name]
         forward_ctx.block_count_gpu_cache = block_count_gpu_cache[kv_cache_idx]
         forward_ctx.block_index_gpu_cache = block_index_gpu_cache[kv_cache_idx]
-        forward_ctx.column_count_gpu_cache = column_count_gpu_cache[kv_cache_idx]
-        forward_ctx.column_index_gpu_cache = column_index_gpu_cache[kv_cache_idx]
+        if not block_sparse_mode:
+            forward_ctx.column_count_gpu_cache = column_count_gpu_cache[kv_cache_idx]
+            forward_ctx.column_index_gpu_cache = column_index_gpu_cache[kv_cache_idx]
 
 class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
     def __init__(
         self,
         referred_worker: WorkerBase,
-        standalone_kv_compress_recover_rate: float
+        standalone_kv_compress_recover_rate: float,
+        block_sparse_mode: bool,
     ):
         RefWorkerBase.__init__(self, referred_worker)
         assert hasattr(self.worker, "model_runner")
@@ -54,6 +57,7 @@ class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
         # Lazy initialization list.
         self._proposer: SpeculativeProposer
         self.sparse_index_gpu_cache = None
+        self.block_sparse_mode = block_sparse_mode
     
     def init_device(self) -> None:
         self.worker.init_device()
@@ -66,6 +70,7 @@ class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
     
     def get_cache_block_size_bytes(self) -> int:
         return SparseIndexBlockCacheEngine.get_cache_block_size(
+            self.cache_config,
             self.model_config,
             self.parallel_config,
             self.speculative_config,
@@ -73,19 +78,23 @@ class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
-        self.sparse_index_gpu_cache = (
-            SparseIndexBlockCacheEngine(
-                self.model_config, self.parallel_config,
-                self.device_config, self.speculative_config,
+        if not self.block_sparse_mode:
+            # TODO[shk]: enable index cache later.
+            self.sparse_index_gpu_cache = (
+                SparseIndexBlockCacheEngine(
+                    self.cache_config,
+                    self.model_config, self.parallel_config,
+                    self.device_config, self.speculative_config,
+                )
             )
-        )
-        bind_sparse_index_block(
-            self.worker.compilation_config.static_forward_context,
-            self.sparse_index_gpu_cache.block_count_gpu_cache,
-            self.sparse_index_gpu_cache.block_index_gpu_cache,
-            self.sparse_index_gpu_cache.column_count_gpu_cache,
-            self.sparse_index_gpu_cache.column_index_gpu_cache,
-        )
+            bind_sparse_index_block(
+                self.worker.compilation_config.static_forward_context,
+                self.sparse_index_gpu_cache.block_count_gpu_cache,
+                self.sparse_index_gpu_cache.block_index_gpu_cache,
+                self.sparse_index_gpu_cache.column_count_gpu_cache,
+                self.sparse_index_gpu_cache.column_index_gpu_cache,
+                self.block_sparse_mode,
+            )
     
     def set_include_gpu_probs_tensor(self) -> None:
         self.model_runner.sampler.include_gpu_probs_tensor = True

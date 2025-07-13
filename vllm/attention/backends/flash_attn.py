@@ -29,7 +29,8 @@ from vllm.logger import init_logger
 from vllm.multimodal import MultiModalPlaceholderMap
 from vllm.utils import async_tensor_h2d, make_tensor_with_pad
 from vllm.vllm_flash_attn import (flash_attn_varlen_func,
-                                  flash_attn_with_kvcache)
+                                  flash_attn_with_kvcache,
+                                  sparse_attn_func)
 
 import os
 import math
@@ -743,6 +744,19 @@ class SpargeAttnConfig:
     cdfthreshd: float = 0.98
     pvthreshd: int = 50
 
+def _sum_all_diagonal_matrix(mat: torch.tensor):
+    h, n, m = mat.shape
+    # Zero matrix used for padding
+    zero_mat = torch.zeros((h, n, n), device=mat.device)
+    # pads the matrix on left and right
+    mat_padded = torch.cat((zero_mat, mat, zero_mat), -1)
+    # Change the strides
+    mat_strided = mat_padded.as_strided((h, n, n + m),
+                                        (n * (2 * n + m), 2 * n + m + 1, 1))
+    # Sums the resulting matrix's columns
+    sum_diags = torch.sum(mat_strided, 1)
+    return sum_diags[:, 1:]
+
 class FlashAttentionImpl(AttentionImpl):
     """
     If the input tensors contain prompt tokens, the layout is as follows:
@@ -872,6 +886,13 @@ class FlashAttentionImpl(AttentionImpl):
             self.sparse_prefill_attn_config = FlexPrefillConfig()
         if self.sparse_prefill_attn_type == SparsePrefillType.SPARGE_ATTN:
             self.sparse_prefill_attn_config = SpargeAttnConfig()
+        
+        self.sparse_index_block_size = 64
+        self.arange = torch.arange(self.sparse_index_block_size)
+        self.last_q_mask = (self.arange[None, :, None]
+                            >= self.arange[None, None, :])
+        self.int32_max = torch.iinfo(torch.int32).max
+        self.int32_min = torch.iinfo(torch.int32).min
 
     def forward(
         self,
@@ -1350,6 +1371,111 @@ class FlashAttentionImpl(AttentionImpl):
             sparse_index_block_tensor = sparse_index_decode_meta.sparse_index_block_tensor
             assert (recover_rate is not None and sparse_index_block is not None and
                     sparse_index_block_tensor is not None)
+            assert (block_count_gpu_cache is not None and block_index_gpu_cache is not None and
+                        column_count_gpu_cache is not None and column_index_gpu_cache is not None)
+            # block_count_gpu_cache = block_count_gpu_cache.unsqueeze(-1)
+            # block_index_gpu_cache = block_index_gpu_cache.unsqueeze(-2)
+            # column_count_gpu_cache = column_count_gpu_cache.unsqueeze(-1)
+            # column_index_gpu_cache = column_index_gpu_cache.unsqueeze(-2)
+            
+            if sparse_index_decode_meta.num_sparse_index_recomputes > 0:
+                max_vertical_slash_topk = block_index_gpu_cache.size(-1)
+                # For simple, we handle single batch.
+                assert len(sparse_index_block) == 1
+                query = sparse_index_decode_query[:self.sparse_index_block_size, ...]
+                sparse_index_block_idx = sparse_index_block[0]
+                sparse_index_decode_block_table = sparse_index_decode_meta.block_tables[0]
+                seq_len = sparse_index_decode_meta.max_decode_seq_len
+                n_heads = query.size(-2)
+
+                group_size = query.size(-2) // key_cache.size(-2)
+                key = key_cache[sparse_index_decode_block_table].view(-1, *key_cache.shape[-2:])[: seq_len]
+
+                query = query.transpose(0, 1) # hnd
+                # nhd -> hdn
+                key = key.permute(1, 2, 0)
+                assert key.size(0) == 1
+                qk = (query * softmax_scale) @ key
+                qk[:, :, -self.sparse_index_block_size:] = torch.where(
+                    self.last_q_mask,
+                    qk[:, :, -self.sparse_index_block_size:],
+                    -torch.inf,
+                )
+                qk = F.softmax(qk, dim=-1)
+
+                # 
+                vertical = qk.sum(-2)
+                vertical_sorted = vertical.sort(dim=-1, descending=True).values
+                cum_vertical_sorted = vertical_sorted.cumsum(dim=-1)
+                vertical_targets = torch.ones((n_heads,), device=qk.device) * cum_vertical_sorted[..., -1] * recover_rate
+                vindices = torch.searchsorted(cum_vertical_sorted, vertical_targets.view(n_heads, 1), side='left')
+                vindices = vindices[..., 0] + 30
+                # vertical count
+                vindices = torch.clamp(vindices, max=min(max_vertical_slash_topk, seq_len))
+                vertical[..., :30] = torch.inf
+                # 
+                slash = _sum_all_diagonal_matrix(qk)
+                slash = slash[..., :-self.sparse_index_block_size + 1]
+                slash_sorted = slash.sort(dim=-1, descending=True).values
+                cum_slash_sorted = slash_sorted.cumsum(dim=-1)
+                slash_targets = torch.ones((n_heads,), device=qk.device) * cum_slash_sorted[..., -1] * recover_rate
+                sindices = torch.searchsorted(cum_slash_sorted, slash_targets.view(n_heads, 1), side='left')
+                sindices = sindices[..., 0] + 100
+                # slash_count
+                sindices = torch.clamp(sindices, max=min(max_vertical_slash_topk, seq_len))
+                slash[..., -100:] = torch.inf
+                
+                vertical_index_buff = torch.full(
+                    (n_heads, min(max_vertical_slash_topk, seq_len)),
+                    self.int32_max,
+                    dtype=torch.int32,
+                    device=qk.device,
+                )
+                slash_index_buff = torch.full(
+                    (n_heads, min(max_vertical_slash_topk, seq_len)),
+                    self.int32_max,
+                    dtype=torch.int32,
+                    device=qk.device,
+                )
+                for head_i in range(n_heads):
+                    vtopk = vindices[head_i].item()
+                    vertical_topk = torch.topk(vertical[head_i:head_i+1], vtopk, -1).indices
+                    vertical_index_buff[head_i, :vtopk] = vertical_topk
+
+                    stopk = sindices[head_i].item()
+                    slash_topk = torch.topk(slash[head_i:head_i+1], stopk, -1).indices
+                    slash_topk = (seq_len - 1) - slash_topk
+                    slash_index_buff[head_i, :stopk] = slash_topk
+                vertical_index_buff = vertical_index_buff.sort(dim=-1, descending=False)[0]
+                slash_index_buff = slash_index_buff.sort(dim=-1, descending=False)[0]
+
+                # kv_seq_len = seq_len
+                # context_size = self.sparse_index_block_size
+                # q_seqlens = torch.tensor([context_size],
+                #              dtype=torch.int32,
+                #              device=query.device)
+                # kv_seqlens = torch.tensor([kv_seq_len],
+                #                         dtype=torch.int32,
+                #                         device=query.device)
+                vcount = vindices.to(torch.int32)
+                scount = sindices.to(torch.int32)
+
+                block_count_gpu_cache[sparse_index_block_idx, ...] = scount
+                column_count_gpu_cache[sparse_index_block_idx, ...] = vcount
+                block_index_gpu_cache[sparse_index_block_idx, :, :min(max_vertical_slash_topk, seq_len)] = slash_index_buff
+                column_index_gpu_cache[sparse_index_block_idx, :, :min(max_vertical_slash_topk, seq_len)] = vertical_index_buff
+                
+                # block_count_gpu_cache[sparse_index_block_idx:sparse_index_block_idx+1, ...] = 
+                # (
+                #     block_count_gpu_cache[sparse_index_block_idx:sparse_index_block_idx+1, ...],
+                #     block_index_gpu_cache[sparse_index_block_idx:sparse_index_block_idx+1, :, :, :seq_len],
+                #     column_count_gpu_cache[sparse_index_block_idx:sparse_index_block_idx+1, ...],
+                #     column_index_gpu_cache[sparse_index_block_idx:sparse_index_block_idx+1, :, :, :seq_len]
+                # ) = ops.convert_vertical_slash_indexes_mergehead(
+                #     q_seqlens, kv_seqlens, 
+                #     vertical_index_buff.unsqueeze(0), slash_index_buff.unsqueeze(0), 
+                #     vindices, sindices, context_size,
+                #     self.sparse_index_block_size, self.sparse_index_block_size)
 
             assert sparse_index_decode_meta.max_decode_query_len is not None
             if sparse_index_decode_meta.max_decode_query_len > 1:
@@ -1380,6 +1506,90 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale=layer._v_scale.expand(descale_shape),
                 )
             else:
+                # if sparse_index_decode_meta.num_sparse_index_recomputes == 0:
+                #     print("DEBUG")
+                # assert len(sparse_index_block) == 1
+                # sparse_index_block_idx = sparse_index_block[0]
+                # sparse_index_decode_block_table = sparse_index_decode_meta.block_tables[0]
+                # seq_len = sparse_index_decode_meta.max_decode_seq_len
+                # key = key_cache[sparse_index_decode_block_table].view(-1, *key_cache.shape[-2:])[: seq_len]
+                # value = value_cache[sparse_index_decode_block_table].view(-1, *value_cache.shape[-2:])[: seq_len]
+
+                # n_head = sparse_index_decode_query.size(-2)
+                # kv_head = key.size(-2)
+                # group_size = n_head // kv_head
+                # for head_i in range(n_head):
+                #     khead_i = head_i // group_size
+                #     block_count = block_count_gpu_cache[sparse_index_block_idx, head_i]
+                #     column_count = column_count_gpu_cache[sparse_index_block, head_i]
+                #     block_index = block_index_gpu_cache[sparse_index_block_idx, head_i, :block_count]
+                #     column_index = column_index_gpu_cache[sparse_index_block_idx, head_i, :column_count]
+                #     indices = torch.unique(torch.cat([((seq_len - 1) - block_index), column_index]))
+
+                #     q = sparse_index_decode_query[:, head_i:head_i+1, :]
+                #     k = key[indices, khead_i:khead_i+1, :]
+                #     v = value[indices, khead_i:khead_i+1, :]
+                #     flash_attn_varlen_func(
+                #         q=q,
+                #         k=k,
+                #         v=v,
+                #         softmax_scale=softmax_scale,
+                #         cu_seqlens_q=torch.tensor([0, 1],
+                #                                 dtype=torch.int32,
+                #                                 device=q.device),
+                #         max_seqlen_q=1,
+                #         cu_seqlens_k=torch.tensor([0, k.shape[0]],
+                #                                 dtype=torch.int32,
+                #                                 device=q.device),
+                #         max_seqlen_k=k.shape[0],
+                #         causal=True,
+                #         window_size=window_size,
+                #         alibi_slopes=alibi_slopes,
+                #         softcap=logits_soft_cap,
+                #         out=sparse_index_decode_output[:, head_i:head_i+1, :],
+                #         fa_version=self.vllm_flash_attn_version,
+                #     )
+
+                # # descale_shape = (sparse_index_decode_meta.seq_lens_tensor.shape[0], key_cache.shape[-2])
+                # flash_attn_varlen_func(
+                #     q=sparse_index_decode_query,
+                #     k=key,
+                #     v=value,
+                #     softmax_scale=softmax_scale,
+                #     cu_seqlens_q=torch.tensor([0, 1],
+                #                             dtype=torch.int32,
+                #                             device=query.device),
+                #     max_seqlen_q=1,
+                #     cu_seqlens_k=torch.tensor([0, key.shape[0]],
+                #                             dtype=torch.int32,
+                #                             device=query.device),
+                #     max_seqlen_k=key.shape[0],
+                #     causal=True,
+                #     window_size=window_size,
+                #     alibi_slopes=alibi_slopes,
+                #     softcap=logits_soft_cap,
+                #     out=sparse_index_decode_output,
+                #     fa_version=self.vllm_flash_attn_version,
+                #     # q_descale=layer._q_scale.expand(descale_shape),
+                #     # k_descale=layer._k_scale.expand(descale_shape),
+                #     # v_descale=layer._v_scale.expand(descale_shape),
+                # )
+                # block_count = block_count_gpu_cache[sparse_index_block_idx, ...].unsqueeze(-1)
+                # block_offset = block_index_gpu_cache[sparse_index_block_idx, ...].unsqueeze(-2)
+                # column_count = column_count_gpu_cache[sparse_index_block_idx, ...].unsqueeze(-1)
+                # column_index = column_index_gpu_cache[sparse_index_block_idx, ...].unsqueeze(-2)
+                # sparse_attn_func(
+                #     q=sparse_index_decode_query.unsqueeze(0),
+                #     k=key.unsqueeze(0),
+                #     v=value.unsqueeze(0),
+                #     block_count=block_count,
+                #     block_offset=block_offset,
+                #     column_count=column_count,
+                #     column_index=column_index,
+                #     causal=True,
+                #     softmax_scale=softmax_scale,
+                #     out=sparse_index_decode_output.unsqueeze(1)
+                # )
                 seq_lens_arg = sparse_index_decode_meta.seq_lens_tensor
                 block_tables_arg = sparse_index_decode_meta.block_tables
                 descale_shape = (seq_lens_arg.shape[0], key_cache.shape[-2])

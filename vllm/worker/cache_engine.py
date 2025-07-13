@@ -5,7 +5,7 @@ from typing import List
 import torch
 
 from vllm.attention import get_attn_backend
-from vllm.config import CacheConfig, DeviceConfig, ModelConfig, ParallelConfig
+from vllm.config import CacheConfig, DeviceConfig, ModelConfig, ParallelConfig, SpeculativeConfig
 from vllm.logger import init_logger
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
                         get_dtype_size, is_pin_memory_available)
@@ -27,11 +27,14 @@ class CacheEngine:
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
         device_config: DeviceConfig,
+        speculative_config: SpeculativeConfig = None
     ) -> None:
         self.cache_config = cache_config
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.device_config = device_config
+        self.speculative_config = speculative_config
+        self.enable_meta_cache = self.speculative_config and self.speculative_config.block_sparse_mode
 
         self.head_size = model_config.get_head_size()
         # Models like Jamba, have mixed typed layers, E.g Mamba
@@ -64,6 +67,34 @@ class CacheEngine:
         self.gpu_cache = self._allocate_kv_cache(
             self.num_gpu_blocks, self.device_config.device_type)
         self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
+
+        self.gpu_meta_cache = None
+        self.cpu_meta_cache = None
+        if self.enable_meta_cache:
+            self.gpu_meta_cache = self._allocate_key_meta_cache(
+                self.num_gpu_blocks, self.device_config.device_type)
+            self.cpu_meta_cache = self._allocate_key_meta_cache(
+                self.num_cpu_blocks, self.device_config.device_type)
+
+    def _allocate_key_meta_cache(
+        self,
+        num_blocks: int,
+        device: str
+    ) -> List[torch.Tensor]:
+        # TODO: add attn_backend interface.
+        key_meta_cache_shape = (num_blocks, self.num_kv_heads, 2, self.head_size)
+        pin_memory = is_pin_memory_available() if device == "cpu" else False
+        key_meta_cache: List[torch.Tensor] = []
+        
+        for _ in range(self.num_attention_layers):
+            layer_kv_cache = torch.zeros(
+                key_meta_cache_shape,
+                dtype=self.dtype,
+                pin_memory=pin_memory,
+                device=device)
+            key_meta_cache.append(layer_kv_cache)
+        
+        return key_meta_cache
 
     def _allocate_kv_cache(
         self,
@@ -108,25 +139,39 @@ class CacheEngine:
         for i in range(self.num_attention_layers):
             self.attn_backend.swap_blocks(self.cpu_cache[i], self.gpu_cache[i],
                                           src_to_dst)
+            if self.enable_meta_cache:
+                # TODO[shk]: support meta block swap
+                pass
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
         for i in range(self.num_attention_layers):
             self.attn_backend.swap_blocks(self.gpu_cache[i], self.cpu_cache[i],
                                           src_to_dst)
+            if self.enable_meta_cache:
+                # TODO[shk]: support meta block swap
+                pass
 
     def copy(self, src_to_dsts: torch.Tensor) -> None:
         self.attn_backend.copy_blocks(self.gpu_cache, src_to_dsts)
+        if self.enable_meta_cache:
+            # TODO[shk]: support meta block copy
+            pass
 
     @staticmethod
     def get_cache_block_size(
         cache_config: CacheConfig,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
+        speculative_config: SpeculativeConfig = None,
     ) -> int:
         head_size = model_config.get_head_size()
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_attention_layers = model_config.get_num_layers_by_block_type(
             parallel_config, LayerBlockType.attention)
+        
+        key_meta_entry = 0
+        if speculative_config and speculative_config.block_sparse_mode:
+            key_meta_entry = num_attention_layers * 2 * num_heads * head_size
 
         if cache_config.cache_dtype == "auto":
             dtype = model_config.dtype
@@ -139,7 +184,7 @@ class CacheEngine:
         # is joint keys and values.
         value_cache_entry = key_cache_entry if not model_config.use_mla else 0
         total = num_attention_layers * cache_config.block_size * \
-            (key_cache_entry + value_cache_entry)
+            (key_cache_entry + value_cache_entry) + key_meta_entry
 
         dtype_size = get_dtype_size(dtype)
         return dtype_size * total

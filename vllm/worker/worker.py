@@ -23,7 +23,7 @@ from vllm.platforms import current_platform
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (ExecuteModelRequest, IntermediateTensors,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta)
-from vllm.utils import (GiB_bytes, MemorySnapshot, bind_kv_cache,
+from vllm.utils import (GiB_bytes, MemorySnapshot, bind_kv_cache, bind_key_meta_cache,
                         memory_profiling)
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
@@ -97,6 +97,7 @@ class Worker(LocalOrDistributedWorkerBase):
         self.cache_engine: List[CacheEngine]
         # Initialize gpu_cache as pooling models don't initialize kv_caches
         self.gpu_cache: Optional[List[List[torch.Tensor]]] = None
+        self.gpu_meta_cache: Optional[List[List[torch.Tensor]]] = None
         self._seq_group_metadata_cache: Dict[str, SequenceGroupMetadata] = {}
 
         # Buffers saved before sleep
@@ -345,8 +346,15 @@ class Worker(LocalOrDistributedWorkerBase):
             self.cache_engine[ve].gpu_cache
             for ve in range(self.parallel_config.pipeline_parallel_size)
         ]
+        self.gpu_meta_cache = [
+            self.cache_engine[ve].gpu_meta_cache
+            for ve in range(self.parallel_config.pipeline_parallel_size)
+        ]
         bind_kv_cache(self.compilation_config.static_forward_context,
                       self.gpu_cache)
+        if self.gpu_meta_cache[0] is not None:
+            bind_key_meta_cache(self.compilation_config.static_forward_context,
+                                self.gpu_meta_cache)
 
     def _warm_up_model(self) -> None:
         # warm up sizes that are not in cudagraph capture sizes,
