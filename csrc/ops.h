@@ -347,6 +347,14 @@ void causal_conv1d_fwd(const at::Tensor& x, const at::Tensor& weight,
                        const std::optional<at::Tensor>& has_initial_state,
                        bool silu_activation, int64_t pad_slot_id);
 
+void lserve_page_selector(
+    const torch::Tensor& q,                   // [batch_size, num_q_head, head_dim]. Only for decode. bf16
+    const torch::Tensor& key_meta_cache,      // [num_block, num_kv_head, 2, head_dim] bf16
+    const torch::Tensor& block_table,         // [batch_size, max_block_size] int32
+    const torch::Tensor& num_full_blocks,     // [batch_size, ] int32
+    torch::Tensor& out                        // [batch_size, num_q_head, max_block_size] bf16
+);
+
 using fptr_t = int64_t;
 fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
                       torch::Tensor& rank_data, int64_t rank,

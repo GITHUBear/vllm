@@ -790,7 +790,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         seq_ids = seq_group_metadata.seq_data.keys()
         n_seqs = len(seq_ids)
         is_prompt = seq_group_metadata.is_prompt
-        if not self.runner.speculative_config.block_sparse_mode:
+        if (self.runner.speculative_config is not None) and (not self.runner.speculative_config.block_sparse_mode):
             is_sparse_index_recompute = seq_group_metadata.need_recompute_sparse_index(
                 recompute_index_step=self.runner.sparse_index_recompute_step,
             )

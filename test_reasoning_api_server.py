@@ -19,7 +19,9 @@ data = {
         {"role": "user", "content": prompt_template.format(question=question)}
     ],
     "temperature": 0,
-    "stream": True
+    "stream": True,
+    "ignore_eos": True,
+    "max_tokens": 65536,
 }
 
 try:

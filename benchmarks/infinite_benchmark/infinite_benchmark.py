@@ -102,6 +102,7 @@ def load_model(
     dca_recover_rate: float = None,
     sparse_prefill_type: str = None,
     max_num_seqs: int = None,
+    sparse_block: bool = False,
 ):
     tok = AutoTokenizer.from_pretrained(
         model_name, resume_download=None, trust_remote_code=trust_remote_code
@@ -131,26 +132,45 @@ def load_model(
             os.environ["VLLM_FA_SPARSE_PREFILL"] = sparse_prefill_type
             print(f"================ SPARSE PREFILL ENABLED: {sparse_prefill_type} ================")
 
-        llm = LLM(
-            model=model_name,
-            max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max_num_batched_tokens,
-            max_model_len=max_model_len,
-            tensor_parallel_size=tensor_parallel_size,
-            enforce_eager=enforce_eager,
-            enable_chunked_prefill=enable_chunked_prefill,
-        )
+        if sparse_block:
+            print(f"================ SPARSE BLOCK ENABLE ===============")
+            llm = LLM(
+                model=model_name,
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_model_len=max_model_len,
+                tensor_parallel_size=tensor_parallel_size,
+                enforce_eager=enforce_eager,
+                enable_chunked_prefill=enable_chunked_prefill,
+                speculative_config={
+                    "method": "standalone",
+                    "block_sparse_mode": True,
+                    "num_speculative_tokens": 4,
+                }
+            )
+        else:
+            llm = LLM(
+                model=model_name,
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_model_len=max_model_len,
+                tensor_parallel_size=tensor_parallel_size,
+                enforce_eager=enforce_eager,
+                enable_chunked_prefill=enable_chunked_prefill,
+            )
 
     print("Model and tokenizer loaded.")
     return llm, tok
 
-def gen_test_tag(enable_dca: bool, sparse_prefill_type, dca_recover_rate = None):
+def gen_test_tag(enable_dca: bool, sparse_prefill_type, dca_recover_rate = None, sparse_block: bool = False):
     if enable_dca:
         if dca_recover_rate is None:
             return "DCA"
         else:
             return f"DCA_wo_sparse_attn_config_{dca_recover_rate}"
     if sparse_prefill_type is None:
+        if sparse_block:
+            return "LSERVE"
         return "woDCA"
     if sparse_prefill_type == "1":
         return "XATTN"
@@ -187,6 +207,7 @@ if __name__ == "__main__":
         enable_dca=args.enable_dca,
         sparse_prefill_type=args.sparse_prefill_type,
         max_num_seqs=args.max_num_seqs,
+        sparse_block=args.sparse_block,
     )
     results = {}
 
@@ -201,7 +222,8 @@ if __name__ == "__main__":
         )
         
         # Data
-        tag = gen_test_tag(args.enable_dca, sparse_prefill_type=args.sparse_prefill_type, dca_recover_rate=args.dca_recover_rate)
+        tag = gen_test_tag(args.enable_dca, sparse_prefill_type=args.sparse_prefill_type, 
+                           dca_recover_rate=args.dca_recover_rate, sparse_block=args.sparse_block)
         result_dir = Path(args.output_dir, f"{real_model_name}_{tag}")
         result_dir.mkdir(exist_ok=True, parents=True)
         output_path = result_dir / f"prediction_{data_name}.jsonl"

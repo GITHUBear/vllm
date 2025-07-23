@@ -102,6 +102,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &convert_vertical_slash_indexes_mergehead);
 #endif
 
+  // LServe sparse page selector
+  ops.def(
+    "lserve_page_selector(Tensor q,"
+    "                     Tensor key_meta_cache,"
+    "                     Tensor block_table,"
+    "                     Tensor num_full_blocks,"
+    "                     Tensor! out) -> ()");
+  ops.impl("lserve_page_selector", torch::kCUDA, &lserve_page_selector);
+
   // Activation ops
   // Activation function used in SwiGLU.
   ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");

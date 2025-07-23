@@ -4,16 +4,16 @@ from urllib.request import urlopen
 
 from vllm import LLM, SamplingParams
 
-os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
+# os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
 os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-# os.environ["VLLM_USE_V1"] = "0"
+os.environ["VLLM_USE_V1"] = "0"
 # os.environ["VLLM_DCA_RECOVER_RATE"] = "0.9"
 # os.environ["CUDA_VISIBLE_DEVICES"]="4,5,6,7"
 
 # os.environ["VLLM_FA_SPARSE_PREFILL"] = "1"
 # os.environ["VLLM_ENABLE_LAST_ATTN_MAP_DUMP"] = "1"
 # os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-# os.environ["VLLM_SKIP_DCA_CONFIG"] = "1"
+os.environ["VLLM_SKIP_DCA_CONFIG"] = "1"
 # os.environ["VLLM_USE_V1"] = "0"
 
 
@@ -28,8 +28,8 @@ def load_prompt() -> str:
     with urlopen(
             # "https://qianwen-res.oss-cn-beijing.aliyuncs.com"
             # "/Qwen2.5-1M/test-data/600k.txt",
-            "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-1M/test-data/200k.txt",
-            # "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-1M/test-data/64k.txt",
+            # "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-1M/test-data/200k.txt",
+            "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-1M/test-data/64k.txt",
             timeout=5) as response:
         prompt = response.read().decode('utf-8')
     return prompt
@@ -71,7 +71,13 @@ def initialize_engine() -> LLM:
               enforce_eager=True,
               enable_chunked_prefill=True,
               max_num_batched_tokens=131072,
-              max_num_seqs=1)
+              max_num_seqs=1,
+            #   speculative_config={
+            #     "method": "standalone",
+            #     "block_sparse_mode": True,
+            #     "num_speculative_tokens": 4,
+            #   }
+              )
     return llm
 
 

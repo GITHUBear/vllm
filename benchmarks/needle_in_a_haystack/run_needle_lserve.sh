@@ -1,0 +1,1 @@
+python ./needle_test.py --model_name Qwen/Qwen2.5-7B-Instruct-1M --max_length 200000 --min_length 10000 --trust_remote_code --tensor_parallel_size 4 --enforce_eager --run_name lserve --max_model_len 402320 --max_num_batched_tokens 402320 --max_num_seqs 1 --enable_chunked_prefill --sparse_block

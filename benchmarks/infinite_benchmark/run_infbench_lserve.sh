@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=4,5,6,7 python ./infinite_benchmark.py --task passkey,number_string,kv_retrieval,longbook_sum_eng,longbook_choice_eng --enable_chunked_prefill --tensor_parallel_size 4 --trust_remote_code --enforce_eager --max_seq_length 402320 --max_num_batched_tokens 402320 --max_num_seqs 1 --sparse_block

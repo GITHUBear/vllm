@@ -339,7 +339,8 @@ class Worker(LocalOrDistributedWorkerBase):
         assert self.cache_config.num_gpu_blocks is not None
         self.cache_engine = [
             CacheEngine(self.cache_config, self.model_config,
-                        self.parallel_config, self.device_config)
+                        self.parallel_config, self.device_config,
+                        self.speculative_config)
             for _ in range(self.parallel_config.pipeline_parallel_size)
         ]
         self.gpu_cache = [
@@ -524,7 +525,8 @@ class Worker(LocalOrDistributedWorkerBase):
         """
         return CacheEngine.get_cache_block_size(self.cache_config,
                                                 self.model_config,
-                                                self.parallel_config)
+                                                self.parallel_config,
+                                                self.speculative_config)
 
 
 def init_worker_distributed_environment(

@@ -59,4 +59,5 @@ def parse_args() -> Namespace:
     p.add_argument("--enable_dca", action="store_true")
     p.add_argument("--dca_recover_rate", type=float, default=None)
     p.add_argument("--sparse_prefill_type", type=str, default=None)
+    p.add_argument("--sparse_block", action="store_true")
     return p.parse_args()

@@ -198,7 +198,28 @@ class LLMNeedleHaystackTester:
             config.model_name, trust_remote_code=config.trust_remote_code
         )
 
-        if self.config.enable_dca:
+        if self.config.sparse_block:
+            print("################# ENABLE SPARSE BLOCK\n")
+            os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+            os.environ["VLLM_USE_V1"] = "0"
+            os.environ["VLLM_SKIP_DCA_CONFIG"] = "1"
+
+            self.model = LLM(
+                model=self.config.model_name,
+                # max_num_seqs=1,
+                max_num_batched_tokens=config.max_num_batched_tokens,
+                max_model_len=config.max_model_len,
+                max_num_seqs=config.max_num_seqs,
+                tensor_parallel_size=config.tensor_parallel_size,
+                enforce_eager=config.enforce_eager,
+                enable_chunked_prefill=config.enable_chunked_prefill,
+                speculative_config={
+                    "method": "standalone",
+                    "block_sparse_mode": True,
+                    "num_speculative_tokens": 4,
+                }
+            )
+        elif self.config.enable_dca:
             print("################# ENABLE DCA\n")
             os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
 
