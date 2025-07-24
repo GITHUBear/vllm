@@ -173,7 +173,7 @@ inline __device__ __host__ constexpr unsigned threads_per_value(unsigned dh)
 }
 
 template <int THREAD_PER_KEY>
-inline __device__ float qk_hmma_dot_min_max(const half2* q, const half2* k_max, const half2* k_min)
+inline __device__ half qk_hmma_dot_min_max(const half2* q, const half2* k_max, const half2* k_min)
 {
     half2 acc_max = __hmul2(q[0], k_max[0]);
     half2 acc_min = __hmul2(q[0], k_min[0]);
@@ -185,20 +185,31 @@ inline __device__ float qk_hmma_dot_min_max(const half2* q, const half2* k_max, 
         acc_min = __hmul2(q[ii], k_min[ii]);
         acc = __hadd2(acc, __hmax2(acc_max, acc_min));
     }
-    float qk_min_max = __half2float(__hadd(acc.x, acc.y));
-
+    float acc_for_shuffle = *(reinterpret_cast<float*>(&(acc)));
 #pragma unroll
-    for (int mask = THREAD_PER_KEY / 2; mask >= 1; mask /= 2)
+    for (int mask = THREAD_PER_KEY / 2; mask >= 1; mask /= 2) 
     {
-        qk_min_max += __shfl_xor_sync(uint32_t(-1), qk_min_max, mask);
+        acc_for_shuffle = __shfl_xor_sync(uint32_t(-1), acc_for_shuffle, mask);
+        acc = __hadd2(acc, *(reinterpret_cast<half2*>(&(acc_for_shuffle))));
+        acc_for_shuffle = *(reinterpret_cast<float*>(&(acc)));
     }
+    return __hadd(acc.x, acc.y);
 
-    return qk_min_max;
+//     float qk_min_max = __half2float(__hadd(acc.x, acc.y));
+
+// #pragma unroll
+//     for (int mask = THREAD_PER_KEY / 2; mask >= 1; mask /= 2)
+//     {
+//         qk_min_max += __shfl_xor_sync(uint32_t(-1), qk_min_max, mask);
+//     }
+
+//     return qk_min_max;
 }
 
 template <int THREAD_PER_KEY>
-inline __device__ float qk_hmma_dot_min_max(const __nv_bfloat162* q, const __nv_bfloat162* k_max, const __nv_bfloat162* k_min)
+inline __device__ __nv_bfloat16 qk_hmma_dot_min_max(const __nv_bfloat162* q, const __nv_bfloat162* k_max, const __nv_bfloat162* k_min)
 {
+    static_assert(sizeof(float) == sizeof(__nv_bfloat162));
     __nv_bfloat162 acc_max = __hmul2(q[0], k_max[0]);
     __nv_bfloat162 acc_min = __hmul2(q[0], k_min[0]);
     __nv_bfloat162 acc = __hmax2(acc_max, acc_min);
@@ -209,15 +220,24 @@ inline __device__ float qk_hmma_dot_min_max(const __nv_bfloat162* q, const __nv_
         acc_min = __hmul2(q[ii], k_min[ii]);
         acc = __hadd2(acc, __hmax2(acc_max, acc_min));
     }
-    float qk_min_max = __bfloat162float(__hadd(acc.x, acc.y));
-
+    float acc_for_shuffle = *(reinterpret_cast<float*>(&(acc)));
 #pragma unroll
-    for (int mask = THREAD_PER_KEY / 2; mask >= 1; mask /= 2)
+    for (int mask = THREAD_PER_KEY / 2; mask >= 1; mask /= 2) 
     {
-        qk_min_max += __shfl_xor_sync(uint32_t(-1), qk_min_max, mask);
+        acc_for_shuffle = __shfl_xor_sync(uint32_t(-1), acc_for_shuffle, mask);
+        acc = __hadd2(acc, *(reinterpret_cast<__nv_bfloat162*>(&(acc_for_shuffle))));
+        acc_for_shuffle = *(reinterpret_cast<float*>(&(acc)));
     }
+    return __hadd(acc.x, acc.y);
+//     float qk_min_max = __bfloat162float(__hadd(acc.x, acc.y));
 
-    return qk_min_max;
+// #pragma unroll
+//     for (int mask = THREAD_PER_KEY / 2; mask >= 1; mask /= 2)
+//     {
+//         qk_min_max += __shfl_xor_sync(uint32_t(-1), qk_min_max, mask);
+//     }
+
+//     return qk_min_max;
 }
 
 template <
@@ -259,14 +279,13 @@ __global__ void lserve_page_selector_kernel(
     static_assert(THREADS_PER_BLOCK >= META_CACHE_BLOCKS_PER_THREAD_BLOCK);
     __shared__ __align__(sizeof(int)) int BLOCK_TABLE_FOR_THREAD_BLOCK[META_CACHE_BLOCKS_PER_THREAD_BLOCK];
     const int* block_table_gmem_ptr = block_table + batch_id * max_block_size + logical_meta_cache_blocks_id;
-    if (logical_meta_cache_blocks_id + tid < num_max_blocks) {
-        BLOCK_TABLE_FOR_THREAD_BLOCK[tid] = *(block_table_gmem_ptr + tid);
-    } else if (tid < META_CACHE_BLOCKS_PER_THREAD_BLOCK) {
-        // 设置为 0 号 block，以免后续引入复杂的边界检查
-        BLOCK_TABLE_FOR_THREAD_BLOCK[tid] = 0;
+    if (tid < META_CACHE_BLOCKS_PER_THREAD_BLOCK) {
+        BLOCK_TABLE_FOR_THREAD_BLOCK[tid] = (logical_meta_cache_blocks_id + tid < num_max_blocks) ? 
+                                            *(block_table_gmem_ptr + tid) : 0;
     }
     // __syncthreads();
 
+    // q_vec 能够保证是一个 WARP 处理装载, 不出现 WARP DIVERGENCE
     using q_vec = typename Q_VEC_TRANSFER<T, HEAD_DIM>::Type;
     constexpr unsigned Q_VEC_SIZE = sizeof(q_vec) / sizeof(T);
     const auto qvec_offset = tid * Q_VEC_SIZE;
@@ -304,7 +323,7 @@ __global__ void lserve_page_selector_kernel(
         block_table_idx += NUM_META_BLOCK_PER_THREAD_BLOCK, ++iter) 
     {
         int block_id = BLOCK_TABLE_FOR_THREAD_BLOCK[block_table_idx];
-        const T* key_max_cache_gmem_ptr = key_meta_cache + block_id * kmc_stride0 + khead_id * kmc_stride0;
+        const T* key_max_cache_gmem_ptr = key_meta_cache + block_id * kmc_stride0 + khead_id * kmc_stride1;
         const T* key_min_cache_gmem_ptr = key_max_cache_gmem_ptr + kmc_stride2;
         calc_max_kvec[iter] = *reinterpret_cast<const cvec*>(key_max_cache_gmem_ptr + calc_qvec_offset);
         calc_min_kvec[iter] = *reinterpret_cast<const cvec*>(key_min_cache_gmem_ptr + calc_qvec_offset);
@@ -321,15 +340,16 @@ __global__ void lserve_page_selector_kernel(
         qk_type* q = reinterpret_cast<qk_type*>(&(calc_qvec));
         qk_type* k_max = reinterpret_cast<qk_type*>(&(calc_max_kvec[iter]));
         qk_type* k_min = reinterpret_cast<qk_type*>(&(calc_min_kvec[iter]));
-        float qk_min_max = qk_hmma_dot_min_max<THREAD_PER_KEY>(q, k_max, k_min);
+        auto qk_min_max = qk_hmma_dot_min_max<THREAD_PER_KEY>(q, k_max, k_min);
 
         // 5. 结果写回 out
         if (calc_qvec_offset == 0) {
-            if constexpr(std::is_same<T, uint16_t>::value) {
-                *(out_gmem_ptr + logical_block_id) = __float2half(qk_min_max);
-            } else {
-                *(out_gmem_ptr + logical_block_id) = __float2bfloat16(qk_min_max);
-            }
+            *(out_gmem_ptr + logical_block_id) = qk_min_max;
+            // if constexpr(std::is_same<T, uint16_t>::value) {
+            //     *(out_gmem_ptr + logical_block_id) = qk_min_max;
+            // } else {
+            //     *(out_gmem_ptr + logical_block_id) = qk_min_max;
+            // }
         }
     }
 }
@@ -344,7 +364,6 @@ void lserve_page_selector_kernel_launch(
     const int batch_size,
     const int num_q_head,
     const int num_kv_head,
-    const int head_dim,
     const int max_block_size,
 
     const int64_t qstride0, const int64_t qstride1
@@ -352,9 +371,9 @@ void lserve_page_selector_kernel_launch(
     // auto constexpr threads_per_value = threads_per_value<T>(HEAD_DIM);
     constexpr unsigned META_CACHE_BLOCKS_PER_THREAD_BLOCK = 64;
     const unsigned num_block_tiles = (max_block_size + META_CACHE_BLOCKS_PER_THREAD_BLOCK - 1) / META_CACHE_BLOCKS_PER_THREAD_BLOCK;
-    const int64_t kmc_stride0 = ((int64_t)1) * num_kv_head * 2 * head_dim;
-    const int64_t kmc_stride1 = ((int64_t)1) * 2 * head_dim;
-    const int64_t kmc_stride2 = ((int64_t)1) * head_dim;
+    const int64_t kmc_stride0 = ((int64_t)1) * num_kv_head * 2 * HEAD_DIM;
+    const int64_t kmc_stride1 = ((int64_t)1) * 2 * HEAD_DIM;
+    const int64_t kmc_stride2 = ((int64_t)1) * HEAD_DIM;
     const int64_t out_stride0 = ((int64_t)1) * num_q_head * max_block_size;
     const int64_t out_stride1 = ((int64_t)1) * max_block_size;
     dim3 grid(batch_size, num_q_head, num_block_tiles);
@@ -394,7 +413,6 @@ void lserve_page_selector_head_dim_dispatcher(
             num_q_head,
             num_kv_head,
             max_block_size,
-            head_dim,
             qstride0, qstride1
         );
     });
@@ -424,7 +442,7 @@ void lserve_page_selector(
     int batch_size = q.size(0);
     int num_q_head = q.size(1);
     int head_dim = q.size(-1);
-    int num_kv_head = key_meta_cache.size(0);
+    int num_kv_head = key_meta_cache.size(1);
     TORCH_CHECK(num_q_head % num_kv_head == 0);
 
     int max_block_size = block_table.size(-1);
