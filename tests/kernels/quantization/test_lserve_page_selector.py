@@ -17,16 +17,17 @@ batch_size = 10
 num_q_head = 8
 head_dim = 128
 num_kv_head = 1
-num_block = 10000
-max_block_size = 10000
+num_block = 4000
+max_block_size = 4000
+data_type = torch.float16
 
 with torch.device("cuda:0"):
     # q = torch.randint(1, 41, (batch_size, num_q_head, head_dim))
     # q = q.to(dtype=torch.bfloat16)
     # key_meta_cache = torch.randint(1, 41, (num_block, num_kv_head, 2, head_dim))
     # key_meta_cache = key_meta_cache.to(dtype=torch.bfloat16)
-    q = torch.rand((batch_size, num_q_head, head_dim), dtype=torch.bfloat16)
-    key_meta_cache = torch.rand((num_block, num_kv_head, 2, head_dim), dtype=torch.bfloat16)
+    q = torch.rand((batch_size, num_q_head, head_dim), dtype=data_type)
+    key_meta_cache = torch.rand((num_block, num_kv_head, 2, head_dim), dtype=data_type)
     # for i in range(num_q_head):
     #     q[:, i, :] = torch.ones((head_dim), dtype=torch.bfloat16) * (i + 1)
     # for i in range(num_kv_head):
@@ -34,9 +35,10 @@ with torch.device("cuda:0"):
     block_table = torch.randint(low=0, high=num_block, size=(batch_size, max_block_size), dtype=torch.int)
     # block_table = torch.tensor([[0]], dtype=torch.int)
     # num_full_blocks = torch.tensor([1], dtype=torch.int)
-    num_full_blocks = torch.ones((batch_size,), dtype=torch.int) * max_block_size
-    out_std = torch.zeros((batch_size, num_q_head, max_block_size), dtype=torch.bfloat16)
-    out = torch.zeros((batch_size, num_q_head, max_block_size), dtype=torch.bfloat16)
+    num_full_blocks = torch.randint(low=max_block_size // 2, high=max_block_size+1, size=(batch_size,), dtype=torch.int)
+    # num_full_blocks = torch.ones((batch_size,), dtype=torch.int) * max_block_size
+    out_std = torch.zeros((batch_size, num_q_head, max_block_size), dtype=data_type)
+    out = torch.zeros((batch_size, num_q_head, max_block_size), dtype=data_type)
 
     print(q)
     print()
@@ -82,23 +84,24 @@ with torch.device("cuda:0"):
     end_event1.record()
     torch.cuda.synchronize()
     elapsed_time_ms = start_event1.elapsed_time(end_event1)
-    print(f"torch cost: {elapsed_time_ms / 10:.3f}ms")
+    print(f"torch cost: {elapsed_time_ms}ms")
     print(f"std: {out_std}")
     print()
 
     print("=======================================")
     start_event2.record()
-    torch.ops._C.lserve_page_selector(
-        q,
-        key_meta_cache,
-        block_table,
-        num_full_blocks,
-        out,
-    )
+    for _ in range(20):
+        torch.ops._C.lserve_page_selector(
+            q,
+            key_meta_cache,
+            block_table,
+            num_full_blocks,
+            out,
+        )
     end_event2.record()
     torch.cuda.synchronize()
     elapsed_time_ms = start_event2.elapsed_time(end_event2)
-    print(f"cuda cost: {elapsed_time_ms / 10:.3f}ms")
+    print(f"cuda cost: {elapsed_time_ms/20}ms")
     print(out)
     print()
 

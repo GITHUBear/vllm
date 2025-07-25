@@ -41,7 +41,7 @@ struct SATypeConverter {
 
 template<>
 struct SATypeConverter<at::Half> {
-    using Type = uint16_t;
+    using Type = __half;
 };
 
 template<>
@@ -56,25 +56,25 @@ struct Q_VEC_TRANSFER
 };
 
 template <>
-struct Q_VEC_TRANSFER<uint16_t, 32>
+struct Q_VEC_TRANSFER<__half, 32>
 {
     using Type = uint32_t;
 };
 
 template <>
-struct Q_VEC_TRANSFER<uint16_t, 64>
+struct Q_VEC_TRANSFER<__half, 64>
 {
     using Type = uint32_t;
 };
 
 template <>
-struct Q_VEC_TRANSFER<uint16_t, 128>
+struct Q_VEC_TRANSFER<__half, 128>
 {
     using Type = uint2;
 };
 
 template <>
-struct Q_VEC_TRANSFER<uint16_t, 256>
+struct Q_VEC_TRANSFER<__half, 256>
 {
     using Type = uint4;
 };
@@ -111,19 +111,19 @@ struct CALC_VEC
 };
 
 template <>
-struct CALC_VEC<uint16_t, 2>
+struct CALC_VEC<__half, 2>
 {
     using Type = uint32_t;
 };
 
 template <>
-struct CALC_VEC<uint16_t, 4>
+struct CALC_VEC<__half, 4>
 {
     using Type = uint2;
 };
 
 template <>
-struct CALC_VEC<uint16_t, 8>
+struct CALC_VEC<__half, 8>
 {
     using Type = uint4;
 };
@@ -154,7 +154,7 @@ struct QkDotMinMaxTypeConverter
 };
 
 template <>
-struct QkDotMinMaxTypeConverter<uint16_t, uint4>
+struct QkDotMinMaxTypeConverter<__half, uint4>
 {
     using Type = half2;
 };
@@ -173,7 +173,7 @@ inline __device__ __host__ constexpr unsigned threads_per_value(unsigned dh)
 }
 
 template <int THREAD_PER_KEY>
-inline __device__ half qk_hmma_dot_min_max(const half2* q, const half2* k_max, const half2* k_min)
+inline __device__ __half qk_hmma_dot_min_max(const half2* q, const half2* k_max, const half2* k_min)
 {
     half2 acc_max = __hmul2(q[0], k_max[0]);
     half2 acc_min = __hmul2(q[0], k_min[0]);
