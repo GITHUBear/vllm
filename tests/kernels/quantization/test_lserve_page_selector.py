@@ -11,14 +11,14 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# seed_everything(0)
+seed_everything(0)
 
 batch_size = 10
 num_q_head = 8
 head_dim = 128
 num_kv_head = 1
-num_block = 4000
-max_block_size = 4000
+num_block = 4096
+max_block_size = 4096
 data_type = torch.float16
 
 with torch.device("cuda:0"):
@@ -37,8 +37,8 @@ with torch.device("cuda:0"):
     # num_full_blocks = torch.tensor([1], dtype=torch.int)
     num_full_blocks = torch.randint(low=max_block_size // 2, high=max_block_size+1, size=(batch_size,), dtype=torch.int)
     # num_full_blocks = torch.ones((batch_size,), dtype=torch.int) * max_block_size
-    out_std = torch.zeros((batch_size, num_q_head, max_block_size), dtype=data_type)
-    out = torch.zeros((batch_size, num_q_head, max_block_size), dtype=data_type)
+    out_std = torch.zeros((batch_size, num_kv_head, max_block_size), dtype=data_type)
+    out = torch.zeros((batch_size, num_kv_head, max_block_size), dtype=data_type)
 
     print(q)
     print()
@@ -57,27 +57,52 @@ with torch.device("cuda:0"):
     end_event2 = torch.cuda.Event(enable_timing=True)
 
     start_event1.record()
+    new_q = q.reshape(batch_size, num_kv_head, head_group_size, head_dim).transpose(1,2)
     for bi in range(batch_size):
         num_full_blk = num_full_blocks[bi].item()
         block_id = block_table[bi, :num_full_blk]
         kmc = key_meta_cache[block_id, ...]
         
-        for qhead_id in range(num_q_head):
-            # print(f"batch_id:{bi} qhead_id:{qhead_id}")
-            khead_id = qhead_id // head_group_size
-            cur_q = q[bi, qhead_id, :]
-            cur_kmc_max = kmc[:, khead_id, 0, :]
-            cur_kmc_min = kmc[:, khead_id, 1, :]
-            # print(f"cur_q.shape={cur_q.shape}  cur_kmc_max.shape={cur_kmc_max.shape} cur_kmc_min.shape={cur_kmc_min.shape}")
-            max_qk = cur_q * cur_kmc_max
-            # print(max_qk)
-            min_qk = cur_q * cur_kmc_min
-            # print(min_qk)
-            # print(min_qk.shape)
-            concated_qk = torch.concat([max_qk.unsqueeze(1), min_qk.unsqueeze(1)], dim=1).max(dim=1).values
-            # out_std[bi, qhead_id, ]
-            cur_block_size = concated_qk.size(0)
-            out_std[bi, qhead_id, :cur_block_size] = concated_qk.sum(dim=-1)
+        for head_id in range(num_kv_head):
+            cur_kmc_max = kmc[:, head_id, 0, :]
+            cur_kmc_min = kmc[:, head_id, 1, :]
+
+            seq_res = []
+            for seq_id in range(head_group_size):
+                cur_q = new_q[bi, seq_id, head_id, :]
+                # print(f"cur_q.shape={cur_q.shape}  cur_kmc_max.shape={cur_kmc_max.shape} cur_kmc_min.shape={cur_kmc_min.shape}")
+                max_qk = cur_q * cur_kmc_max
+                # print(max_qk)
+                min_qk = cur_q * cur_kmc_min
+                # print(min_qk)
+                # print(min_qk.shape)
+                concated_qk = torch.concat([max_qk.unsqueeze(1), min_qk.unsqueeze(1)], dim=1).max(dim=1).values
+                # out_std[bi, qhead_id, ]
+                # cur_block_size = concated_qk.size(0)
+                # out_std[bi, qhead_id, :cur_block_size] = concated_qk.sum(dim=-1)
+                # print(concated_qk.shape)
+                seq_res.append(concated_qk.sum(dim=-1))
+            sum_res = torch.stack(seq_res).sum(dim=0)
+            # print(sum_res.shape)
+            cur_block_size = sum_res.size(0)
+            out_std[bi, head_id, :cur_block_size] = sum_res
+
+        # for qhead_id in range(num_q_head):
+        #     # print(f"batch_id:{bi} qhead_id:{qhead_id}")
+        #     khead_id = qhead_id // head_group_size
+        #     cur_q = q[bi, qhead_id, :]
+        #     cur_kmc_max = kmc[:, khead_id, 0, :]
+        #     cur_kmc_min = kmc[:, khead_id, 1, :]
+        #     # print(f"cur_q.shape={cur_q.shape}  cur_kmc_max.shape={cur_kmc_max.shape} cur_kmc_min.shape={cur_kmc_min.shape}")
+        #     max_qk = cur_q * cur_kmc_max
+        #     # print(max_qk)
+        #     min_qk = cur_q * cur_kmc_min
+        #     # print(min_qk)
+        #     # print(min_qk.shape)
+        #     concated_qk = torch.concat([max_qk.unsqueeze(1), min_qk.unsqueeze(1)], dim=1).max(dim=1).values
+        #     # out_std[bi, qhead_id, ]
+        #     cur_block_size = concated_qk.size(0)
+        #     out_std[bi, qhead_id, :cur_block_size] = concated_qk.sum(dim=-1)
             # print(concated_qk.shape)
             # print(f"batch_size: {bi} qhead_id: {qhead_id} res: {concated_qk.sum(dim=-1)}")
             # print()
@@ -87,6 +112,17 @@ with torch.device("cuda:0"):
     print(f"torch cost: {elapsed_time_ms}ms")
     print(f"std: {out_std}")
     print()
+
+    for _ in range(20):
+        torch.ops._C.lserve_page_selector(
+            q,
+            key_meta_cache,
+            block_table,
+            num_full_blocks,
+            out,
+        )
+        topk = torch.topk(out, k=256, largest=True).index
+    torch.cuda.synchronize()
 
     print("=======================================")
     start_event2.record()
@@ -98,12 +134,16 @@ with torch.device("cuda:0"):
             num_full_blocks,
             out,
         )
+        topk = torch.topk(out, k=256, largest=True).index
+        # out.topk(k=256, dim=-1).index
+        # out.sort(dim=-1)
     end_event2.record()
     torch.cuda.synchronize()
     elapsed_time_ms = start_event2.elapsed_time(end_event2)
     print(f"cuda cost: {elapsed_time_ms/20}ms")
     print(out)
+    print(out.shape)
     print()
 
     print(torch.abs(out - out_std).flatten().max())
-    # print(f"matched? {torch.allclose(out, out_std, atol=1)}")
+    print(f"matched? {torch.allclose(out, out_std, atol=1)}")

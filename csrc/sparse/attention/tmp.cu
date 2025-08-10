@@ -354,6 +354,167 @@ __global__ void lserve_page_selector_kernel(
     }
 }
 
+inline __device__ void f16_vec_add8(__nv_bfloat162* a, __nv_bfloat162* b)
+{
+    #pragma unroll
+    for (int ii = 0; ii < 4; ++ii) {
+        a[ii] = __hadd2(a[ii], b[ii]);
+    }
+}
+
+inline __device__ void f16_vec_add8(half2* a, half2* b)
+{
+    #pragma unroll
+    for (int ii = 0; ii < 4; ++ii) {
+        a[ii] = __hadd2(a[ii], b[ii]);
+    }
+}
+
+template <
+    typename T, 
+    int HEAD_DIM, 
+    unsigned THREADS_PER_BLOCK = 256,
+    unsigned THREAD_PER_KEY = threads_per_value<T>(HEAD_DIM),
+    unsigned META_CACHE_BLOCKS_PER_THREAD_BLOCK = 64>  // 目前设置为 64
+__global__ void lserve_page_selector_kernel_v2(
+    const T* q,                     // [batch_size, seqlen_q, num_head, head_dim]
+    const T* key_meta_cache,        // [num_block, num_kv_head, 2, head_dim]
+    const int* block_table,
+    const int* num_full_blocks,
+    T* out,
+    const int seqlen_q,
+    const int num_head,
+    const int max_block_size,
+
+    const int64_t qstride0, const int64_t qstride1, const int64_t qstride2,
+    const int64_t kmc_stride0, const int64_t kmc_stride1, const int64_t kmc_stride2,
+    const int64_t out_stride0, const int64_t out_stride1
+) {
+    const auto tid = threadIdx.x;
+    const auto batch_id = blockIdx.x;
+    const auto head_id = blockIdx.y;
+    const auto block_tile_id = blockIdx.z;
+
+    // 0.0 判断现在要处理的 META_CACHE_BLOCKS_PER_THREAD_BLOCK 个 meta cache block 是否超过了 num_full_blocks
+    // 如果超过则直接return
+    const unsigned logical_meta_cache_blocks_id = META_CACHE_BLOCKS_PER_THREAD_BLOCK * block_tile_id;
+    int num_max_blocks = num_full_blocks[batch_id];
+    if (logical_meta_cache_blocks_id >= num_max_blocks) {
+        return;
+    }
+
+    // 0.1 读取 block table 到 smem
+    static_assert(THREADS_PER_BLOCK >= META_CACHE_BLOCKS_PER_THREAD_BLOCK);
+    __shared__ __align__(sizeof(int)) int BLOCK_TABLE_FOR_THREAD_BLOCK[META_CACHE_BLOCKS_PER_THREAD_BLOCK];
+    const int* block_table_gmem_ptr = block_table + batch_id * max_block_size + logical_meta_cache_blocks_id;
+    if (tid < META_CACHE_BLOCKS_PER_THREAD_BLOCK) {
+        BLOCK_TABLE_FOR_THREAD_BLOCK[tid] = (logical_meta_cache_blocks_id + tid < num_max_blocks) ? 
+                                            *(block_table_gmem_ptr + tid) : 0;
+    }
+    // __syncthreads();
+
+    // 2. 从 gmem 装载到寄存器
+    const T* query_gmem_ptr = q + qstride0 * batch_id + qstride2 * head_id;
+    constexpr auto CALC_VEC_SIZE = 16u / sizeof(T);
+    constexpr auto ELEMENTS_PER_CHUNK = THREAD_PER_KEY * CALC_VEC_SIZE;
+    // 目前的检查下可以保证刚好可以处理一整个 HEAD_DIM
+    static_assert(ELEMENTS_PER_CHUNK == HEAD_DIM);
+    // 每个线程的 CALC_VEC 寄存器
+    using cvec = typename CALC_VEC<T, CALC_VEC_SIZE>::Type;
+    cvec calc_qvec;
+    // 每个线程只需要独立处理 query 的 CALC_VEC_SIZE 大小即可
+    const auto calc_qvec_offset = (tid % THREAD_PER_KEY) * CALC_VEC_SIZE;
+    calc_qvec = *reinterpret_cast<const cvec*>(&((query_gmem_ptr)[calc_qvec_offset]));
+    using qk_type = typename QkDotMinMaxTypeConverter<T, cvec>::Type;
+#pragma unroll
+    for (int i = 1; i < seqlen_q; ++i) {
+        cvec tmp = *reinterpret_cast<const cvec*>(&((query_gmem_ptr + i * qstride1)[calc_qvec_offset]));
+        f16_vec_add8(
+            reinterpret_cast<qk_type*>(&calc_qvec),
+            reinterpret_cast<qk_type*>(&tmp)
+        );
+    }
+
+    constexpr unsigned NUM_META_BLOCK_PER_THREAD_BLOCK = THREADS_PER_BLOCK / THREAD_PER_KEY;
+    static_assert(META_CACHE_BLOCKS_PER_THREAD_BLOCK % NUM_META_BLOCK_PER_THREAD_BLOCK == 0);
+    constexpr auto ITERS = META_CACHE_BLOCKS_PER_THREAD_BLOCK / NUM_META_BLOCK_PER_THREAD_BLOCK;
+    // 3. 从 gmem 中向量化 load 每个线程需要的数据
+    cvec calc_max_kvec[ITERS];
+    cvec calc_min_kvec[ITERS];
+#pragma unroll
+    for (int block_table_idx = tid / THREAD_PER_KEY, iter = 0; 
+        block_table_idx < META_CACHE_BLOCKS_PER_THREAD_BLOCK; 
+        block_table_idx += NUM_META_BLOCK_PER_THREAD_BLOCK, ++iter) 
+    {
+        int block_id = BLOCK_TABLE_FOR_THREAD_BLOCK[block_table_idx];
+        const T* key_max_cache_gmem_ptr = key_meta_cache + block_id * kmc_stride0 + head_id * kmc_stride1;
+        const T* key_min_cache_gmem_ptr = key_max_cache_gmem_ptr + kmc_stride2;
+        calc_max_kvec[iter] = *reinterpret_cast<const cvec*>(key_max_cache_gmem_ptr + calc_qvec_offset);
+        calc_min_kvec[iter] = *reinterpret_cast<const cvec*>(key_min_cache_gmem_ptr + calc_qvec_offset);
+    }
+    __syncthreads();
+
+    // 4. 每个线程计算局部向量点积，再reduce求和
+    T* out_gmem_ptr = out + batch_id * out_stride0 + head_id * out_stride1;
+    unsigned logical_block_id = logical_meta_cache_blocks_id + (tid / THREAD_PER_KEY);
+#pragma unroll
+    for (int iter = 0; iter < ITERS && logical_block_id < num_max_blocks;
+         ++iter, logical_block_id += NUM_META_BLOCK_PER_THREAD_BLOCK) {
+        qk_type* q = reinterpret_cast<qk_type*>(&(calc_qvec));
+        qk_type* k_max = reinterpret_cast<qk_type*>(&(calc_max_kvec[iter]));
+        qk_type* k_min = reinterpret_cast<qk_type*>(&(calc_min_kvec[iter]));
+        auto qk_min_max = qk_hmma_dot_min_max<THREAD_PER_KEY>(q, k_max, k_min);
+
+        // 5. 结果写回 out
+        if (calc_qvec_offset == 0) {
+            *(out_gmem_ptr + logical_block_id) = qk_min_max;
+            // if constexpr(std::is_same<T, uint16_t>::value) {
+            //     *(out_gmem_ptr + logical_block_id) = qk_min_max;
+            // } else {
+            //     *(out_gmem_ptr + logical_block_id) = qk_min_max;
+            // }
+        }
+    }
+}
+
+template<typename T, int HEAD_DIM>
+void lserve_page_selector_kernel_launch_v2(
+    const T* q,                     // [batch_size, seqlen_q, num_head, head_dim]
+    const T* key_meta_cache,        // [num_block, num_head, 2, head_dim]
+    const int* block_table,         // [batch_size, max_block_size]
+    const int* num_full_blocks,     // [batch_size, ]
+    T* out,                         // [batch_size, num_head, max_block_size]
+    const int batch_size,
+    const int seqlen_q,
+    const int num_head,
+    const int max_block_size,
+
+    const int64_t qstride0, 
+    const int64_t qstride1,
+    const int64_t qstride2
+) {
+    // auto constexpr threads_per_value = threads_per_value<T>(HEAD_DIM);
+    constexpr unsigned META_CACHE_BLOCKS_PER_THREAD_BLOCK = 64;
+    const unsigned num_block_tiles = (max_block_size + META_CACHE_BLOCKS_PER_THREAD_BLOCK - 1) / META_CACHE_BLOCKS_PER_THREAD_BLOCK;
+    const int64_t kmc_stride0 = ((int64_t)1) * num_head * 2 * HEAD_DIM;
+    const int64_t kmc_stride1 = ((int64_t)1) * 2 * HEAD_DIM;
+    const int64_t kmc_stride2 = ((int64_t)1) * HEAD_DIM;
+    const int64_t out_stride0 = ((int64_t)1) * num_head * max_block_size;
+    const int64_t out_stride1 = ((int64_t)1) * max_block_size;
+    dim3 grid(batch_size, num_head, num_block_tiles);
+    dim3 block(256);
+    lserve_page_selector_kernel_v2<T, HEAD_DIM><<<grid, block>>>(
+        q, key_meta_cache, block_table,
+        num_full_blocks, out,
+        seqlen_q,
+        num_head,
+        max_block_size,
+        qstride0, qstride1, qstride2,
+        kmc_stride0, kmc_stride1, kmc_stride2,
+        out_stride0, out_stride1
+    );
+}
+
 template<typename T, int HEAD_DIM>
 void lserve_page_selector_kernel_launch(
     const T* q,
@@ -391,182 +552,6 @@ void lserve_page_selector_kernel_launch(
 }
 
 template<typename T>
-void lserve_page_selector_head_dim_dispatcher(
-    const T* q,
-    const T* key_meta_cache,
-    const int* block_table,
-    const int* num_full_blocks,
-    T* out,
-    const int batch_size,
-    const int num_q_head,
-    const int num_kv_head,
-    const int head_dim,
-    const int max_block_size,
-
-    const int64_t qstride0, const int64_t qstride1
-) {
-    DISPATCH_WITH_HEAD_DIM(head_dim, "lserve_page_selector_head_dim_dispatcher", [&] {
-        lserve_page_selector_kernel_launch<T, HEAD_DIM>(
-            q, key_meta_cache, block_table,
-            num_full_blocks, out,
-            batch_size, 
-            num_q_head,
-            num_kv_head,
-            max_block_size,
-            qstride0, qstride1
-        );
-    });
-}
-
-template <
-    typename T, 
-    int HEAD_DIM, 
-    unsigned THREADS_PER_BLOCK = 256,
-    unsigned THREAD_PER_KEY = threads_per_value<T>(HEAD_DIM),
-    unsigned META_CACHE_BLOCKS_PER_THREAD_BLOCK = 64>  // 目前设置为 64
-__global__ void lserve_page_selector_kernel_v2(
-    const T* q,                     // [batch_size, seqlen_q, num_head, head_dim]
-    const T* key_meta_cache,        // [num_block, num_kv_head, 2, head_dim]
-    const int* block_table,
-    const int* num_full_blocks,
-    T* out,
-    const int seqlen_q,
-    const int max_block_size,
-
-    const int64_t qstride0, const int64_t qstride1, const int64_t qstride2,
-    const int64_t kmc_stride0, const int64_t kmc_stride1, const int64_t kmc_stride2,
-    const int64_t out_stride0, const int64_t out_stride1
-) {
-    const auto tid = threadIdx.x;
-    const auto batch_id = blockIdx.x;
-    const auto head_id = blockIdx.y;
-    const auto block_tile_id = blockIdx.z;
-
-    // 0.0 判断现在要处理的 META_CACHE_BLOCKS_PER_THREAD_BLOCK 个 meta cache block 是否超过了 num_full_blocks
-    // 如果超过则直接return
-    const unsigned logical_meta_cache_blocks_id = META_CACHE_BLOCKS_PER_THREAD_BLOCK * block_tile_id;
-    int num_max_blocks = num_full_blocks[batch_id];
-    if (logical_meta_cache_blocks_id >= num_max_blocks) {
-        return;
-    }
-
-    // 0.1 读取 block table 到 smem
-    static_assert(THREADS_PER_BLOCK >= META_CACHE_BLOCKS_PER_THREAD_BLOCK);
-    __shared__ __align__(sizeof(int)) int BLOCK_TABLE_FOR_THREAD_BLOCK[META_CACHE_BLOCKS_PER_THREAD_BLOCK];
-    const int* block_table_gmem_ptr = block_table + batch_id * max_block_size + logical_meta_cache_blocks_id;
-    if (tid < META_CACHE_BLOCKS_PER_THREAD_BLOCK) {
-        BLOCK_TABLE_FOR_THREAD_BLOCK[tid] = (logical_meta_cache_blocks_id + tid < num_max_blocks) ? 
-                                            *(block_table_gmem_ptr + tid) : 0;
-    }
-    __syncthreads();
-
-    // using q_vec = typename Q_VEC_TRANSFER<T, HEAD_DIM>::Type;
-    // constexpr unsigned Q_VEC_SIZE = sizeof(q_vec) / sizeof(T);
-    // __shared__ __align__(sizeof(q_vec)) T q_smem[HEAD_DIM];
-    // const auto qvec_offset = tid * Q_VEC_SIZE;
-    const T* query_gmem_ptr = q + qstride0 * batch_id + qstride2 * head_id;
-
-    constexpr auto CALC_VEC_SIZE = 16u / sizeof(T);
-    using cvec = typename CALC_VEC<T, CALC_VEC_SIZE>::Type;
-    constexpr auto ELEMENTS_PER_CHUNK = THREAD_PER_KEY * CALC_VEC_SIZE;
-    // 目前的检查下可以保证刚好可以处理一整个 HEAD_DIM
-    static_assert(ELEMENTS_PER_CHUNK == HEAD_DIM);
-
-    using qk_type = typename QkDotMinMaxTypeConverter<T, cvec>::Type;
-    constexpr unsigned NUM_META_BLOCK_PER_THREAD_BLOCK = THREADS_PER_BLOCK / THREAD_PER_KEY;
-    static_assert(META_CACHE_BLOCKS_PER_THREAD_BLOCK % NUM_META_BLOCK_PER_THREAD_BLOCK == 0);
-    constexpr auto ITERS = META_CACHE_BLOCKS_PER_THREAD_BLOCK / NUM_META_BLOCK_PER_THREAD_BLOCK;
-    const auto calc_qvec_offset = (tid % THREAD_PER_KEY) * CALC_VEC_SIZE;
-    // 从 gmem 中向量化 load 每个线程需要的数据
-    cvec calc_max_kvec[ITERS];
-    cvec calc_min_kvec[ITERS];
-#pragma unroll
-    for (int block_table_idx = tid / THREAD_PER_KEY, iter = 0; 
-        block_table_idx < META_CACHE_BLOCKS_PER_THREAD_BLOCK; 
-        block_table_idx += NUM_META_BLOCK_PER_THREAD_BLOCK, ++iter) 
-    {
-        int block_id = BLOCK_TABLE_FOR_THREAD_BLOCK[block_table_idx];
-        const T* key_max_cache_gmem_ptr = key_meta_cache + block_id * kmc_stride0 + head_id * kmc_stride1;
-        const T* key_min_cache_gmem_ptr = key_max_cache_gmem_ptr + kmc_stride2;
-        calc_max_kvec[iter] = *reinterpret_cast<const cvec*>(key_max_cache_gmem_ptr + calc_qvec_offset);
-        calc_min_kvec[iter] = *reinterpret_cast<const cvec*>(key_min_cache_gmem_ptr + calc_qvec_offset);
-    }
-    __syncthreads();
-
-    T acc_out[ITERS];
-    T* out_gmem_ptr = out + batch_id * out_stride0 + head_id * out_stride1;
-    for (int seq_id = 0; seq_id < seqlen_q; ++seq_id) {
-        const T* cur_gq_ptr = query_gmem_ptr + (int64_t)seq_id * (qstride1);
-        // // 装载 query 到 smem
-        // if (qvec_offset < HEAD_DIM) {
-        //     *reinterpret_cast<q_vec*>(&(q_smem[qvec_offset])) = *reinterpret_cast<const q_vec*>(cur_gq_ptr + qvec_offset);
-        // }
-        // __syncthreads();
-
-        cvec calc_qvec;
-        // 每个线程只需要独立处理 query 的 CALC_VEC_SIZE 大小即可
-        calc_qvec = *reinterpret_cast<const cvec*>(&(cur_gq_ptr[calc_qvec_offset]));
-
-        unsigned logical_block_id = logical_meta_cache_blocks_id + (tid / THREAD_PER_KEY);
-    #pragma unroll
-        for (int iter = 0; iter < ITERS && logical_block_id < num_max_blocks;
-            ++iter, logical_block_id += NUM_META_BLOCK_PER_THREAD_BLOCK) {
-            qk_type* q = reinterpret_cast<qk_type*>(&(calc_qvec));
-            qk_type* k_max = reinterpret_cast<qk_type*>(&(calc_max_kvec[iter]));
-            qk_type* k_min = reinterpret_cast<qk_type*>(&(calc_min_kvec[iter]));
-            auto qk_min_max = qk_hmma_dot_min_max<THREAD_PER_KEY>(q, k_max, k_min);
-
-            if (seq_id == 0) {
-                acc_out[iter] = qk_min_max;
-            } else {
-                acc_out[iter] = __hadd(acc_out[iter], qk_min_max);
-            }
-            if (seq_id == seqlen_q - 1 && calc_qvec_offset == 0) {
-                // 5. 结果写回 out
-                *(out_gmem_ptr + logical_block_id) = acc_out[iter];
-            }
-        }
-    }
-}
-
-template<typename T, int HEAD_DIM>
-void lserve_page_selector_kernel_launch_v2(
-    const T* q,                     // [batch_size, seqlen_q, num_head, head_dim]
-    const T* key_meta_cache,        // [num_block, num_head, 2, head_dim]
-    const int* block_table,         // [batch_size, max_block_size]
-    const int* num_full_blocks,     // [batch_size, ]
-    T* out,                         // [batch_size, num_head, max_block_size]
-    const int batch_size,
-    const int seqlen_q,
-    const int num_head,
-    const int max_block_size,
-
-    const int64_t qstride0, 
-    const int64_t qstride1,
-    const int64_t qstride2
-) {
-    // auto constexpr threads_per_value = threads_per_value<T>(HEAD_DIM);
-    constexpr unsigned META_CACHE_BLOCKS_PER_THREAD_BLOCK = 64;
-    const unsigned num_block_tiles = (max_block_size + META_CACHE_BLOCKS_PER_THREAD_BLOCK - 1) / META_CACHE_BLOCKS_PER_THREAD_BLOCK;
-    const int64_t kmc_stride0 = ((int64_t)1) * num_head * 2 * HEAD_DIM;
-    const int64_t kmc_stride1 = ((int64_t)1) * 2 * HEAD_DIM;
-    const int64_t kmc_stride2 = ((int64_t)1) * HEAD_DIM;
-    const int64_t out_stride0 = ((int64_t)1) * num_head * max_block_size;
-    const int64_t out_stride1 = ((int64_t)1) * max_block_size;
-    dim3 grid(batch_size, num_head, num_block_tiles);
-    dim3 block(256);
-    lserve_page_selector_kernel_v2<T, HEAD_DIM><<<grid, block>>>(
-        q, key_meta_cache, block_table,
-        num_full_blocks, out,
-        seqlen_q,
-        max_block_size,
-        qstride0, qstride1, qstride2,
-        kmc_stride0, kmc_stride1, kmc_stride2,
-        out_stride0, out_stride1
-    );
-}
-
-template<typename T>
 void lserve_page_selector_head_dim_dispatcher_v2(
     const T* q,
     const T* key_meta_cache,
@@ -596,13 +581,41 @@ void lserve_page_selector_head_dim_dispatcher_v2(
     });
 }
 
+template<typename T>
+void lserve_page_selector_head_dim_dispatcher(
+    const T* q,
+    const T* key_meta_cache,
+    const int* block_table,
+    const int* num_full_blocks,
+    T* out,
+    const int batch_size,
+    const int num_q_head,
+    const int num_kv_head,
+    const int head_dim,
+    const int max_block_size,
+
+    const int64_t qstride0, const int64_t qstride1
+) {
+    DISPATCH_WITH_HEAD_DIM(head_dim, "lserve_page_selector_head_dim_dispatcher", [&] {
+        lserve_page_selector_kernel_launch<T, HEAD_DIM>(
+            q, key_meta_cache, block_table,
+            num_full_blocks, out,
+            batch_size, 
+            num_q_head,
+            num_kv_head,
+            max_block_size,
+            qstride0, qstride1
+        );
+    });
+}
+
 
 void lserve_page_selector(
-    const torch::Tensor& q,                   // [batch_size, num_q_head, head_dim]. Only for decode. bf16
-    const torch::Tensor& key_meta_cache,      // [num_block, num_kv_head, 2, head_dim] bf16
-    const torch::Tensor& block_table,         // [batch_size, max_block_size] int32
-    const torch::Tensor& num_full_blocks,     // [batch_size, ] int32
-    torch::Tensor& out                        // [batch_size, num_q_head, max_block_size] bf16
+    const at::Tensor& q,                   // [batch_size, num_q_head, head_dim]. Only for decode. bf16
+    const at::Tensor& key_meta_cache,      // [num_block, num_kv_head, 2, head_dim] bf16
+    const at::Tensor& block_table,         // [batch_size, max_block_size] int32
+    const at::Tensor& num_full_blocks,     // [batch_size, ] int32
+    at::Tensor& out                        // [batch_size, num_kv_head, max_block_size] bf16
 ) {
     CHECK_DEVICE(q); CHECK_DEVICE(key_meta_cache); 
     CHECK_DEVICE(block_table); CHECK_DEVICE(num_full_blocks);
@@ -621,6 +634,8 @@ void lserve_page_selector(
     int num_q_head = q.size(1);
     int head_dim = q.size(-1);
     int num_kv_head = key_meta_cache.size(1);
+    int seqlen_q = 1;
+    int num_heads = num_q_head;
     TORCH_CHECK(num_q_head % num_kv_head == 0);
 
     int max_block_size = block_table.size(-1);
@@ -646,49 +661,32 @@ void lserve_page_selector(
         "key_meta_cache must have the same head_dim with q"
     );
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+    const int ngroups = num_q_head / num_kv_head;
+    auto new_q = q.reshape({batch_size, num_kv_head, ngroups, head_dim}).transpose(1, 2);
+    seqlen_q = ngroups;
+    num_heads = num_kv_head;
+    TORCH_CHECK(seqlen_q <= 64);
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(new_q));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    if (num_q_head == num_kv_head) {
-        DISPATCH_HALF_AND_BF16(q.scalar_type(), "lserve_page_selector", [&] {
-            using DataType = typename SATypeConverter<scalar_t>::Type;
+    DISPATCH_HALF_AND_BF16(new_q.scalar_type(), "lserve_page_selector", [&] {
+        using DataType = typename SATypeConverter<scalar_t>::Type;
 
-            lserve_page_selector_head_dim_dispatcher<DataType>(
-                reinterpret_cast<DataType*>(q.data_ptr()),
-                reinterpret_cast<DataType*>(key_meta_cache.data_ptr()),
-                block_table.data_ptr<int>(),
-                num_full_blocks.data_ptr<int>(),
-                reinterpret_cast<DataType*>(out.data_ptr()),
-                batch_size,
-                num_q_head,
-                num_kv_head,
-                head_dim,
-                max_block_size,
-                q.stride(0),
-                q.stride(1)
-            );
-        });
-    } else {
-        const int ngroups = num_q_head / num_kv_head;
-        const int nhead = num_kv_head;
-        DISPATCH_HALF_AND_BF16(q.scalar_type(), "lserve_page_selector", [&] {
-            using DataType = typename SATypeConverter<scalar_t>::Type;
-
-            lserve_page_selector_head_dim_dispatcher_v2<DataType>(
-                reinterpret_cast<DataType*>(q.data_ptr()),
-                reinterpret_cast<DataType*>(key_meta_cache.data_ptr()),
-                block_table.data_ptr<int>(),
-                num_full_blocks.data_ptr<int>(),
-                reinterpret_cast<DataType*>(out.data_ptr()),
-                batch_size,
-                ngroups,
-                nhead,
-                head_dim,
-                max_block_size,
-                q.stride(0),
-                q.stride(1),
-                (int64_t)(ngroups) * q.stride(1)
-            );
-        });
-    }
+        lserve_page_selector_head_dim_dispatcher_v2<DataType>(
+            reinterpret_cast<DataType*>(new_q.data_ptr()),
+            reinterpret_cast<DataType*>(key_meta_cache.data_ptr()),
+            block_table.data_ptr<int>(),
+            num_full_blocks.data_ptr<int>(),
+            reinterpret_cast<DataType*>(out.data_ptr()),
+            batch_size,
+            seqlen_q,
+            num_heads,
+            head_dim,
+            max_block_size,
+            new_q.stride(0),
+            new_q.stride(1),
+            new_q.stride(2)
+        );
+    });
 }

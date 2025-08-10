@@ -20,8 +20,8 @@ data = {
     ],
     "temperature": 0,
     "stream": True,
-    "ignore_eos": True,
-    "max_tokens": 65536,
+    # "ignore_eos": True,
+    # "max_tokens": 65536,
 }
 
 try:
