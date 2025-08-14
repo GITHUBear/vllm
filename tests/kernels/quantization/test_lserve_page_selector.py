@@ -20,6 +20,7 @@ num_kv_head = 1
 num_block = 4096
 max_block_size = 4096
 data_type = torch.float16
+topk = 256
 
 with torch.device("cuda:0"):
     # q = torch.randint(1, 41, (batch_size, num_q_head, head_dim))
@@ -37,8 +38,9 @@ with torch.device("cuda:0"):
     # num_full_blocks = torch.tensor([1], dtype=torch.int)
     num_full_blocks = torch.randint(low=max_block_size // 2, high=max_block_size+1, size=(batch_size,), dtype=torch.int)
     # num_full_blocks = torch.ones((batch_size,), dtype=torch.int) * max_block_size
-    out_std = torch.zeros((batch_size, num_kv_head, max_block_size), dtype=data_type)
-    out = torch.zeros((batch_size, num_kv_head, max_block_size), dtype=data_type)
+    out_std = torch.full((batch_size, num_kv_head, max_block_size), float('-inf'), dtype=data_type)
+    out = None
+    top_indice = torch.zeros((batch_size, num_kv_head, topk), dtype=torch.int32)
 
     print(q)
     print()
@@ -114,6 +116,7 @@ with torch.device("cuda:0"):
     print()
 
     for _ in range(20):
+        out = torch.full((batch_size, num_kv_head, max_block_size), float('-inf'), dtype=data_type)
         torch.ops._C.lserve_page_selector(
             q,
             key_meta_cache,
@@ -121,12 +124,14 @@ with torch.device("cuda:0"):
             num_full_blocks,
             out,
         )
-        topk = torch.topk(out, k=256, largest=True).index
+        top_indice[:, :, :] = torch.topk(out, topk, sorted=False).indices
     torch.cuda.synchronize()
 
     print("=======================================")
+    topk_idx = None
     start_event2.record()
     for _ in range(20):
+        out = torch.full((batch_size, num_kv_head, max_block_size), float('-inf'), dtype=data_type)
         torch.ops._C.lserve_page_selector(
             q,
             key_meta_cache,
@@ -134,7 +139,7 @@ with torch.device("cuda:0"):
             num_full_blocks,
             out,
         )
-        topk = torch.topk(out, k=256, largest=True).index
+        top_indice[:, :, :] = torch.topk(out, topk, sorted=False).indices
         # out.topk(k=256, dim=-1).index
         # out.sort(dim=-1)
     end_event2.record()
@@ -143,6 +148,9 @@ with torch.device("cuda:0"):
     print(f"cuda cost: {elapsed_time_ms/20}ms")
     print(out)
     print(out.shape)
+    print(top_indice)
+    print(top_indice.shape)
+    print(top_indice.dtype)
     print()
 
     print(torch.abs(out - out_std).flatten().max())

@@ -37,11 +37,11 @@ def bind_sparse_index_block(
         kv_cache_idx = layer_index_sorted.index(
             extract_layer_index(layer_name))
         forward_ctx = ctx[layer_name]
-        forward_ctx.block_count_gpu_cache = block_count_gpu_cache[kv_cache_idx]
+        # forward_ctx.block_count_gpu_cache = block_count_gpu_cache[kv_cache_idx]
         forward_ctx.block_index_gpu_cache = block_index_gpu_cache[kv_cache_idx]
-        if not block_sparse_mode:
-            forward_ctx.column_count_gpu_cache = column_count_gpu_cache[kv_cache_idx]
-            forward_ctx.column_index_gpu_cache = column_index_gpu_cache[kv_cache_idx]
+        # if not block_sparse_mode:
+        #     forward_ctx.column_count_gpu_cache = column_count_gpu_cache[kv_cache_idx]
+        #     forward_ctx.column_index_gpu_cache = column_index_gpu_cache[kv_cache_idx]
 
 class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
     def __init__(
@@ -78,23 +78,22 @@ class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
-        if not self.block_sparse_mode:
-            # TODO[shk]: enable index cache later.
-            self.sparse_index_gpu_cache = (
-                SparseIndexBlockCacheEngine(
-                    self.cache_config,
-                    self.model_config, self.parallel_config,
-                    self.device_config, self.speculative_config,
-                )
+        # TODO[shk]: enable index cache later.
+        self.sparse_index_gpu_cache = (
+            SparseIndexBlockCacheEngine(
+                self.cache_config,
+                self.model_config, self.parallel_config,
+                self.device_config, self.speculative_config,
             )
-            bind_sparse_index_block(
-                self.worker.compilation_config.static_forward_context,
-                self.sparse_index_gpu_cache.block_count_gpu_cache,
-                self.sparse_index_gpu_cache.block_index_gpu_cache,
-                self.sparse_index_gpu_cache.column_count_gpu_cache,
-                self.sparse_index_gpu_cache.column_index_gpu_cache,
-                self.block_sparse_mode,
-            )
+        )
+        bind_sparse_index_block(
+            self.worker.compilation_config.static_forward_context,
+            self.sparse_index_gpu_cache.block_count_gpu_cache,
+            self.sparse_index_gpu_cache.block_index_gpu_cache,
+            self.sparse_index_gpu_cache.column_count_gpu_cache,
+            self.sparse_index_gpu_cache.column_index_gpu_cache,
+            self.block_sparse_mode,
+        )
     
     def set_include_gpu_probs_tensor(self) -> None:
         self.model_runner.sampler.include_gpu_probs_tensor = True

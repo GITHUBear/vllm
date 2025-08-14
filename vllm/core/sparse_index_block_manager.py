@@ -17,11 +17,13 @@ class SparseIndexBlockManager:
         seqlen_threshold: int,
         recompute_step: int,
         num_sample_tokens: int,
+        block_size: int,
     ):
         self.num_gpu_blocks = num_gpu_blocks
         self.seqlen_threshold = seqlen_threshold
         self.recompute_step = recompute_step
         self.num_sample_tokens = num_sample_tokens
+        self.block_size = block_size
         self.free_block_ids = [
             i for i in range(self.num_gpu_blocks)
         ]
@@ -33,7 +35,10 @@ class SparseIndexBlockManager:
         for seq in seq_group.seqs:
             if seq.seq_id in self.seqid_block_id_mapping:
                 continue
-            if len(seq.get_token_ids()) < self.seqlen_threshold:
+            if seq.is_prefill():
+                continue
+            # 考虑 decode 额外增加的一个 token
+            if seq.get_num_computed_tokens() + 1 < self.seqlen_threshold:
                 continue
             num_seq_need_allocate += 1
 
@@ -48,18 +53,28 @@ class SparseIndexBlockManager:
     def allocate(self, seq_group: SequenceGroup):
         for seq in seq_group.seqs:
             if seq.seq_id in self.seqid_block_id_mapping:
+                # 如果这个 seq 需要重新更新 compress page，则需要更新 _num_compressed_page
+                seq.data.set_num_computed_tokens_to_compress(
+                    need_check=True,
+                    recompute_index_step=self.recompute_step,
+                    block_size=self.block_size,
+                )
                 continue
             if seq.is_prefill():
                 continue
-            if seq.get_num_computed_tokens() < self.seqlen_threshold:
+            # 考虑 decode 额外增加的一个 token
+            if seq.get_num_computed_tokens() + 1 < self.seqlen_threshold:
                 continue
-            if seq.get_num_computed_tokens() - seq.get_prompt_len() < self.num_sample_tokens:
-                continue
+            # if seq.get_num_computed_tokens() - seq.get_prompt_len() < self.num_sample_tokens:
+            #     continue
+
 
             blk_id = self.free_block_ids[0]
             self.free_block_ids = self.free_block_ids[1:]
             self.seqid_block_id_mapping[seq.seq_id] = blk_id
-            seq.data.set_num_computed_tokens_when_enable_sparse_index()
+            # TODO[shk]: 修改为参与压缩的页面数量
+            # seq.data.set_num_computed_tokens_when_enable_sparse_index()
+            seq.data.set_num_computed_tokens_to_compress()
             logger.info(f"Allocate Sparse Index Block:{blk_id} for req:{seq_group.request_id} seq:{seq.seq_id}")
 
     def build_seq_group_meta_sparse_index_table(self, sgm: SequenceGroupMetadata):
@@ -67,7 +82,7 @@ class SparseIndexBlockManager:
         for seq_id in sgm.seq_data.keys():
             if seq_id not in self.seqid_block_id_mapping:
                 continue
-            assert (sgm.seq_data[seq_id]._num_computed_tokens_when_enable_sparse_index is not None)
+            assert (sgm.seq_data[seq_id]._num_computed_tokens_to_compress is not None)
             blk_id = self.seqid_block_id_mapping[seq_id]
             sgm.sparse_index_table[seq_id] = blk_id
 
@@ -78,7 +93,7 @@ class SparseIndexBlockManager:
         for seq_id in seq_data.keys():
             if seq_id not in self.seqid_block_id_mapping:
                 continue
-            assert (seq_data[seq_id]._num_computed_tokens_when_enable_sparse_index is not None)
+            assert (seq_data[seq_id]._num_computed_tokens_to_compress is not None)
             blk_id = self.seqid_block_id_mapping[seq_id]
             sgmd.sparse_index_table[seq_id] = blk_id
 
@@ -87,5 +102,6 @@ class SparseIndexBlockManager:
             blk_id = self.seqid_block_id_mapping[seq.seq_id]
             self.free_block_ids.append(blk_id)
             self.seqid_block_id_mapping.pop(seq.seq_id)
-            seq.data.reset_num_computed_tokens_when_enable_sparse_index()
+            seq.data.reset_num_computed_tokens_to_compress()
+            # seq.data.reset_num_computed_tokens_when_enable_sparse_index()
             logger.info(f"Free Sparse Index Block:{blk_id} for seq:{seq.seq_id}")

@@ -102,40 +102,24 @@ class SparseIndexBlockCacheEngine:
                 column_count_gpu_cache, column_index_gpu_cache,
             )
         else:
-            block_count_gpu_cache = []
-            block_index_gpu_cache = []
+            page_compress_caches = []
             blocks = self.speculative_config.block_sparse_token_budget // self.cache_config.block_size
 
-            block_count_cache_shape = (
+            page_compress_cache_shape = (
                 self.sparse_index_num_gpu_blocks,
-                self.num_heads,
-            )
-            block_index_cache_shape = (
-                self.sparse_index_num_gpu_blocks,
-                self.num_heads,
+                self.num_kv_heads,
                 blocks,
             )
 
             for _ in range(self.num_attention_layers):
-                layer_block_count_gpu_cache = torch.zeros(
-                    block_count_cache_shape,
+                layer_page_compress_cache = torch.zeros(
+                    page_compress_cache_shape,
                     dtype=self.dtype,
-                    device=device,
+                    device=device
                 )
-                block_count_gpu_cache.append(layer_block_count_gpu_cache)
+                page_compress_caches.append(layer_page_compress_cache)
 
-            for _ in range(self.num_attention_layers):
-                layer_block_index_gpu_cache = torch.zeros(
-                    block_index_cache_shape,
-                    dtype=self.dtype,
-                    device=device,
-                )
-                block_index_gpu_cache.append(layer_block_index_gpu_cache)
-
-            return (
-                block_count_gpu_cache, block_index_gpu_cache,
-                None, None,
-            )
+            return (None, page_compress_caches, None, None)
 
     @staticmethod
     def get_cache_block_size(
@@ -157,16 +141,29 @@ class SparseIndexBlockCacheEngine:
             dtype_size = get_dtype_size(dtype)
             return dtype_size * total
         else:
+            # block_size = cache_config.block_size
+            # token_budget = speculative_config.block_sparse_token_budget
+            # assert token_budget % block_size == 0
+            # blocks = token_budget // block_size
+            # num_heads = model_config.get_num_attention_heads(parallel_config)
+            # num_attention_layers = model_config.get_num_layers_by_block_type(
+            #     parallel_config, LayerBlockType.attention)
+            # dtype = torch.int32
+
+            # total = num_attention_layers * num_heads * (1 + blocks)
+            # dtype_size = get_dtype_size(dtype)
+            # return dtype_size * total
+            assert speculative_config.block_sparse_mode
             block_size = cache_config.block_size
             token_budget = speculative_config.block_sparse_token_budget
             assert token_budget % block_size == 0
-            blocks = token_budget // block_size
-            num_heads = model_config.get_num_attention_heads(parallel_config)
+            blocks = token_budget // block_size   # topk
+            num_kv_heads = model_config.get_num_kv_heads(parallel_config)
             num_attention_layers = model_config.get_num_layers_by_block_type(
                 parallel_config, LayerBlockType.attention)
             dtype = torch.int32
 
-            total = num_attention_layers * num_heads * (1 + blocks)
+            total = num_attention_layers * num_kv_heads * blocks
             dtype_size = get_dtype_size(dtype)
             return dtype_size * total
             

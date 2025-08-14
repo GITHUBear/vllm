@@ -499,9 +499,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         num_gpu_blocks, num_cpu_blocks = (
             self.scorer_worker.determine_num_available_blocks())
         
-        if self.block_sparse_mode:
-            # TODO:[shk]: enable index cache later.
-            return num_gpu_blocks, num_cpu_blocks
+        # if self.block_sparse_mode:
+        #     # TODO:[shk]: enable index cache later.
+        #     return num_gpu_blocks, num_cpu_blocks
         
         scorer_cache_block_size_bytes = (
             self.scorer_worker.get_cache_block_size_bytes())
@@ -748,8 +748,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                 continue
             
             sampled_token_ids_len = 1
-            if self.is_standalone_mode and (not self.block_sparse_mode) and seq_data.need_recompute_sparse_index(self.sparse_index_recompute_step):
-                sampled_token_ids_len = self.kv_compress_num_sample_tokens
+            # 由于不再使用 vertical-slash 模式，此处不需要处理 sample token
+            # if self.is_standalone_mode and (not self.block_sparse_mode) and seq_data.need_recompute_sparse_index(self.sparse_index_recompute_step):
+            #     sampled_token_ids_len = self.kv_compress_num_sample_tokens
 
             # Sequence with output.
             completion_seq_group_output_list.append(

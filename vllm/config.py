@@ -2350,27 +2350,34 @@ class SpeculativeConfig:
     # Standalone proposer configuration
     kv_compress_recover_rate: Optional[float] = None
     """KVCache compression recover rate, required when method is set
-    to standalone."""
+    to standalone.
+    正式版不使用 vertical-slash 做 decoding，弃用
+    """
     kv_compress_trigger_threshold: Optional[int] = None
     """The sequence length threshold to trigger kv compression.
     """
     kv_compress_num_sample_tokens: Optional[int] = None
     """The sample tokens to calculate sparse index.
+    kv_compress_num_sample_tokens 这个参数弃用
     """
     block_sparse_mode: bool = False
     """Enable LServe kv compress mode.
+    正式版不做区分，弃用
     """
     block_sparse_token_budget: Optional[int] = None
     """LServe token budget.
+    功能等同于 kv_compress_trigger_threshold, 弃用
     """
     block_sparse_recompute_step: Optional[int] = None
     """LServe recompute step.
+    功能等同于 sparse_index_recompute_step，弃用
     """
     sparse_index_gpu_memory_ratio: Optional[float] = None
     """The gpu memory ratio of sparse index.
     """
     sparse_index_max_vertical_slash_topk: Optional[int] = None
     """Max topk for vertical and slash index.
+    正式版不再使用
     """
     sparse_index_num_gpu_blocks: Optional[int] = None
     """The number of sparse index gpu blocks need to be allocated.
@@ -2533,37 +2540,33 @@ class SpeculativeConfig:
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
             
-            if not self.block_sparse_mode:
-                if self.kv_compress_recover_rate is None:
-                    self.kv_compress_recover_rate = 0.9
-                
-                if self.kv_compress_recover_rate <= 0 or self.kv_compress_recover_rate > 1:
-                    raise ValueError(
-                        f"kv_compress_recover_rate={self.kv_compress_recover_rate} must be in range (0,1]")
-                
-                if self.kv_compress_trigger_threshold is None:
-                    self.kv_compress_trigger_threshold = 1024
+            if self.kv_compress_recover_rate is None:
+                self.kv_compress_recover_rate = 0.9
+            
+            if self.kv_compress_recover_rate <= 0 or self.kv_compress_recover_rate > 1:
+                raise ValueError(
+                    f"kv_compress_recover_rate={self.kv_compress_recover_rate} must be in range (0,1]")
+            
+            if self.kv_compress_trigger_threshold is None:
+                self.kv_compress_trigger_threshold = 4096
 
-                if self.kv_compress_num_sample_tokens is None:
-                    self.kv_compress_num_sample_tokens = 65
+            if self.kv_compress_num_sample_tokens is None:
+                self.kv_compress_num_sample_tokens = 65
 
-                if self.sparse_index_gpu_memory_ratio is None:
-                    self.sparse_index_gpu_memory_ratio = 0.1
+            if self.sparse_index_gpu_memory_ratio is None:
+                self.sparse_index_gpu_memory_ratio = 0.1
+            
+            if self.sparse_index_max_vertical_slash_topk is None:
+                self.sparse_index_max_vertical_slash_topk = 25000
+            
+            if self.sparse_index_recompute_step is None:
+                self.sparse_index_recompute_step = 32
                 
-                if self.sparse_index_max_vertical_slash_topk is None:
-                    self.sparse_index_max_vertical_slash_topk = 25000
-                
-                if self.sparse_index_recompute_step is None:
-                    self.sparse_index_recompute_step = 128
-            else:
-                if self.block_sparse_token_budget is None:
-                    self.block_sparse_token_budget = 2048
-                
-                if self.block_sparse_recompute_step is None:
-                    self.block_sparse_recompute_step = 4
-
-                if self.sparse_index_gpu_memory_ratio is None:
-                    self.sparse_index_gpu_memory_ratio = 0.1
+            if self.block_sparse_token_budget is None:
+                self.block_sparse_token_budget = 4096
+            
+            if self.block_sparse_recompute_step is None:
+                self.block_sparse_recompute_step = 32
 
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config

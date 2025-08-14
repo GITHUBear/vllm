@@ -477,6 +477,7 @@ class Scheduler:
                 sparse_index_alloc_seqlen_threshold,
                 sparse_index_recompute_step,
                 kv_compress_num_sample_tokens,
+                self.cache_config.block_size,
             )
 
         # Sequence groups in the WAITING state.
@@ -835,6 +836,32 @@ class Scheduler:
         self._scheduler_running_outputs_cache[self.next_cache_id].reset()
         self._scheduled_seq_group_cache[self.next_cache_id].reset()
 
+        if self.sparse_index_block_manager is not None:
+            # Sort sequence group metadata in the following order:
+            # prefill -> sparse index need to be recompute -> enable sparse index -> normal decode
+            #            |<--------------- sparse decode ---------------------->|
+            #            |<------------------------------------ decode ------------------------->|
+            assert len(ret.decode_seq_groups) == len(ret.decode_seq_groups_list)
+            common_decodes = []
+            page_compress_recomputes = []
+            scheduled_common_decodes = []
+            scheduled_page_compress_recomputes = []
+            for scheduled_sg, sg in zip(ret.decode_seq_groups, ret.decode_seq_groups_list):
+                assert len(sg.seqs) == 1
+                seq_data = sg.seqs[0].data
+
+                if seq_data.need_refresh_page_compress_cache(
+                    self.sparse_index_block_manager.recompute_step,
+                    self.cache_config.block_size):
+                    page_compress_recomputes.append(sg)
+                    scheduled_page_compress_recomputes.append(scheduled_sg)
+                else:
+                    common_decodes.append(sg)
+                    scheduled_common_decodes.append(scheduled_sg)
+
+            ret.decode_seq_groups_list = page_compress_recomputes + common_decodes
+            ret.decode_seq_groups = scheduled_page_compress_recomputes + scheduled_common_decodes
+        
         return ret
 
     def _schedule_swapped(
@@ -1711,32 +1738,38 @@ class Scheduler:
             # prefill -> sparse index need to be recompute -> enable sparse index -> normal decode
             #            |<--------------- sparse decode ---------------------->|
             #            |<------------------------------------ decode ------------------------->|
-            prefill_sgm = []
-            sparse_index_recompute_sgm = []
-            sparse_index_sgm = []
-            decode_sgm = []
+            # prefill_sgm_idx = []
+            # sparse_index_recompute_sgm_idx = []
+            # decode_sgm_idx = []
+            find_common_decode = False
             for sgm in seq_group_metadata_list:
                 assert len(sgm.seq_data) == 1
                 seq_data = next(iter(sgm.seq_data.values()))
 
                 if seq_data.stage == SequenceStage.PREFILL:
-                    prefill_sgm.append(sgm)
                     continue
 
-                if seq_data.need_recompute_sparse_index(self.sparse_index_block_manager.recompute_step):
-                    sparse_index_recompute_sgm.append(sgm)
-                    continue
+                # if seq_data.need_recompute_sparse_index(self.sparse_index_block_manager.recompute_step):
+                #     sparse_index_recompute_sgm.append(sgm)
+                #     continue
 
-                if seq_data.enable_sparse_index():
-                    sparse_index_sgm.append(sgm)
-                    continue
+                if seq_data.need_refresh_page_compress_cache(
+                    self.sparse_index_block_manager.recompute_step,
+                    self.cache_config.block_size):
+                    assert not find_common_decode
+                else:
+                    find_common_decode = True
+                
+                # page compress情况下不再需要单独区分使用稀疏 page 的计算和非稀疏的计算
+                # if seq_data.enable_sparse_index():
+                #     sparse_index_sgm.append(sgm)
+                #     continue
 
-                decode_sgm.append(sgm)
+                # decode_sgm.append(sgm)
             
-            prefill_sgm.extend(sparse_index_recompute_sgm)
-            prefill_sgm.extend(sparse_index_sgm)
-            prefill_sgm.extend(decode_sgm)
-            seq_group_metadata_list = prefill_sgm
+            # prefill_sgm.extend(sparse_index_recompute_sgm)
+            # prefill_sgm.extend(decode_sgm)
+            # seq_group_metadata_list = prefill_sgm
 
         # Now that the batch has been created, we can assume all blocks in the
         # batch will have been computed before the next scheduling invocation.

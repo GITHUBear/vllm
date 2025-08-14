@@ -144,7 +144,7 @@ class SequenceDataDelta(
     new_num_computed_tokens: int
     # Overwriting existing `stage`.
     new_stage: SequenceStage
-    num_computed_tokens_when_enable_sparse_index: Optional[int] = None
+    num_computed_tokens_to_compress: Optional[int] = None
 
 
 class SequenceData(msgspec.Struct,
@@ -188,25 +188,58 @@ class SequenceData(msgspec.Struct,
 
     # It is used to compute mrope_position_ids.
     _mrope_position_delta: Optional[int] = None
-    _num_computed_tokens_when_enable_sparse_index: Optional[int] = None
+    # TODO[shk]: 需要改造成 page compress 参与压缩的 page 数量
+    # 如果本次触发重新 compress 则更新为本次 compress 的 page 数量
+    # _num_computed_tokens_when_enable_sparse_index: Optional[int] = None
 
-    def need_recompute_sparse_index(self, recompute_index_step: int) -> bool:
-        if self._num_computed_tokens_when_enable_sparse_index is None:
-            return False
-        if self._num_computed_tokens < self._num_computed_tokens_when_enable_sparse_index:
-            return False
-        return (self._num_computed_tokens - self._num_computed_tokens_when_enable_sparse_index) % recompute_index_step == 0
-    
-    def enable_sparse_index(self) -> bool:
-        if self._num_computed_tokens_when_enable_sparse_index is None:
-            return False
-        return self._num_computed_tokens >= self._num_computed_tokens_when_enable_sparse_index
-    
-    def set_num_computed_tokens_when_enable_sparse_index(self):
-        self._num_computed_tokens_when_enable_sparse_index = self._num_computed_tokens
+    _num_computed_tokens_to_compress: Optional[int] = None
 
-    def reset_num_computed_tokens_when_enable_sparse_index(self):
-        self._num_computed_tokens_when_enable_sparse_index = None
+    # def need_recompute_sparse_index(self, recompute_index_step: int) -> bool:
+    #     if self._num_computed_tokens_when_enable_sparse_index is None:
+    #         return False
+    #     if self._num_computed_tokens < self._num_computed_tokens_when_enable_sparse_index:
+    #         return False
+    #     return (self._num_computed_tokens - self._num_computed_tokens_when_enable_sparse_index) % recompute_index_step == 0
+    
+    # def enable_sparse_index(self) -> bool:
+    #     if self._num_computed_tokens_when_enable_sparse_index is None:
+    #         return False
+    #     return self._num_computed_tokens >= self._num_computed_tokens_when_enable_sparse_index
+
+    # def set_num_computed_tokens_when_enable_sparse_index(self):
+    #     self._num_computed_tokens_when_enable_sparse_index = self._num_computed_tokens
+
+    # def reset_num_computed_tokens_when_enable_sparse_index(self):
+    #     self._num_computed_tokens_when_enable_sparse_index = None
+
+    def need_refresh_page_compress_cache(self, recompute_index_step, block_size) -> bool:
+        if self._num_computed_tokens_to_compress is None:
+            return False
+        assert self._num_computed_tokens + 1 >= self._num_computed_tokens_to_compress
+        if (self._num_computed_tokens + 1 - self._num_computed_tokens_to_compress) % recompute_index_step != 0:
+            return False
+        if self._num_computed_tokens + 1 == self._num_computed_tokens_to_compress:
+            return True
+        return (self._num_computed_tokens + 1) // block_size > self._num_computed_tokens_to_compress // block_size
+
+    def enable_page_compress_cache(self) -> bool:
+        if self._num_computed_tokens_to_compress is None:
+            return False
+        assert self._num_computed_tokens + 1 >= self._num_computed_tokens_to_compress
+        return True
+
+    def set_num_computed_tokens_to_compress(self, need_check = False, 
+                                            recompute_index_step = None, block_size = None):
+        if not need_check:
+            self._num_computed_tokens_to_compress = self._num_computed_tokens + 1
+        else:
+            assert self._num_computed_tokens_to_compress is not None
+            assert block_size is not None and recompute_index_step is not None
+            if self.need_refresh_page_compress_cache(recompute_index_step, block_size):
+                self._num_computed_tokens_to_compress = self._num_computed_tokens + 1
+    
+    def reset_num_computed_tokens_to_compress(self):
+        self._num_computed_tokens_to_compress = None
 
     @staticmethod
     def from_prompt_token_counts(
@@ -444,7 +477,7 @@ class SequenceData(msgspec.Struct,
         delta = SequenceDataDelta(self._new_appended_tokens,
                                   self._cumulative_logprob,
                                   self.get_num_computed_tokens(), self.stage,
-                                  self._num_computed_tokens_when_enable_sparse_index)
+                                  self._num_computed_tokens_to_compress)
         # Reset delta state.
         self._new_appended_tokens = []
         return delta
@@ -453,7 +486,7 @@ class SequenceData(msgspec.Struct,
         self._num_computed_tokens = delta.new_num_computed_tokens
         self._cumulative_logprob = delta.new_cumulative_logprob
         self._stage = delta.new_stage
-        self._num_computed_tokens_when_enable_sparse_index = delta.num_computed_tokens_when_enable_sparse_index
+        self._num_computed_tokens_to_compress = delta.num_computed_tokens_to_compress
         self._output_token_ids.extend(delta.new_output_token_ids)
         self._cached_all_token_ids.extend(delta.new_output_token_ids)
 
@@ -1080,19 +1113,33 @@ class SequenceGroupMetadata(
             else:
                 self.token_chunk_size = 1
 
-    def need_recompute_sparse_index(self, recompute_index_step: Optional[int]) -> bool:
+    # def need_recompute_sparse_index(self, recompute_index_step: Optional[int]) -> bool:
+    #     if recompute_index_step is None:
+    #         return False
+    #     if len(self.seq_data) != 1:
+    #         return False
+    #     data = next(iter(self.seq_data.values()))
+    #     return data.need_recompute_sparse_index(recompute_index_step)
+    
+    def need_refresh_page_compress_cache(self, recompute_index_step, block_size) -> bool:
         if recompute_index_step is None:
             return False
         if len(self.seq_data) != 1:
             return False
         data = next(iter(self.seq_data.values()))
-        return data.need_recompute_sparse_index(recompute_index_step)
+        return data.need_refresh_page_compress_cache(recompute_index_step, block_size)
     
-    def enable_sparse_index(self) -> bool:
+    # def enable_sparse_index(self) -> bool:
+    #     if len(self.seq_data) != 1:
+    #         return False
+    #     data = next(iter(self.seq_data.values()))
+    #     return data.enable_sparse_index()
+    
+    def enable_page_compress_cache(self) -> bool:
         if len(self.seq_data) != 1:
             return False
         data = next(iter(self.seq_data.values()))
-        return data.enable_sparse_index()
+        return data.enable_page_compress_cache()
 
     @property
     def lora_int_id(self) -> int:

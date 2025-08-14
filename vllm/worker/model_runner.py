@@ -268,7 +268,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             encoder_seq_len: int = 0,
             is_sparse_index_recompute: bool = False,
             is_sparse_index: bool = False,
-            sparse_index_block: Optional[Dict[int, int]] = None
+            sparse_index_block: Optional[Dict[int, int]] = None,
+            num_computed_token_to_compress: int = -1,
         ):
             if reinit:
                 assert len(self.seq_ids) == len(seq_ids)  # type: ignore
@@ -283,8 +284,9 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.is_sparse_index = is_sparse_index
             self.block_tables = block_tables
             self.sparse_index_block = sparse_index_block
+            self.num_computed_token_to_compress = num_computed_token_to_compress
             if self.is_sparse_index or self.is_sparse_index_recompute:
-                assert self.sparse_index_block is not None
+                assert self.sparse_index_block is not None and self.num_computed_token_to_compress != -1
             self.computed_block_nums = computed_block_nums
             self.n_seqs = n_seqs
             self.encoder_seq_len = encoder_seq_len
@@ -505,6 +507,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         self.enable_lora = self.runner.lora_config is not None
         self.enable_prompt_adapter = (self.runner.prompt_adapter_config
                                       is not None)
+        # TODO[shk]: page_compress_topk 作为配置项
+        self.page_compress_topk = 256
 
         # Attention metadata inputs.
         if self.attn_backend is not None:
@@ -557,8 +561,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             context_len = seq_len - 1
         else:
             context_len = seq_data.get_num_computed_tokens()
-            if inter_data.is_sparse_index_recompute:
-                context_len -= (self.runner.sparse_index_kv_compress_num_sample_token - 1)
+            # if inter_data.is_sparse_index_recompute:
+            #     context_len -= (self.runner.sparse_index_kv_compress_num_sample_token - 1)
 
         # Compute tokens.
         if seq_data.prompt_embeds is None:
@@ -790,11 +794,17 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         seq_ids = seq_group_metadata.seq_data.keys()
         n_seqs = len(seq_ids)
         is_prompt = seq_group_metadata.is_prompt
-        if (self.runner.speculative_config is not None) and (not self.runner.speculative_config.block_sparse_mode):
-            is_sparse_index_recompute = seq_group_metadata.need_recompute_sparse_index(
+        # TODO[shk]: 
+        # if (self.runner.speculative_config is not None) and (not self.runner.speculative_config.block_sparse_mode):
+        if (self.runner.speculative_config is not None):
+            # is_sparse_index_recompute = seq_group_metadata.need_recompute_sparse_index(
+            #     recompute_index_step=self.runner.sparse_index_recompute_step,
+            # )
+            is_sparse_index_recompute = seq_group_metadata.need_refresh_page_compress_cache(
                 recompute_index_step=self.runner.sparse_index_recompute_step,
+                block_size=self.runner.cache_config.block_size,
             )
-            is_sparse_index = is_sparse_index_recompute or seq_group_metadata.enable_sparse_index()
+            is_sparse_index = is_sparse_index_recompute or seq_group_metadata.enable_page_compress_cache()
         else:
             is_sparse_index_recompute = False
             is_sparse_index = False
@@ -808,6 +818,13 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         if self.runner.model_config.is_encoder_decoder:
             encoder_seq_len = seq_group_metadata.encoder_seq_data.get_len()
 
+        num_computed_token_to_compress = -1
+        if is_sparse_index or is_sparse_index_recompute:
+            assert len(seq_group_metadata.seq_data) == 1
+            seq_data = next(iter(seq_group_metadata.seq_data.values()))
+            num_computed_token_to_compress = seq_data._num_computed_tokens_to_compress
+            assert num_computed_token_to_compress is not None
+
         inter_data = self.init_cached_inter_data(
             request_id=seq_group_metadata.request_id,
             seq_ids=seq_ids,
@@ -819,7 +836,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             encoder_seq_len=encoder_seq_len,
             is_sparse_index_recompute=is_sparse_index_recompute,
             is_sparse_index=is_sparse_index,
-            sparse_index_block=seq_group_metadata.sparse_index_table)
+            sparse_index_block=seq_group_metadata.sparse_index_table,
+            num_computed_token_to_compress=num_computed_token_to_compress)
 
         self.inter_data_list.append(inter_data)
 
@@ -1120,8 +1138,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 self.vllm_config.speculative_config.sparse_index_recompute_step
             self.sparse_index_kv_compress_recover_rate = \
                 self.vllm_config.speculative_config.kv_compress_recover_rate
-            self.sparse_index_kv_compress_num_sample_token = \
-                self.vllm_config.speculative_config.kv_compress_num_sample_tokens
+            # self.sparse_index_kv_compress_num_sample_token = \
+            #     self.vllm_config.speculative_config.kv_compress_num_sample_tokens
 
         #
         self.graph_runners: List[Dict[Tuple[int, bool], CUDAGraphRunner]] = [
