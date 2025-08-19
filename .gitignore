@@ -230,3 +230,6 @@ benchmarks/math/outputs
 benchmarks/math/*.out
 decode_attn_dump
 decode_attn_visual
+*.nsys-rep
+*.out
+*.png

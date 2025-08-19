@@ -13,12 +13,14 @@ def seed_everything(seed):
 
 seed_everything(0)
 
+seqlen = 4096
+block_size = 16
 batch_size = 10
 num_q_head = 8
 head_dim = 128
 num_kv_head = 1
-num_block = 4096
-max_block_size = 4096
+num_block = seqlen // block_size
+max_block_size = seqlen // block_size
 data_type = torch.float16
 topk = 256
 
@@ -124,7 +126,11 @@ with torch.device("cuda:0"):
             num_full_blocks,
             out,
         )
-        top_indice[:, :, :] = torch.topk(out, topk, sorted=False).indices
+        top_indice[:, :, :] = torch.gather(
+            block_table.unsqueeze(1).expand(-1, out.shape[1], -1),
+            dim=-1,
+            index=torch.topk(out, k=topk, sorted=False).indices
+        )
     torch.cuda.synchronize()
 
     print("=======================================")
@@ -139,7 +145,11 @@ with torch.device("cuda:0"):
             num_full_blocks,
             out,
         )
-        top_indice[:, :, :] = torch.topk(out, topk, sorted=False).indices
+        top_indice[:, :, :] = torch.gather(
+            block_table.unsqueeze(1).expand(-1, out.shape[1], -1),
+            dim=-1,
+            index=torch.topk(out, k=topk, sorted=False).indices
+        )
         # out.topk(k=256, dim=-1).index
         # out.sort(dim=-1)
     end_event2.record()

@@ -1738,6 +1738,8 @@ class FlashAttentionImpl(AttentionImpl):
                 ) = get_seq_len_block_table_args(decode_meta, False, attn_type)
                 descale_shape = (seq_lens_arg.shape[0], key_cache.shape[-2])
 
+                # start_event = torch.cuda.Event(enable_timing=True)
+                # end_event = torch.cuda.Event(enable_timing=True)
                 n_recomputes = decode_meta.num_sparse_index_recomputes
                 num_compressed_page_tensor = decode_meta.num_compressed_pages_tensor
                 page_compress_cache_ids_tensor = decode_meta.page_compress_cache_ids_tensor
@@ -1748,6 +1750,7 @@ class FlashAttentionImpl(AttentionImpl):
                         key_meta_cache is not None and block_index_gpu_cache is not None and 
                         num_compressed_page_tensor is not None and page_compress_cache_ids_tensor is not None
                     )
+                    # start_event.record()
                     # print(f"==================== RECOMPUTE PAGE COMPRESS: actual_max_num_blocks_per_seq:{actual_max_num_blocks_per_seq} block_index_gpu_cache:{block_index_gpu_cache.data_ptr()} page_compress_cache_id:{page_compress_cache_ids_tensor[0]} num_compressed_page_tensor:{num_compressed_page_tensor[0]}  ==============")
                     out = torch.full((n_recomputes, key_cache.shape[-2], block_tables_arg.shape[-1]), 
                                      float('-inf'), 
@@ -1764,6 +1767,10 @@ class FlashAttentionImpl(AttentionImpl):
                         dim=-1,
                         index=torch.topk(out, k=decode_meta.page_compress_topk, sorted=False).indices
                     )
+                    # end_event.record()
+                    # torch.cuda.synchronize()
+                    # elapsed_time = start_event.elapsed_time(end_event)
+                    # print(f"==================== Page Selector time cost: {elapsed_time:.4f}ms =================")
 
                 # topk = None
                 # if key_meta_cache:

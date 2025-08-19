@@ -1733,32 +1733,32 @@ class Scheduler:
                 allow_async_output_proc = self._allow_async_output_proc(
                     seq_group)
 
-        if self.sparse_index_block_manager is not None:
-            # Sort sequence group metadata in the following order:
-            # prefill -> sparse index need to be recompute -> enable sparse index -> normal decode
-            #            |<--------------- sparse decode ---------------------->|
-            #            |<------------------------------------ decode ------------------------->|
-            # prefill_sgm_idx = []
-            # sparse_index_recompute_sgm_idx = []
-            # decode_sgm_idx = []
-            find_common_decode = False
-            for sgm in seq_group_metadata_list:
-                assert len(sgm.seq_data) == 1
-                seq_data = next(iter(sgm.seq_data.values()))
+        # if self.sparse_index_block_manager is not None:
+        #     # Sort sequence group metadata in the following order:
+        #     # prefill -> sparse index need to be recompute -> enable sparse index -> normal decode
+        #     #            |<--------------- sparse decode ---------------------->|
+        #     #            |<------------------------------------ decode ------------------------->|
+        #     # prefill_sgm_idx = []
+        #     # sparse_index_recompute_sgm_idx = []
+        #     # decode_sgm_idx = []
+        #     find_common_decode = False
+        #     for sgm in seq_group_metadata_list:
+        #         assert len(sgm.seq_data) == 1
+        #         seq_data = next(iter(sgm.seq_data.values()))
 
-                if seq_data.stage == SequenceStage.PREFILL:
-                    continue
+        #         if seq_data.stage == SequenceStage.PREFILL:
+        #             continue
 
-                # if seq_data.need_recompute_sparse_index(self.sparse_index_block_manager.recompute_step):
-                #     sparse_index_recompute_sgm.append(sgm)
-                #     continue
+        #         # if seq_data.need_recompute_sparse_index(self.sparse_index_block_manager.recompute_step):
+        #         #     sparse_index_recompute_sgm.append(sgm)
+        #         #     continue
 
-                if seq_data.need_refresh_page_compress_cache(
-                    self.sparse_index_block_manager.recompute_step,
-                    self.cache_config.block_size):
-                    assert not find_common_decode
-                else:
-                    find_common_decode = True
+        #         if seq_data.need_refresh_page_compress_cache(
+        #             self.sparse_index_block_manager.recompute_step,
+        #             self.cache_config.block_size):
+        #             assert not find_common_decode
+        #         else:
+        #             find_common_decode = True
                 
                 # page compress情况下不再需要单独区分使用稀疏 page 的计算和非稀疏的计算
                 # if seq_data.enable_sparse_index():
@@ -1806,15 +1806,14 @@ class Scheduler:
     def free_seq(self, seq: Sequence) -> None:
         """Free a sequence from a block table."""
         self.block_manager.free(seq)
+        if self.sparse_index_block_manager is not None:
+            self.sparse_index_block_manager.free(seq)
 
     def _free_finished_seqs(self, seq_group: SequenceGroup) -> None:
         """Free finished seqs in a sequence group."""
         for seq in seq_group.get_seqs():
             if seq.is_finished():
                 self.free_seq(seq)
-
-                if self.sparse_index_block_manager is not None:
-                    self.sparse_index_block_manager.free(seq)
 
     def _free_finished_seq_group(self, seq_group: SequenceGroup) -> None:
         if seq_group.is_finished():
@@ -1949,8 +1948,6 @@ class Scheduler:
         for seq in seqs:
             seq.status = SequenceStatus.WAITING
             self.free_seq(seq)
-            if self.sparse_index_block_manager is not None:
-                self.sparse_index_block_manager.free(seq)
             seq.reset_state_for_recompute()
         self._free_seq_group_cross_attn_blocks(seq_group)
 
