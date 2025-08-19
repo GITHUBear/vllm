@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import Optional
 
 import torch
 import torch.nn as nn
+from packaging import version
 
 from vllm import envs
 from vllm.logger import init_logger
@@ -31,8 +33,8 @@ class TopKTopPSampler(nn.Module):
         if current_platform.is_cuda():
             if is_flashinfer_available:
                 flashinfer_version = flashinfer.__version__
-                if flashinfer_version < "0.2.3":
-                    logger.warning(
+                if version.parse(flashinfer_version) < version.parse("0.2.3"):
+                    logger.warning_once(
                         "FlashInfer version >= 0.2.3 required. "
                         "Falling back to default sampling implementation.")
                     self.forward = self.forward_native
@@ -45,17 +47,18 @@ class TopKTopPSampler(nn.Module):
                     # None means False, while in V1, None means True. This is
                     # why we use the condition
                     # `envs.VLLM_USE_FLASHINFER_SAMPLER is not False` here.
-                    logger.info("Using FlashInfer for top-p & top-k sampling.")
+                    logger.info_once(
+                        "Using FlashInfer for top-p & top-k sampling.")
                     self.forward = self.forward_cuda
                 else:
-                    logger.warning(
+                    logger.warning_once(
                         "FlashInfer is available, but it is not enabled. "
                         "Falling back to the PyTorch-native implementation of "
                         "top-p & top-k sampling. For the best performance, "
                         "please set VLLM_USE_FLASHINFER_SAMPLER=1.")
                     self.forward = self.forward_native
             else:
-                logger.warning(
+                logger.warning_once(
                     "FlashInfer is not available. Falling back to the PyTorch-"
                     "native implementation of top-p & top-k sampling. For the "
                     "best performance, please install FlashInfer.")
@@ -89,18 +92,21 @@ class TopKTopPSampler(nn.Module):
         p: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """More optimized implementation for top-k and top-p sampling."""
-        probs = logits.softmax(dim=-1, dtype=torch.float32)
         if k is None and p is None:
             # We prefer `random_sample` over `flashinfer_sample` when sorting is
             # not needed. This is because `random_sample` does not require
             # CPU-GPU synchronization while `flashinfer_sample` does.
+            probs = logits.softmax(dim=-1, dtype=torch.float32)
             return random_sample(probs, generators)
         if generators:
-            logger.warning("FlashInfer 0.2.3+ does not support "
-                           "per-request generators. Falling back to "
-                           "PyTorch-native implementation.")
+            logger.warning_once("FlashInfer 0.2.3+ does not support "
+                                "per-request generators. Falling back to "
+                                "PyTorch-native implementation.")
             return self.forward_native(logits, generators, k, p)
-        return flashinfer_sample(probs, k, p, generators)
+        # flashinfer sampling functions expect contiguous logits.
+        # In flex_attn/triton_attn fp32 inference, logits can be non-contiguous
+        # because of slicing operation in logits_processor.
+        return flashinfer_sample(logits.contiguous(), k, p, generators)
 
     def forward_tpu(
         self,
@@ -254,17 +260,17 @@ def random_sample(
 
 
 def flashinfer_sample(
-    probs: torch.Tensor,
+    logits: torch.Tensor,
     k: Optional[torch.Tensor],
     p: Optional[torch.Tensor],
     generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
-    """Sample from the probabilities using FlashInfer.
+    """Sample from the logits using FlashInfer.
 
     Statistically, this function is equivalent to the `random_sample` function.
     However, this function is faster because it avoids sorting the logits tensor
     via rejection sampling.
-    
+
     NOTE: The outputs of this function do not necessarily match the outputs of
     the `random_sample` function. It only guarantees that the outputs are
     statistically equivalent.
@@ -274,18 +280,19 @@ def flashinfer_sample(
     the synchronization overhead.
     """
     assert not (k is None and p is None)
-
     if k is None:
         # Top-p only.
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
         next_token_ids = flashinfer.sampling.top_p_sampling_from_probs(
             probs, p, deterministic=True)
     elif p is None:
         # Top-k only.
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
         next_token_ids = flashinfer.sampling.top_k_sampling_from_probs(
             probs, k, deterministic=True)
     else:
         # Both top-k and top-p.
-        next_token_ids = (flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            probs, k, p, deterministic=True))
+        next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            logits, k, p, deterministic=True)
 
     return next_token_ids.view(-1)
