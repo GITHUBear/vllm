@@ -206,3 +206,30 @@ shellcheck*/
 
 # Ingore moe/marlin_moe gen code
 csrc/moe/marlin_moe_wna16/kernel_*
+
+benchmarks/infinite_benchmark/data
+benchmarks/infinite_benchmark/results
+benchmarks/needle_in_a_haystack/data
+benchmarks/needle_in_a_haystack/results
+benchmarks/needle_in_a_haystack/*.out
+benchmarks/infinite_benchmark/*.out
+benchmarks/infinite_benchmark/*.output
+nohup.out
+diff_fig
+diff_chunk_fig
+attn_out_dump
+xattn_chunked_out_dump
+xattn_out_dump
+
+benchmarks/math/results
+minference_fig
+minference_fig2
+attn_map_dump
+attn_map_dump2
+benchmarks/math/outputs
+benchmarks/math/*.out
+decode_attn_dump
+decode_attn_visual
+*.nsys-rep
+*.out
+*.png
