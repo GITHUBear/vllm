@@ -137,7 +137,6 @@ class Detokenizer:
         # Decode logprobs
         logprobs = seq.output_logprobs[-1]
         if logprobs:
-            previous_tokens = all_input_ids[:-1]
             for token_id, sample_logprob in logprobs.items():
                 # If the token was generated this iteration,
                 # use the provided text.
@@ -147,7 +146,7 @@ class Detokenizer:
 
                 if (sample_logprob.decoded_token is None
                         and token_id != VLLM_INVALID_TOKEN_ID):
-                    all_input_ids_with_logprob = previous_tokens + [token_id]
+                    all_input_ids_with_logprob = all_input_ids[:-1] + [token_id]
                     (_, new_text, _, _) = detokenize_incrementally(
                         tokenizer=tokenizer,
                         all_input_ids=all_input_ids_with_logprob,
