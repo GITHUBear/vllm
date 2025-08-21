@@ -108,7 +108,7 @@ class VisualTokenizer(torch.nn.Module):
         prefix: str = "",
     ):
         model_type = config.backbone_config.model_type
-        if model_type == "aimv2":
+        if model_type == "aim_v2":
             return AIMv2Model(
                 config=config.backbone_config,
                 quant_config=quant_config,
