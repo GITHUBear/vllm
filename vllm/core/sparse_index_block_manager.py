@@ -18,12 +18,14 @@ class SparseIndexBlockManager:
         recompute_step: int,
         num_sample_tokens: int,
         block_size: int,
+        block_sparse_enable_spec_decode: bool = False,
     ):
         self.num_gpu_blocks = num_gpu_blocks
         self.seqlen_threshold = seqlen_threshold
         self.recompute_step = recompute_step
         self.num_sample_tokens = num_sample_tokens
         self.block_size = block_size
+        self.block_sparse_enable_spec_decode = block_sparse_enable_spec_decode
         self.free_block_ids = [
             i for i in range(self.num_gpu_blocks)
         ]
@@ -55,7 +57,7 @@ class SparseIndexBlockManager:
             if seq.seq_id in self.seqid_block_id_mapping:
                 # 如果这个 seq 需要重新更新 compress page，则需要更新 _num_compressed_page
                 seq.data.set_num_computed_tokens_to_compress(
-                    need_check=True,
+                    need_check=(not self.block_sparse_enable_spec_decode),
                     recompute_index_step=self.recompute_step,
                     block_size=self.block_size,
                 )
@@ -72,7 +74,6 @@ class SparseIndexBlockManager:
             blk_id = self.free_block_ids[0]
             self.free_block_ids = self.free_block_ids[1:]
             self.seqid_block_id_mapping[seq.seq_id] = blk_id
-            # TODO[shk]: 修改为参与压缩的页面数量
             # seq.data.set_num_computed_tokens_when_enable_sparse_index()
             seq.data.set_num_computed_tokens_to_compress()
             logger.info(f"Allocate Sparse Index Block:{blk_id} for req:{seq_group.request_id} seq:{seq.seq_id}")

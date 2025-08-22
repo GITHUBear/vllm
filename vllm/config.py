@@ -2385,6 +2385,9 @@ class SpeculativeConfig:
     sparse_index_recompute_step: Optional[int] = None
     """Recompute sparse index after sparse_index_recompute_step decoding.
     """
+    block_sparse_enable_spec_decode: bool = False
+    """是否启用 spec decode 进行矫正
+    """
 
     # Typical acceptance sampler configuration
     posterior_threshold: Optional[float] = None
@@ -2560,13 +2563,13 @@ class SpeculativeConfig:
                 self.sparse_index_max_vertical_slash_topk = 25000
             
             if self.sparse_index_recompute_step is None:
-                self.sparse_index_recompute_step = 32
+                self.sparse_index_recompute_step = 64
                 
             if self.block_sparse_token_budget is None:
                 self.block_sparse_token_budget = 4096
             
             if self.block_sparse_recompute_step is None:
-                self.block_sparse_recompute_step = 32
+                self.block_sparse_recompute_step = 64
 
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config

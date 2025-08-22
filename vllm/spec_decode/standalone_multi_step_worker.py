@@ -140,9 +140,15 @@ class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
         seq_group_metadata_list_copy = []
         new_execute_model_req = execute_model_req.clone(seq_group_metadata_list_copy)
         for sg in execute_model_req.seq_group_metadata_list:
-            seq_group_metadata_list_copy.append(
-                StandaloneMultiStepWorker._shallow_copy_seq_group_metadata(sg)
-            )
+            sg_copied = StandaloneMultiStepWorker._shallow_copy_seq_group_metadata(sg)
+            sg_copied.enable_spec_decode_sparse_attn_force = True
+            if sg_copied.need_refresh_page_compress_cache(None, None, True):
+                sg_copied.spec_decode_force_sparse_index_recompute = True
+                sg_copied.spec_decode_force_use_sparse_index = True
+            else:
+                sg_copied.spec_decode_force_sparse_index_recompute = False
+                sg_copied.spec_decode_force_use_sparse_index = False
+            seq_group_metadata_list_copy.append(sg_copied)
         new_execute_model_req.seq_group_metadata_list = seq_group_metadata_list_copy
 
         # Run model sample_len times.
@@ -199,6 +205,7 @@ class StandaloneMultiStepWorker(ProposerWorkerBase, RefWorkerBase):
         for _, (seq_group_metadata, sequence_group_outputs) in enumerate(
                 zip(seq_group_metadata_list, model_output)):
             seq_group_metadata.is_prompt = False
+            seq_group_metadata.spec_decode_force_sparse_index_recompute = False
 
             for seq_output in sequence_group_outputs.samples:
                 seq = seq_group_metadata.seq_data[seq_output.parent_seq_id]

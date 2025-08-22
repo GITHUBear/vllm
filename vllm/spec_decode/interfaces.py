@@ -82,12 +82,14 @@ class SpeculativeProposer(ABC):
 class SpeculativeScorer(ABC):
 
     def __init__(self, scorer_worker: WorkerBase,
-                 device: Union[torch.device, str], vocab_size: int):
+                 device: Union[torch.device, str], vocab_size: int,
+                 standalone_mode_enable_spec_decode: bool = False):
         self._scorer_worker = scorer_worker
         if isinstance(device, torch.device):
             device = device.type
         self._device = device
         self._vocab_size = vocab_size
+        self._standalone_mode_enable_spec_decode = standalone_mode_enable_spec_decode
 
     @abstractmethod
     def score_proposals(

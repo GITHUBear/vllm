@@ -212,10 +212,15 @@ class SequenceData(msgspec.Struct,
     # def reset_num_computed_tokens_when_enable_sparse_index(self):
     #     self._num_computed_tokens_when_enable_sparse_index = None
 
-    def need_refresh_page_compress_cache(self, recompute_index_step, block_size) -> bool:
+    def need_refresh_page_compress_cache(self, 
+                                         recompute_index_step = None, 
+                                         block_size = None,
+                                         block_sparse_enable_spec_decode = False) -> bool:
         if self._num_computed_tokens_to_compress is None:
             return False
         assert self._num_computed_tokens + 1 >= self._num_computed_tokens_to_compress
+        if block_sparse_enable_spec_decode:
+            return True
         if (self._num_computed_tokens + 1 - self._num_computed_tokens_to_compress) % recompute_index_step != 0:
             return False
         if self._num_computed_tokens + 1 == self._num_computed_tokens_to_compress:
@@ -1104,6 +1109,12 @@ class SequenceGroupMetadata(
     num_speculative_tokens: Optional[int] = None
     # seq_id -> sparse_blk_id
     sparse_index_table: dict[int, int] = None
+    # 在开启稀疏注意力开启 spec decode 时用于强制控制 ModelInputForGPUBuilder.InterDataForSeqGroup 的以下参数
+    # 1. is_sparse_index_recompute
+    # 2. is_sparse_index
+    enable_spec_decode_sparse_attn_force: bool = False
+    spec_decode_force_sparse_index_recompute: bool = False
+    spec_decode_force_use_sparse_index: bool = False
 
     def __post_init__(self):
         if self.seq_data is not None and self.token_chunk_size is None:
@@ -1121,12 +1132,15 @@ class SequenceGroupMetadata(
     #     data = next(iter(self.seq_data.values()))
     #     return data.need_recompute_sparse_index(recompute_index_step)
     
-    def need_refresh_page_compress_cache(self, recompute_index_step, block_size) -> bool:
-        if recompute_index_step is None:
-            return False
+    def need_refresh_page_compress_cache(self, recompute_index_step, block_size, 
+                                         block_sparse_enable_spec_decode = False) -> bool:
         if len(self.seq_data) != 1:
             return False
         data = next(iter(self.seq_data.values()))
+        if block_sparse_enable_spec_decode:
+            return data.need_refresh_page_compress_cache(None, None, True)
+        if recompute_index_step is None:
+            return False
         return data.need_refresh_page_compress_cache(recompute_index_step, block_size)
     
     # def enable_sparse_index(self) -> bool:

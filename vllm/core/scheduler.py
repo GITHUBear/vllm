@@ -436,6 +436,7 @@ class Scheduler:
         sparse_index_alloc_seqlen_threshold: int = None,
         sparse_index_recompute_step: int = None,
         kv_compress_num_sample_tokens: int = None,
+        block_sparse_enable_spec_decode: bool = False,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -469,6 +470,7 @@ class Scheduler:
             enable_caching=self.cache_config.enable_prefix_caching,
         )
 
+        self.block_sparse_enable_spec_decode = block_sparse_enable_spec_decode
         self.sparse_index_block_manager: SparseIndexBlockManager = None
         if (sparse_index_num_gpu_blocks is not None and 
             sparse_index_alloc_seqlen_threshold is not None):
@@ -478,6 +480,7 @@ class Scheduler:
                 sparse_index_recompute_step,
                 kv_compress_num_sample_tokens,
                 self.cache_config.block_size,
+                self.block_sparse_enable_spec_decode,
             )
 
         # Sequence groups in the WAITING state.
@@ -852,7 +855,8 @@ class Scheduler:
 
                 if seq_data.need_refresh_page_compress_cache(
                     self.sparse_index_block_manager.recompute_step,
-                    self.cache_config.block_size):
+                    self.cache_config.block_size,
+                    self.block_sparse_enable_spec_decode):
                     page_compress_recomputes.append(sg)
                     scheduled_page_compress_recomputes.append(scheduled_sg)
                 else:
@@ -1521,6 +1525,7 @@ class Scheduler:
         # this allows us to go through the `no_spec` path in
         # `spec_decode_worker.py`
         all_prefills = len(scheduled_seq_groups) == num_prefill_groups
+        # comment[shk]: 如果全部是 prefill 请求的话 num_lookahead_slots = 0
         num_lookahead_slots = (0 if
                                (all_prefills
                                 and not self.scheduler_config.is_multi_step)

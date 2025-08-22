@@ -17,6 +17,8 @@ llm = LLM(
         "draft_tensor_parallel_size": 1,
         "num_speculative_tokens": 4,
     },
+    enforce_eager=True,
+    max_model_len=2048,
 )
 
 outputs = llm.generate(prompts, sampling_params)

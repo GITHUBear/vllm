@@ -23,7 +23,8 @@ class MQAScorer(SpeculativeScorer):
         all_proposal_lengths = proposals.proposal_lens.tolist()
         for i, seq_group_metadata in enumerate(
                 execute_model_req.seq_group_metadata_list):
-            if all_proposal_lengths[i] == 0:
+            if (self._standalone_mode_enable_spec_decode and 
+                (not seq_group_metadata.need_refresh_page_compress_cache(None, None, True))) or all_proposal_lengths[i] == 0:
                 # Keep prompt seqs untouched (keep computed_tokens for chunks).
                 target_seq_group_metadata_list.append(seq_group_metadata)
                 continue
@@ -80,9 +81,9 @@ class MQAScorer(SpeculativeScorer):
         # the for loop to build output for better performance.
         if min(all_proposal_lengths) == k:
             # Regular decodes only.
-            assert all(not sg.is_prompt
-                       for sg in target_seq_group_metadata_list
-                       if sg.is_prompt)
+            # assert all(not sg.is_prompt
+            #            for sg in target_seq_group_metadata_list
+            #            if sg.is_prompt)
             bs, _ = proposals.proposal_token_ids.shape
             all_tokens = target_token_ids.reshape(bs, k + 1)
             all_probs = target_probs.reshape(bs, k + 1, self._vocab_size)

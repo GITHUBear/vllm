@@ -108,6 +108,7 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
         block_sparse_mode=speculative_config.block_sparse_mode,
         block_sparse_token_budget=speculative_config.block_sparse_token_budget,
         block_sparse_recompute_step=speculative_config.block_sparse_recompute_step,
+        block_sparse_enable_spec_decode=speculative_config.block_sparse_enable_spec_decode,
     )
 
     spec_decode_worker = SpecDecodeWorker.create_worker(
@@ -205,6 +206,10 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             draft_worker_kwargs.pop("block_sparse_token_budget"))
         block_sparse_recompute_step = (
             draft_worker_kwargs.pop("block_sparse_recompute_step"))
+        block_sparse_enable_spec_decode = (
+            draft_worker_kwargs.pop("block_sparse_enable_spec_decode"))
+        if block_sparse_enable_spec_decode:
+            assert block_sparse_mode
         draft_model_config = draft_worker_kwargs["vllm_config"].model_config
         draft_parallel_config: ParallelConfig = draft_worker_kwargs[
             'vllm_config'].parallel_config
@@ -282,9 +287,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                     scorer_worker.model_config.max_model_len:
                 disable_mqa_scorer = True
                 logger.info(
-                    "[Speculative Decoding] Disabling MQA scorer as the "
-                    "draft model max_model_len is smaller than the target "
-                    "model max_model_len.")
+                    f"[Speculative Decoding] Disabling MQA scorer as the " \
+                    f"draft model max_model_len {draft_model_config.max_model_len} is smaller than the target " \
+                    f"model max_model_len {scorer_worker.model_config.max_model_len}.")
 
             if not scorer_worker.model_runner.model_config.enforce_eager:
                 disable_mqa_scorer = True
@@ -310,6 +315,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             block_sparse_mode=block_sparse_mode,
             block_sparse_token_budget=block_sparse_token_budget,
             block_sparse_recompute_step=block_sparse_recompute_step,
+            block_sparse_enable_spec_decode=block_sparse_enable_spec_decode,
             )
 
     def __init__(
@@ -331,7 +337,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         kv_compress_num_sample_tokens: Optional[int] = None,
         block_sparse_mode: bool = False,
         block_sparse_token_budget: Optional[int] = None,
-        block_sparse_recompute_step: Optional[int] = None
+        block_sparse_recompute_step: Optional[int] = None,
+        block_sparse_enable_spec_decode: bool = False,
     ):
         """
         Create a SpecDecodeWorker.
@@ -374,6 +381,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         self.block_sparse_mode = block_sparse_mode
         self.block_sparse_token_budget = block_sparse_token_budget
         self.block_sparse_recompute_step = block_sparse_recompute_step
+        self.block_sparse_enable_spec_decode = block_sparse_enable_spec_decode
         self.is_standalone_mode = isinstance(self.proposer_worker, StandaloneMultiStepWorker)
         self.standalone_kv_compress_trigger_threshold = (
             standalone_kv_compress_trigger_threshold)
@@ -455,7 +463,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
 
         self.scorer = scorer_cls(scorer_worker=self.scorer_worker,
                                  device=self.device,
-                                 vocab_size=self._vocab_size)
+                                 vocab_size=self._vocab_size,
+                                 standalone_mode_enable_spec_decode=self.block_sparse_enable_spec_decode)
 
         self._configure_model_sampler_for_spec_decode()
 
@@ -598,8 +607,16 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         # In any of these cases, the proposer and scorer workers
         # are called normally.
         # We expect `num_speculative_tokens` to be None for prefills.
+        force_no_spec = False
+        if self.is_standalone_mode:
+            if not self.block_sparse_enable_spec_decode:
+                force_no_spec = True
+            elif (len(execute_model_req.seq_group_metadata_list) == 1 and 
+                  not execute_model_req.seq_group_metadata_list[0].need_refresh_page_compress_cache(None, None, True)):
+                    force_no_spec = True
         no_spec = (num_lookahead_slots == 0 or disable_all_speculation
-                   or all_zero_spec_tokens or self.is_standalone_mode)
+                   or all_zero_spec_tokens or force_no_spec)
+        
 
         # Broadcast how many lookahead slots are scheduled for this step, and
         # whether all speculation is disabled, to all non-driver workers.
