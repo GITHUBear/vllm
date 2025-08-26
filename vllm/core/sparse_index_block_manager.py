@@ -18,12 +18,14 @@ class SparseIndexBlockManager:
         recompute_step: int,
         num_sample_tokens: int,
         block_size: int,
+        enable_recitify: bool = False,
     ):
         self.num_gpu_blocks = num_gpu_blocks
         self.seqlen_threshold = seqlen_threshold
         self.recompute_step = recompute_step
         self.num_sample_tokens = num_sample_tokens
         self.block_size = block_size
+        self.enable_recitify = enable_recitify
         self.free_block_ids = [
             i for i in range(self.num_gpu_blocks)
         ]
@@ -75,6 +77,8 @@ class SparseIndexBlockManager:
             # TODO[shk]: 修改为参与压缩的页面数量
             # seq.data.set_num_computed_tokens_when_enable_sparse_index()
             seq.data.set_num_computed_tokens_to_compress()
+            if self.enable_recitify:
+                seq.data.set_num_computed_tokens_first_time_page_compress()
             logger.info(f"Allocate Sparse Index Block:{blk_id} for req:{seq_group.request_id} seq:{seq.seq_id}")
 
     def build_seq_group_meta_sparse_index_table(self, sgm: SequenceGroupMetadata):
@@ -103,5 +107,6 @@ class SparseIndexBlockManager:
             self.free_block_ids.append(blk_id)
             self.seqid_block_id_mapping.pop(seq.seq_id)
             seq.data.reset_num_computed_tokens_to_compress()
+            seq.data.reset_num_computed_tokens_first_time_page_compress()
             # seq.data.reset_num_computed_tokens_when_enable_sparse_index()
             logger.info(f"Free Sparse Index Block:{blk_id} for seq:{seq.seq_id}")

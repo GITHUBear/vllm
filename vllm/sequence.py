@@ -193,6 +193,7 @@ class SequenceData(msgspec.Struct,
     # _num_computed_tokens_when_enable_sparse_index: Optional[int] = None
 
     _num_computed_tokens_to_compress: Optional[int] = None
+    _num_computed_tokens_first_time_page_compress: Optional[int] = None
 
     # def need_recompute_sparse_index(self, recompute_index_step: int) -> bool:
     #     if self._num_computed_tokens_when_enable_sparse_index is None:
@@ -222,6 +223,12 @@ class SequenceData(msgspec.Struct,
             return True
         return (self._num_computed_tokens + 1) // block_size > self._num_computed_tokens_to_compress // block_size
 
+    def need_recitify_kv_cache(self, recitify_step) -> bool:
+        if self._num_computed_tokens_first_time_page_compress is None:
+            return False
+        assert self._num_computed_tokens + 1 >= self._num_computed_tokens_first_time_page_compress
+        return (self._num_computed_tokens + 1 - self._num_computed_tokens_first_time_page_compress) % recitify_step == (recitify_step - 1)
+
     def enable_page_compress_cache(self) -> bool:
         if self._num_computed_tokens_to_compress is None:
             return False
@@ -238,8 +245,14 @@ class SequenceData(msgspec.Struct,
             if self.need_refresh_page_compress_cache(recompute_index_step, block_size):
                 self._num_computed_tokens_to_compress = self._num_computed_tokens + 1
     
+    def set_num_computed_tokens_first_time_page_compress(self):
+        self._num_computed_tokens_first_time_page_compress = self._num_computed_tokens + 1
+    
     def reset_num_computed_tokens_to_compress(self):
         self._num_computed_tokens_to_compress = None
+    
+    def reset_num_computed_tokens_first_time_page_compress(self):
+        self._num_computed_tokens_first_time_page_compress = None
 
     @staticmethod
     def from_prompt_token_counts(
@@ -1128,6 +1141,14 @@ class SequenceGroupMetadata(
             return False
         data = next(iter(self.seq_data.values()))
         return data.need_refresh_page_compress_cache(recompute_index_step, block_size)
+    
+    def need_recitify_kv_cache(self, recitify_step) -> bool:
+        if recitify_step is None:
+            return False
+        if len(self.seq_data) != 1:
+            return False
+        data = next(iter(self.seq_data.values()))
+        return data.need_recitify_kv_cache(recitify_step)
     
     # def enable_sparse_index(self) -> bool:
     #     if len(self.seq_data) != 1:

@@ -2372,6 +2372,9 @@ class SpeculativeConfig:
     """LServe recompute step.
     功能等同于 sparse_index_recompute_step，弃用
     """
+    block_sparse_enable_rectification: bool = False
+    """是否定期整改 block sparse attention 的 kv cache
+    """
     sparse_index_gpu_memory_ratio: Optional[float] = None
     """The gpu memory ratio of sparse index.
     """

@@ -18,10 +18,10 @@ data = {
         {"role": "system", "content": "你是一个乐于助人的AI助手。"},
         {"role": "user", "content": prompt_template.format(question=question)}
     ],
-    "temperature": 0,
+    "temperature": 0.8,
     "stream": True,
     # "ignore_eos": True,
-    # "max_tokens": 131072,
+    # "max_tokens": 65537,
 }
 
 try:

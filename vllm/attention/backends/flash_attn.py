@@ -211,6 +211,7 @@ class FlashAttentionMetadata(AttentionMetadata):
     num_compressed_pages_tensor: Optional[torch.Tensor] = None
     actual_seqlen_tensor: Optional[torch.Tensor] = None
     actual_max_num_blocks_per_seq: Optional[int] = None
+    actual_max_decode_seq_len: Optional[int] = None
     # page selector 的参数
     # num_full_blocks_tensor 由 num_compressed_pages_tensor 的前 num_sparse_index_recomputes 个提供
     # 用于初始化 out tensor
@@ -406,6 +407,7 @@ class FlashAttentionMetadata(AttentionMetadata):
             page_compress_cache_ids_tensor=self.page_compress_cache_ids_tensor,
             num_compressed_pages_tensor=self.num_compressed_pages_tensor,
             actual_max_num_blocks_per_seq=self.actual_max_num_blocks_per_seq,
+            actual_max_decode_seq_len=self.actual_max_decode_seq_len,
             actual_seqlen_tensor=self.actual_seqlen_tensor,
             page_selector_max_block_size=self.page_selector_max_block_size,
             page_compress_topk=self.page_compress_topk)
@@ -536,6 +538,9 @@ class FlashAttentionMetadataBuilder(
         is_prompt = inter_data.is_prompt
         is_sparse_index_recompute = inter_data.is_sparse_index_recompute
         is_sparse_index = inter_data.is_sparse_index
+        is_recitify = inter_data.is_recitify
+        assert (not is_sparse_index_recompute) or (not is_recitify)
+        
         block_tables = inter_data.block_tables
         sparse_index_block = inter_data.sparse_index_block
         num_computed_token_to_compress = inter_data.num_computed_token_to_compress
@@ -579,16 +584,19 @@ class FlashAttentionMetadataBuilder(
                     self.num_sparse_index_recompute_tokens += query_len
                 
                 # sparse_index_blocks
-                self.sparse_index_blocks.append(sparse_index_block_id)
+                if not is_recitify:
+                    self.sparse_index_blocks.append(sparse_index_block_id)
+                else:
+                    self.sparse_index_blocks.append(-1)
 
                 # num_compressed_pages
-                if num_computed_token_to_compress == -1:
+                if is_recitify or num_computed_token_to_compress == -1:
                     self.num_compressed_pages.append(-1)
                 else:
                     self.num_compressed_pages.append(num_computed_token_to_compress // self.block_size)
                 
                 # actual_curr_seq_lens
-                if is_sparse_index or is_sparse_index_recompute:
+                if (not is_recitify) and (is_sparse_index or is_sparse_index_recompute):
                     self.actual_curr_seq_lens.append(
                         curr_seq_len - (
                             num_computed_token_to_compress // self.block_size - self.page_compress_topk
@@ -732,8 +740,10 @@ class FlashAttentionMetadataBuilder(
                                                             device, self.runner.pin_memory)
         
         actual_max_num_blocks_per_seq = -1
+        actual_max_decode_seq_len = -1
         if len(self.actual_curr_seq_lens) > 0:
-            actual_max_num_blocks_per_seq = (max(self.actual_curr_seq_lens) + self.block_size - 1) // self.block_size
+            actual_max_decode_seq_len = max(self.actual_curr_seq_lens)
+            actual_max_num_blocks_per_seq = (actual_max_decode_seq_len + self.block_size - 1) // self.block_size
 
         page_selector_max_block_size = None
         if self.num_sparse_index_recomputes > 0:
@@ -788,6 +798,7 @@ class FlashAttentionMetadataBuilder(
             page_compress_cache_ids_tensor=page_compress_cache_ids_tensor,
             num_compressed_pages_tensor=num_compressed_pages_tensor,
             actual_max_num_blocks_per_seq=actual_max_num_blocks_per_seq,
+            actual_max_decode_seq_len=actual_max_decode_seq_len,
             page_selector_max_block_size=page_selector_max_block_size,
             page_compress_topk=self.page_compress_topk,
             update_meta_block_id_tensor=update_meta_block_id_tensor,
@@ -1701,6 +1712,42 @@ class FlashAttentionImpl(AttentionImpl):
             # because different queries might have different lengths.
 
             assert decode_meta.max_decode_query_len is not None
+
+            # start_event = torch.cuda.Event(enable_timing=True)
+            # end_event = torch.cuda.Event(enable_timing=True)
+            n_recomputes = decode_meta.num_sparse_index_recomputes
+            num_compressed_page_tensor = decode_meta.num_compressed_pages_tensor
+            page_compress_cache_ids_tensor = decode_meta.page_compress_cache_ids_tensor
+            actual_seqlen_tensor = decode_meta.actual_seqlen_tensor
+            actual_max_num_blocks_per_seq = decode_meta.actual_max_num_blocks_per_seq
+            if n_recomputes > 0:
+                assert (
+                    attn_type == AttentionType.DECODER and 
+                    key_meta_cache is not None and block_index_gpu_cache is not None and 
+                    num_compressed_page_tensor is not None and page_compress_cache_ids_tensor is not None
+                )
+                # start_event.record()
+                # print(f"==================== RECOMPUTE PAGE COMPRESS: actual_max_num_blocks_per_seq:{actual_max_num_blocks_per_seq} block_index_gpu_cache:{block_index_gpu_cache.data_ptr()} page_compress_cache_id:{page_compress_cache_ids_tensor[0]} num_compressed_page_tensor:{num_compressed_page_tensor[0]}  ==============")
+                out = torch.full((n_recomputes, key_cache.shape[-2], decode_meta.block_tables.shape[-1]), 
+                                    float('-inf'), 
+                                    dtype=decode_query.dtype, device=decode_query.device)
+                torch.ops._C.lserve_page_selector(
+                    decode_query[:n_recomputes],
+                    key_meta_cache,
+                    decode_meta.block_tables[:n_recomputes],
+                    num_compressed_page_tensor[:n_recomputes],
+                    out,
+                )
+                block_index_gpu_cache[page_compress_cache_ids_tensor[:n_recomputes], :, :] = torch.gather(
+                    decode_meta.block_tables[:n_recomputes].unsqueeze(1).expand(-1, out.shape[1], -1),
+                    dim=-1,
+                    index=torch.topk(out, k=decode_meta.page_compress_topk, sorted=False).indices
+                )
+                # end_event.record()
+                # torch.cuda.synchronize()
+                # elapsed_time = start_event.elapsed_time(end_event)
+                # print(f"==================== Page Selector time cost: {elapsed_time:.4f}ms =================")
+            
             # use only for actual varlen decoding
             if decode_meta.max_decode_query_len > 1:
                 assert attn_type == AttentionType.DECODER, (
@@ -1709,26 +1756,51 @@ class FlashAttentionImpl(AttentionImpl):
                 assert decode_meta.query_start_loc is not None
                 descale_shape = (decode_meta.query_start_loc.shape[0] - 1,
                                  key.shape[1])
-                flash_attn_varlen_func(
-                    q=decode_query,
-                    k=key_cache,
-                    v=value_cache,
-                    cu_seqlens_q=decode_meta.query_start_loc,
-                    max_seqlen_q=decode_meta.max_decode_query_len,
-                    seqused_k=decode_meta.seq_lens_tensor,
-                    max_seqlen_k=decode_meta.max_decode_seq_len,
-                    softmax_scale=softmax_scale,
-                    causal=True,
-                    window_size=window_size,
-                    alibi_slopes=alibi_slopes,
-                    softcap=logits_soft_cap,
-                    block_table=decode_meta.block_tables,
-                    out=decode_output,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
-                )
+                if block_index_gpu_cache is not None and block_index_gpu_cache.size(0) > 0:
+                    flash_attn_varlen_func(
+                        q=decode_query,
+                        k=key_cache,
+                        v=value_cache,
+                        cu_seqlens_q=decode_meta.query_start_loc,
+                        max_seqlen_q=decode_meta.max_decode_query_len,
+                        seqused_k=actual_seqlen_tensor,   # 使用压缩后的 actual_seqlen_tensor
+                        max_seqlen_k=decode_meta.actual_max_decode_seq_len,    # 使用压缩后的 actual_max_decode_seq_len
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                        window_size=window_size,
+                        alibi_slopes=alibi_slopes,
+                        softcap=logits_soft_cap,
+                        block_table=decode_meta.block_tables,
+                        page_compress_cache=block_index_gpu_cache,
+                        page_compress_cache_ids=page_compress_cache_ids_tensor,
+                        num_compressed_pages=num_compressed_page_tensor,
+                        out=decode_output,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=layer._q_scale.expand(descale_shape),
+                        k_descale=layer._k_scale.expand(descale_shape),
+                        v_descale=layer._v_scale.expand(descale_shape),
+                    )
+                else:
+                    flash_attn_varlen_func(
+                        q=decode_query,
+                        k=key_cache,
+                        v=value_cache,
+                        cu_seqlens_q=decode_meta.query_start_loc,
+                        max_seqlen_q=decode_meta.max_decode_query_len,
+                        seqused_k=decode_meta.seq_lens_tensor,
+                        max_seqlen_k=decode_meta.max_decode_seq_len,
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                        window_size=window_size,
+                        alibi_slopes=alibi_slopes,
+                        softcap=logits_soft_cap,
+                        block_table=decode_meta.block_tables,
+                        out=decode_output,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=layer._q_scale.expand(descale_shape),
+                        k_descale=layer._k_scale.expand(descale_shape),
+                        v_descale=layer._v_scale.expand(descale_shape),
+                    )
             else:
                 # Use flash_attn_with_kvcache for normal decoding.
                 (
@@ -1737,95 +1809,6 @@ class FlashAttentionImpl(AttentionImpl):
                     block_tables_arg,
                 ) = get_seq_len_block_table_args(decode_meta, False, attn_type)
                 descale_shape = (seq_lens_arg.shape[0], key_cache.shape[-2])
-
-                # start_event = torch.cuda.Event(enable_timing=True)
-                # end_event = torch.cuda.Event(enable_timing=True)
-                n_recomputes = decode_meta.num_sparse_index_recomputes
-                num_compressed_page_tensor = decode_meta.num_compressed_pages_tensor
-                page_compress_cache_ids_tensor = decode_meta.page_compress_cache_ids_tensor
-                actual_seqlen_tensor = decode_meta.actual_seqlen_tensor
-                actual_max_num_blocks_per_seq = decode_meta.actual_max_num_blocks_per_seq
-                if n_recomputes > 0:
-                    assert (
-                        key_meta_cache is not None and block_index_gpu_cache is not None and 
-                        num_compressed_page_tensor is not None and page_compress_cache_ids_tensor is not None
-                    )
-                    # start_event.record()
-                    # print(f"==================== RECOMPUTE PAGE COMPRESS: actual_max_num_blocks_per_seq:{actual_max_num_blocks_per_seq} block_index_gpu_cache:{block_index_gpu_cache.data_ptr()} page_compress_cache_id:{page_compress_cache_ids_tensor[0]} num_compressed_page_tensor:{num_compressed_page_tensor[0]}  ==============")
-                    out = torch.full((n_recomputes, key_cache.shape[-2], block_tables_arg.shape[-1]), 
-                                     float('-inf'), 
-                                     dtype=decode_query.dtype, device=decode_query.device)
-                    torch.ops._C.lserve_page_selector(
-                        decode_query[:n_recomputes],
-                        key_meta_cache,
-                        block_tables_arg[:n_recomputes],
-                        num_compressed_page_tensor[:n_recomputes],
-                        out,
-                    )
-                    block_index_gpu_cache[page_compress_cache_ids_tensor[:n_recomputes], :, :] = torch.gather(
-                        block_tables_arg[:n_recomputes].unsqueeze(1).expand(-1, out.shape[1], -1),
-                        dim=-1,
-                        index=torch.topk(out, k=decode_meta.page_compress_topk, sorted=False).indices
-                    )
-                    # end_event.record()
-                    # torch.cuda.synchronize()
-                    # elapsed_time = start_event.elapsed_time(end_event)
-                    # print(f"==================== Page Selector time cost: {elapsed_time:.4f}ms =================")
-
-                # topk = None
-                # if key_meta_cache:
-                #     torch.ops._C.lserve_page_selector(
-                #         decode_query,
-                #         key_meta_cache,
-                #         block_tables_arg,
-                #         # 在 build metadata 时创建两者
-                #         num_full_blocks,
-                #         out,
-                #     )
-                #     topk = torch.topk(out, k=256, largest=True).index
-
-                # topk_blocks_per_head = None
-                # SEQ_LEN_THRESHOLD = 8192
-                # TOKEN_BUDGET = 8192
-                # BLOCK_SIZE = 16
-                # if key_meta_cache is not None and key_meta_cache.size(0) > 0:
-                #     assert seq_lens_arg.size(0) == 1
-                #     seq_len = decode_meta.seq_lens[0]
-                #     block_table = block_tables_arg[0, :]
-                #     if seq_len >= SEQ_LEN_THRESHOLD:
-                #         num_full_filled_block = seq_len // BLOCK_SIZE
-                #         non_full_block_tokens = seq_len % BLOCK_SIZE
-                #         more_tokens = 1 if non_full_block_tokens > 0 else 0
-                #         cur_meta = key_meta_cache[block_table[:num_full_filled_block], ...]
-                #         pos_mask = decode_query >= 0
-                #         neg_mask = decode_query < 0
-                #         metas = torch.zeros(
-                #             (num_full_filled_block, key_meta_cache.size(1), key_meta_cache.size(-1)),
-                #             dtype=key_meta_cache.dtype,
-                #             device=key_meta_cache.device,
-                #         )
-                #         group_size = decode_query.size(1) // key_meta_cache.size(1)
-
-                #         topk = (TOKEN_BUDGET // BLOCK_SIZE) + more_tokens
-                #         topk_blocks_per_head = torch.zeros(
-                #             (decode_query.size(1), topk),
-                #             dtype=torch.int32,
-                #             device=key_meta_cache.device,
-                #         )
-
-                #         for head_i in range(decode_query.size(1)):
-                #             head_pos_mask = pos_mask[0, head_i, :]
-                #             head_neg_mask = neg_mask[0, head_i, :]
-                #             kv_head_i = head_i // group_size
-                #             metas[:, kv_head_i, head_pos_mask] = cur_meta[:, kv_head_i, 0, head_pos_mask]
-                #             metas[:, kv_head_i, head_neg_mask] = cur_meta[:, kv_head_i, 1, head_neg_mask]
-                #             scores = decode_query[:, head_i, :] @ metas[:, kv_head_i, :].transpose(0, 1)
-                #             if more_tokens == 0:
-                #                 topk_blocks_per_head[head_i, :] = block_table[scores.squeeze(0).topk(k=topk, dim=-1).indices]
-                #             else:
-                #                 topk_blocks_per_head[head_i, topk - 1] = block_table[num_full_filled_block]
-                #                 topk_blocks_per_head[head_i, :topk - 1] = block_table[scores.squeeze(0).topk(k=topk-1, dim=-1).indices]
-                #         seq_lens_arg[0] = TOKEN_BUDGET + non_full_block_tokens
 
                 # TODO
                 if self.dump_decode_attn:
@@ -1899,7 +1882,7 @@ class FlashAttentionImpl(AttentionImpl):
                             k_cache=key_cache,
                             v_cache=value_cache,
                             block_table=block_tables_arg,
-                            cache_seqlens=actual_seqlen_tensor,
+                            cache_seqlens=seq_lens_arg,
                             softmax_scale=softmax_scale,
                             causal=True,
                             window_size=window_size,

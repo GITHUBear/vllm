@@ -268,6 +268,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             encoder_seq_len: int = 0,
             is_sparse_index_recompute: bool = False,
             is_sparse_index: bool = False,
+            is_recitify: bool = False,
             sparse_index_block: Optional[Dict[int, int]] = None,
             num_computed_token_to_compress: int = -1,
         ):
@@ -282,6 +283,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.is_prompt = is_prompt
             self.is_sparse_index_recompute = is_sparse_index_recompute
             self.is_sparse_index = is_sparse_index
+            self.is_recitify = is_recitify
             self.block_tables = block_tables
             self.sparse_index_block = sparse_index_block
             self.num_computed_token_to_compress = num_computed_token_to_compress
@@ -561,8 +563,9 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             context_len = seq_len - 1
         else:
             context_len = seq_data.get_num_computed_tokens()
-            # if inter_data.is_sparse_index_recompute:
-            #     context_len -= (self.runner.sparse_index_kv_compress_num_sample_token - 1)
+            if inter_data.is_recitify:
+                # 矫正过程需要传入 sparse_index_recompute_step 个 token
+                context_len -= (self.runner.sparse_index_recompute_step - 1)
 
         # Compute tokens.
         if seq_data.prompt_embeds is None:
@@ -800,12 +803,18 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             # is_sparse_index_recompute = seq_group_metadata.need_recompute_sparse_index(
             #     recompute_index_step=self.runner.sparse_index_recompute_step,
             # )
+            # self.runner.speculative_config.block_sparse_enable_rectification
+            is_recitify = seq_group_metadata.need_recitify_kv_cache(
+                recitify_step=self.runner.sparse_index_recompute_step,
+            )
             is_sparse_index_recompute = seq_group_metadata.need_refresh_page_compress_cache(
                 recompute_index_step=self.runner.sparse_index_recompute_step,
                 block_size=self.runner.cache_config.block_size,
             )
+            assert (not is_recitify) or (not is_sparse_index_recompute)
             is_sparse_index = is_sparse_index_recompute or seq_group_metadata.enable_page_compress_cache()
         else:
+            is_recitify = False
             is_sparse_index_recompute = False
             is_sparse_index = False
 
@@ -836,6 +845,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             encoder_seq_len=encoder_seq_len,
             is_sparse_index_recompute=is_sparse_index_recompute,
             is_sparse_index=is_sparse_index,
+            is_recitify=is_recitify,
             sparse_index_block=seq_group_metadata.sparse_index_table,
             num_computed_token_to_compress=num_computed_token_to_compress)
 

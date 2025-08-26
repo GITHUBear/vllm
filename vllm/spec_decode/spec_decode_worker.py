@@ -748,9 +748,10 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                 continue
             
             sampled_token_ids_len = 1
-            # 由于不再使用 vertical-slash 模式，此处不需要处理 sample token
-            # if self.is_standalone_mode and (not self.block_sparse_mode) and seq_data.need_recompute_sparse_index(self.sparse_index_recompute_step):
-            #     sampled_token_ids_len = self.kv_compress_num_sample_tokens
+            # 对于修正过程，我们只需要取其最后一个output token作为输出即可
+            if (self.is_standalone_mode and self.block_sparse_mode and 
+                seq_data.need_recitify_kv_cache(self.sparse_index_recompute_step)):
+                sampled_token_ids_len = self.sparse_index_recompute_step
 
             # Sequence with output.
             completion_seq_group_output_list.append(
