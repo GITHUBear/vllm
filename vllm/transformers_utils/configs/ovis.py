@@ -32,7 +32,7 @@ class AIMv2Config(PretrainedConfig):
         kwargs: Keyword arguments for the [`PretrainedConfig`].
     """
 
-    model_type: str = "aimv2"
+    model_type: str = "aim_v2"
 
     def __init__(
         self,
@@ -72,7 +72,7 @@ IMAGE_TOKEN = "<image>"
 IMAGE_ATOM_ID = -300
 IMAGE_INDICATOR_IDS = [-301, -302, -303, -304, -305]
 
-AutoConfig.register("aimv2", AIMv2Config)
+AutoConfig.register("aim_v2", AIMv2Config)
 
 
 # ----------------------------------------------------------------------
