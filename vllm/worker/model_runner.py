@@ -271,6 +271,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             is_recitify: bool = False,
             sparse_index_block: Optional[Dict[int, int]] = None,
             num_computed_token_to_compress: int = -1,
+            pooling_token_delta: int = 0,
+            seq_len_after_pooling_for_decode: Optional[List[int]] = None,
         ):
             if reinit:
                 assert len(self.seq_ids) == len(seq_ids)  # type: ignore
@@ -292,6 +294,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.computed_block_nums = computed_block_nums
             self.n_seqs = n_seqs
             self.encoder_seq_len = encoder_seq_len
+
+            self.pooling_token_delta = pooling_token_delta
 
             if reinit:
                 if len(self.seq_ids) == 1 and reinit_use_defaults:
@@ -391,6 +395,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 self.mrope_input_positions = mrope_input_positions or None
                 self.seq_lens = seq_lens or []
                 self.orig_seq_lens = orig_seq_lens or []
+                self.seq_len_after_pooling_for_decode = seq_len_after_pooling_for_decode or []
                 self.prompt_lens = prompt_lens or []
                 self.query_lens = query_lens or []
                 self.context_lens = context_lens or []
@@ -424,6 +429,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.token_types = [[] for _ in range(self.n_seqs)]
             self.mrope_input_positions = None
             self.seq_lens = [0] * self.n_seqs
+            self.seq_len_after_pooling_for_decode = [0] * self.n_seqs
             self.orig_seq_lens = [0] * self.n_seqs
             self.prompt_lens = [0] * self.n_seqs
             self.query_lens = [0] * self.n_seqs
@@ -578,6 +584,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
         token_types = seq_group_metadata.token_type_ids
 
+        if inter_data.is_prompt:
+            inter_data.seq_len_after_pooling_for_decode[seq_idx] = seq_len
+        else:
+            inter_data.seq_len_after_pooling_for_decode[seq_idx] = seq_len - inter_data.pooling_token_delta
         inter_data.seq_lens[seq_idx] = seq_len
         inter_data.orig_seq_lens[seq_idx] = seq_len
         inter_data.prompt_lens[seq_idx] = seq_data.get_prompt_len()
@@ -847,7 +857,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             is_sparse_index=is_sparse_index,
             is_recitify=is_recitify,
             sparse_index_block=seq_group_metadata.sparse_index_table,
-            num_computed_token_to_compress=num_computed_token_to_compress)
+            num_computed_token_to_compress=num_computed_token_to_compress,
+            pooling_token_delta=seq_group_metadata.pooling_token_delta)
 
         self.inter_data_list.append(inter_data)
 
@@ -971,11 +982,13 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
         seq_lens = []
         query_lens = []
+        seq_len_after_pooling_for_decode = []
         max_decode_seq_len = 0
         max_encoder_seq_len = 0
         for inter_data in self.inter_data_list:
             seq_lens.extend(inter_data.seq_lens)
             query_lens.extend(inter_data.query_lens)
+            seq_len_after_pooling_for_decode.extend(inter_data.seq_len_after_pooling_for_decode)
             if not inter_data.is_prompt:
                 max_decode_seq_len = max(max_decode_seq_len,
                                          max(inter_data.seq_lens))
@@ -1035,7 +1048,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
         # Attention metadata.
         attn_metadata = self.attn_metadata_builder.build(
-            seq_lens, query_lens, cuda_graph_pad_size, batch_size)
+            seq_lens, query_lens, cuda_graph_pad_size, batch_size,
+            seq_len_after_pooling_for_decode)
 
         # LoRA data.
         lora_requests = set()

@@ -1467,6 +1467,11 @@ class CacheConfig:
     num_cpu_blocks: Optional[int] = field(default=None, init=False)
     """The number of blocks to allocate for CPU memory."""
 
+    enable_pooling: bool = False
+    """Enable pooling."""
+    pooling_blk_size: Optional[int] = None
+    """Pooling block size."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

@@ -233,3 +233,8 @@ decode_attn_visual
 *.nsys-rep
 *.out
 *.png
+
+topk_dump/*
+qkv_sim/*
+prefill_qkv_dump/*
+*.hdf5

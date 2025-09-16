@@ -85,7 +85,8 @@ def _compute_slot_mapping_numpy(slot_mapping: List[int],
 def compute_slot_mapping(is_profile_run: bool, slot_mapping: List[int],
                          seq_id: int, seq_len: int, context_len: int,
                          start_idx: int, block_size: int,
-                         block_tables: Dict[int, List[int]]):
+                         block_tables: Dict[int, List[int]],
+                         pooling_token_delta: int = 0):
     """
     Compute slot mapping.
     """
@@ -108,6 +109,12 @@ def compute_slot_mapping(is_profile_run: bool, slot_mapping: List[int],
 
     range_start = max(start_idx, context_len)
     range_end = seq_len
+    # TODO[shk]: 调整 range_start & range_end
+    if range_start == 0:
+        range_end -= pooling_token_delta
+    else:
+        range_start -= pooling_token_delta
+        range_end -= pooling_token_delta
     numel = range_end - range_start
     block_table = block_tables[seq_id]
 

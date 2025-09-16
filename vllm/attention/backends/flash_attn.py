@@ -220,6 +220,7 @@ class FlashAttentionMetadata(AttentionMetadata):
 
 
     update_meta_block_id_tensor: Optional[torch.Tensor] = None
+    seq_len_after_pooling_for_decode_tensor: Optional[torch.Tensor] = None
 
     @property
     def is_all_encoder_attn_metadata_set(self):
@@ -296,60 +297,6 @@ class FlashAttentionMetadata(AttentionMetadata):
             cross_slot_mapping=self.cross_slot_mapping,
             cross_block_tables=self.cross_block_tables)
         return self._cached_prefill_metadata
-    
-    # @property
-    # def sparse_index_decode_metadata(self) -> Optional["FlashAttentionMetadata"]:
-    #     if self.num_sparse_index_tokens == 0:
-    #         return None
-        
-    #     if self._cached_sparse_index_decode_metadata is not None:
-    #         return self._cached_sparse_index_decode_metadata
-        
-    #     assert ((self.seq_lens_tensor is not None)
-    #             or (self.encoder_seq_lens_tensor is not None))
-        
-    #     token_ed = self.num_prefill_tokens + self.num_sparse_index_tokens
-    #     query_ed = self.num_prefills + self.num_sparse_index_decodes
-    #     slot_mapping = (None if self.slot_mapping is None else
-    #                     self.slot_mapping[self.num_prefill_tokens:token_ed])
-    #     seq_lens_tensor = (None if self.seq_lens_tensor is None else
-    #                        self.seq_lens_tensor[self.num_prefills:query_ed])
-    #     block_tables = (None if self.block_tables is None else
-    #                     self.block_tables[self.num_prefills:query_ed])
-    #     prompt_lens = (None if self.prompt_lens is None else
-    #                    self.prompt_lens[self.num_prefills:query_ed])
-        
-    #     self._cached_sparse_index_decode_metadata = FlashAttentionMetadata(
-    #         num_prefills=0,
-    #         num_prefill_tokens=0,
-    #         num_decode_tokens=self.num_sparse_index_tokens,
-    #         slot_mapping=slot_mapping,
-    #         multi_modal_placeholder_index_maps=None,
-    #         enable_kv_scales_calculation=True,
-    #         seq_lens=None,
-    #         seq_lens_tensor=seq_lens_tensor,
-    #         max_decode_query_len=self.max_sparse_index_decode_query_len,
-    #         max_query_len=self.max_query_len,
-    #         max_prefill_seq_len=0,
-    #         max_decode_seq_len=self.max_sparse_index_decode_seq_len,
-    #         # Batch may be composed of prefill|decodes, adjust query start
-    #         # indices to refer to the start of decodes. E.g.
-    #         # in tokens:[3 prefills|6 decodes], query_start_loc=[3,9] => [0,6].
-    #         query_start_loc=(self.query_start_loc[self.num_prefills:query_ed+1] -
-    #                          self.query_start_loc[self.num_prefills])
-    #         if self.query_start_loc is not None else None,
-    #         seq_start_loc=self.seq_start_loc[self.num_prefills:query_ed+1]
-    #         if self.seq_start_loc is not None else None,
-    #         prompt_lens=prompt_lens,
-    #         context_lens_tensor=None,
-    #         block_tables=block_tables,
-    #         use_cuda_graph=self.use_cuda_graph,
-    #         sparse_index_kv_compress_recover_rate=self.sparse_index_kv_compress_recover_rate,
-    #         num_sparse_index_recomputes=self.num_sparse_index_recomputes,
-    #         num_sparse_index_recompute_tokens=self.num_sparse_index_recompute_tokens,
-    #         sparse_index_block=self.sparse_index_block,
-    #         sparse_index_block_tensor=self.sparse_index_block_tensor)
-    #     return self._cached_sparse_index_decode_metadata
 
     @property
     def decode_metadata(self) -> Optional["FlashAttentionMetadata"]:
@@ -410,7 +357,8 @@ class FlashAttentionMetadata(AttentionMetadata):
             actual_max_decode_seq_len=self.actual_max_decode_seq_len,
             actual_seqlen_tensor=self.actual_seqlen_tensor,
             page_selector_max_block_size=self.page_selector_max_block_size,
-            page_compress_topk=self.page_compress_topk)
+            page_compress_topk=self.page_compress_topk,
+            seq_len_after_pooling_for_decode_tensor=self.seq_len_after_pooling_for_decode_tensor)
         return self._cached_decode_metadata
 
     def advance_step(self,
@@ -539,6 +487,7 @@ class FlashAttentionMetadataBuilder(
         is_sparse_index_recompute = inter_data.is_sparse_index_recompute
         is_sparse_index = inter_data.is_sparse_index
         is_recitify = inter_data.is_recitify
+        pooling_token_delta = inter_data.pooling_token_delta
         assert (not is_sparse_index_recompute) or (not is_recitify)
         
         block_tables = inter_data.block_tables
@@ -576,7 +525,8 @@ class FlashAttentionMetadataBuilder(
             else:
                 # decode
                 self.num_decode_tokens += query_len
-                self.curr_seq_lens.append(curr_seq_len)
+                # [shk]
+                self.curr_seq_lens.append(curr_seq_len - pooling_token_delta)
 
                 # num_sparse_index_recomputes & num_sparse_index_recompute_tokens
                 if is_sparse_index_recompute:
@@ -632,7 +582,8 @@ class FlashAttentionMetadataBuilder(
                                                        self.sliding_window)
             compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
                                  seq_len, context_len, start_idx,
-                                 self.block_size, inter_data.block_tables)
+                                 self.block_size, inter_data.block_tables,
+                                 pooling_token_delta=pooling_token_delta)
 
     def _get_graph_runner_block_tables(
             self, num_seqs: int,
@@ -659,7 +610,8 @@ class FlashAttentionMetadataBuilder(
             device=self.runner.device, non_blocking=True)
 
     def build(self, seq_lens: List[int], query_lens: List[int],
-              cuda_graph_pad_size: int, batch_size: int):
+              cuda_graph_pad_size: int, batch_size: int,
+              seq_len_after_pooling_for_decode: Optional[List[int]] = None):
         """Build attention metadata with on-device tensors.
 
         Args:
@@ -758,6 +710,9 @@ class FlashAttentionMetadataBuilder(
         assert device is not None
         context_lens_tensor = async_tensor_h2d(self.context_lens, torch.int,
                                                device, self.runner.pin_memory)
+        seq_len_after_pooling_for_decode_tensor = async_tensor_h2d(
+            seq_len_after_pooling_for_decode, torch.int, device,
+            self.runner.pin_memory)
         seq_lens_tensor = async_tensor_h2d(seq_lens, torch.int, device,
                                            self.runner.pin_memory)
         slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, torch.long,
@@ -802,6 +757,7 @@ class FlashAttentionMetadataBuilder(
             page_selector_max_block_size=page_selector_max_block_size,
             page_compress_topk=self.page_compress_topk,
             update_meta_block_id_tensor=update_meta_block_id_tensor,
+            seq_len_after_pooling_for_decode_tensor=seq_len_after_pooling_for_decode_tensor,
         )
 
 class SparsePrefillType(IntEnum):
@@ -845,6 +801,57 @@ def _sum_all_diagonal_matrix(mat: torch.tensor):
     sum_diags = torch.sum(mat_strided, 1)
     return sum_diags[:, 1:]
 
+# @triton.jit
+# def triton_calcuate_blk_similarity(
+#     x_ptr,        # N * H * D
+#     # xmean_ptr,
+#     output_pool_ptr,
+#     output_blk_table_bitmap_ptr,
+#     sim_threshold: tl.float32,
+#     sim_blk_size: tl.constexpr,
+#     table_blk_size: tl.constexpr,
+#     N: tl.constexpr,
+#     D: tl.constexpr,
+#     BS: tl.constexpr,
+#     # fuse_mean: tl.constexpr,
+# ):
+#     nb, h = tl.program_id(0), tl.program_id(1)
+#     NB, H = tl.num_programs(0), tl.num_programs(1)
+
+#     block_offset = nb * BS * H * D + h * D
+#     xmask = 
+
+def group_mean_vectorized(tensor, BLK):
+    N, H, d = tensor.shape
+    num_full_groups = N // BLK
+    remainder = N % BLK
+
+    if num_full_groups > 0:
+        full_part = tensor[:num_full_groups * BLK]
+        full_reshaped = full_part.view(num_full_groups, BLK, H, d)
+        full_means = full_reshaped.mean(dim=1)
+    else:
+        full_means = None
+
+    if remainder > 0:
+        remaining_part = tensor[num_full_groups * BLK:]
+        remaining_mean = remaining_part.mean(dim=0, keepdim=True)  # (1, d)
+    else:
+        remaining_mean = None
+
+    # 合并结果
+    if full_means is not None and remaining_mean is not None:
+        result = torch.cat([full_means, remaining_mean], dim=0)
+    elif full_means is not None:
+        result = full_means
+    elif remaining_mean is not None:
+        result = remaining_mean
+    else:
+        assert False
+
+    return result
+
+
 class FlashAttentionImpl(AttentionImpl):
     """
     If the input tensors contain prompt tokens, the layout is as follows:
@@ -885,6 +892,8 @@ class FlashAttentionImpl(AttentionImpl):
         attn_type: str = AttentionType.DECODER,
         use_irope: bool = False,
         layer_idx: int = -1,
+        enable_pooling: bool = False,
+        pooling_blk_size: Optional[int] = None,
         dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
         enable_attn_out_dump: bool = False,
         enable_last_attn_map_dump: bool = False,
@@ -932,6 +941,8 @@ class FlashAttentionImpl(AttentionImpl):
         self.attn_type = attn_type
 
         self.layer_idx = layer_idx
+        self.enable_pooling = enable_pooling
+        self.pooling_blk_size = pooling_blk_size
         self.enable_attn_out_dump = enable_attn_out_dump
         self.enable_last_attn_map_dump = enable_last_attn_map_dump
         self.dump_last_query_len = dump_last_query_len
@@ -960,6 +971,8 @@ class FlashAttentionImpl(AttentionImpl):
                 for i in range(start_head, end_head)
             ]
 
+        self.dump_prefill_qkv = os.getenv("VLLM_FA_DUMP_PREFILL_QKV", None) is not None
+        # self.enable_blk_compress_qkv = os.getenv("VLLM_FA_BLK_QKV_COMPRESS", None) is not None
         self.dump_decode_attn = os.getenv("VLLM_FA_DUMP_DECODE_ATTN", None) is not None
         self.dump_decode_which_step = int(os.getenv("VLLM_FA_DUMP_DECODE_STEP", 0))
 
@@ -1044,6 +1057,33 @@ class FlashAttentionImpl(AttentionImpl):
             raise NotImplementedError(
                 "FlashAttention does not support FP8 kv-cache on this device.")
 
+        (num_prefill_query_tokens, num_prefill_kv_tokens,
+         num_decode_query_tokens) = \
+            get_num_prefill_decode_query_kv_tokens(attn_metadata, attn_type)
+        
+        key_after_pooling = []
+        val_after_pooling = []
+        if prefill_meta := attn_metadata.prefill_metadata:
+            if self.enable_pooling:
+                cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
+                for idx in range(0, len(cu_seqlens_cpu) - 1):
+                    start_idx = cu_seqlens_cpu[idx]
+                    end_idx = cu_seqlens_cpu[idx:idx+2][-1]
+                    seqlen = end_idx - start_idx
+
+                    cur_pooling_key = group_mean_vectorized(key[start_idx : end_idx], self.pooling_blk_size)
+                    cur_pooling_val = group_mean_vectorized(value[start_idx : end_idx], self.pooling_blk_size)
+                    
+                    key_after_pooling.append(cur_pooling_key)
+                    val_after_pooling.append(cur_pooling_val)
+            else:
+                key_after_pooling.append(key[:num_prefill_kv_tokens])
+                val_after_pooling.append(value[:num_prefill_kv_tokens])
+            
+        if decode_meta := attn_metadata.decode_metadata:
+            key_after_pooling.append(key[num_prefill_kv_tokens:])
+            val_after_pooling.append(value[num_prefill_kv_tokens:])
+
         if kv_cache.numel() > 0:
             key_cache = kv_cache[0]
             value_cache = kv_cache[1]
@@ -1063,20 +1103,35 @@ class FlashAttentionImpl(AttentionImpl):
                     # Update self-attention KV cache (prefill/decode)
                     updated_slot_mapping = attn_metadata.slot_mapping
 
-                # Reshape the input keys and values and store them in the cache.
-                # If kv_cache is not provided, the new key and value tensors are
-                # not cached. This happens during the initial memory
-                # profiling run.
-                torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    key,
-                    value,
-                    kv_cache[0],
-                    kv_cache[1],
-                    updated_slot_mapping.flatten(),  # type: ignore[union-attr]
-                    kv_cache_dtype,
-                    layer._k_scale,
-                    layer._v_scale,
-                )
+                if self.enable_pooling:
+                    assert len(key_after_pooling) > 0 and len(val_after_pooling) > 0
+                    key_after_pooling_tensor = torch.cat(key_after_pooling, dim=0)
+                    val_after_pooling_tensor = torch.cat(val_after_pooling, dim=0)
+                    torch.ops._C_cache_ops.reshape_and_cache_flash(
+                        key_after_pooling_tensor,
+                        val_after_pooling_tensor,
+                        kv_cache[0],
+                        kv_cache[1],
+                        updated_slot_mapping.flatten(),  # type: ignore[union-attr]
+                        kv_cache_dtype,
+                        layer._k_scale,
+                        layer._v_scale,
+                    )
+                else:
+                    # Reshape the input keys and values and store them in the cache.
+                    # If kv_cache is not provided, the new key and value tensors are
+                    # not cached. This happens during the initial memory
+                    # profiling run.
+                    torch.ops._C_cache_ops.reshape_and_cache_flash(
+                        key,
+                        value,
+                        kv_cache[0],
+                        kv_cache[1],
+                        updated_slot_mapping.flatten(),  # type: ignore[union-attr]
+                        kv_cache_dtype,
+                        layer._k_scale,
+                        layer._v_scale,
+                    )
 
                 if (key_meta_cache is not None and key_meta_cache.size(0) > 0 and
                     attn_type == AttentionType.DECODER and attn_metadata.update_meta_block_id_tensor.size(0) != 0):
@@ -1098,9 +1153,6 @@ class FlashAttentionImpl(AttentionImpl):
                 layer._q_scale)
             query = query.reshape((num_tokens, num_heads, head_size))
 
-        (num_prefill_query_tokens, num_prefill_kv_tokens,
-        num_decode_query_tokens) = \
-            get_num_prefill_decode_query_kv_tokens(attn_metadata, attn_type)
         decode_query = query[num_prefill_query_tokens:]
         decode_output = output[num_prefill_query_tokens:]
         # QKV for prefill.
@@ -1137,27 +1189,189 @@ class FlashAttentionImpl(AttentionImpl):
                         layer._v_scale)
                     value = value.reshape(
                         (num_kv_tokens, num_kv_heads, head_size))
+                
+                # if self.enable_blk_compress_qkv:
+                #     BLK_SIZE = 16
+
+                #     pass
 
                 descale_shape = (q_seq_start_loc.shape[0] - 1, key.shape[1])
-                flash_attn_varlen_func(
-                    q=query,
-                    k=key,
-                    v=value,
-                    cu_seqlens_q=q_seq_start_loc,
-                    cu_seqlens_k=k_seq_start_loc,
-                    max_seqlen_q=q_seq_len,
-                    max_seqlen_k=k_seq_len,
-                    softmax_scale=softmax_scale,
-                    causal=_get_causal_option(attn_type),
-                    window_size=window_size,
-                    alibi_slopes=alibi_slopes,
-                    softcap=logits_soft_cap,
-                    out=prefill_output,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
-                )
+                if self.sparse_prefill_attn_type == SparsePrefillType.FULL_ATTN or (
+                    kv_cache.numel() == 0 or (prefill_meta.block_tables is None)):
+                    flash_attn_varlen_func(
+                        q=query,
+                        k=key,
+                        v=value,
+                        cu_seqlens_q=q_seq_start_loc,
+                        cu_seqlens_k=k_seq_start_loc,
+                        max_seqlen_q=q_seq_len,
+                        max_seqlen_k=k_seq_len,
+                        softmax_scale=softmax_scale,
+                        causal=_get_causal_option(attn_type),
+                        window_size=window_size,
+                        alibi_slopes=alibi_slopes,
+                        softcap=logits_soft_cap,
+                        out=prefill_output,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=layer._q_scale.expand(descale_shape),
+                        k_descale=layer._k_scale.expand(descale_shape),
+                        v_descale=layer._v_scale.expand(descale_shape),
+                    )
+                    if self.dump_prefill_qkv and kv_cache.numel() > 0 and (prefill_meta.block_tables is not None):
+                        print("================== DUMP PREFILL QKV ================")
+                        assert query.shape[0] == key.shape[0] and query.shape[0] == value.shape[0]
+                        import h5py
+                        file_name = f"/data/shanhaikang.shk/vllm/prefill_qkv_dump_rand1/tensor_{self.tp_rank}.hdf5"
+                        with h5py.File(file_name, 'a') as f:
+                            f.create_dataset(f'Q_{self.layer_idx}', data=query.clone().detach().float().cpu().numpy())
+                            f.create_dataset(f'V_{self.layer_idx}', data=key.clone().detach().float().cpu().numpy())
+                            f.create_dataset(f'K_{self.layer_idx}', data=value.clone().detach().float().cpu().numpy())
+                elif self.sparse_prefill_attn_type == SparsePrefillType.X_ATTN:
+                    cu_seqlens_q = prefill_meta.seq_start_loc
+                    cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+
+                    # Because x_attn can only handle 1 batch_size now, we should do iteration here.
+                    qlen = None
+                    seqlen = None
+                    for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                        qs = cu_seqlens_q_cpu[query_idx]
+                        qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                        qlen = qe - qs
+
+                        current_q = query[qs : qe] # seq_len, num_head, head_dim
+                        group_size = current_q.size(-2) // key.size(-2)
+                        cur_key = key[qs : qe]
+                        cur_value = value[qs : qe]
+                        # x_attn can not handle GQA now, we should repeat key & value
+                        current_q = current_q.permute(1, 0, 2).unsqueeze(0)
+                        cur_key = torch.repeat_interleave(cur_key, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+                        cur_value = torch.repeat_interleave(cur_value, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+                        # copy partial_output to output
+                        # print(f"============== stride={self.sparse_prefill_attn_config.stride} ==========")
+                        partial_output = Xattention_prefill(
+                            query_states=current_q,
+                            key_states=cur_key,
+                            value_states=cur_value,
+                            stride=self.sparse_prefill_attn_config.stride,
+                            threshold=self.sparse_prefill_attn_config.threshold,
+                            block_size=self.sparse_prefill_attn_config.block_size,
+                            chunk_size=self.sparse_prefill_attn_config.chunk_size,
+                        ).squeeze(0)
+                        # print(f"================= partial_output shape: {partial_output.shape} ===========")
+                        output[qs : qe] = partial_output.permute(1, 0, 2)
+                elif self.sparse_prefill_attn_type == SparsePrefillType.FLEX_PREFILL:
+                    # Flex Prefill
+                    max_seq_len = q_seq_len
+                    block_size = self.sparse_prefill_attn_config.block_size
+                    
+                    if max_seq_len <= max(2 * block_size, math.ceil(self.sparse_prefill_attn_config.min_budget / block_size) * block_size):
+                        flash_attn_varlen_func(
+                            q=query,
+                            k=key,
+                            v=value,
+                            cu_seqlens_q=q_seq_start_loc,
+                            cu_seqlens_k=k_seq_start_loc,
+                            max_seqlen_q=q_seq_len,
+                            max_seqlen_k=k_seq_len,
+                            softmax_scale=softmax_scale,
+                            causal=_get_causal_option(attn_type),
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                            q_descale=layer._q_scale.expand(descale_shape),
+                            k_descale=layer._k_scale.expand(descale_shape),
+                            v_descale=layer._v_scale.expand(descale_shape),
+                        )
+                    else:
+                        assert logits_soft_cap == 0.0
+                        cu_seqlens_q = prefill_meta.seq_start_loc
+                        cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+
+                        for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                            qs = cu_seqlens_q_cpu[query_idx]
+                            qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                            current_q = query[qs : qe] # seq_len, num_head, head_dim
+                            # retrieve key & value from kv_cache
+                            cur_key = key[qs : qe]
+                            cur_value = value[qs : qe]
+
+                            current_q = current_q.unsqueeze(0)
+                            cur_key = cur_key.unsqueeze(0)
+                            cur_value = cur_value.unsqueeze(0)
+                            partial_output = flex_prefill_attention(
+                                q=current_q,
+                                k=cur_key,
+                                v=cur_value,
+                                gamma=self.sparse_prefill_attn_config.gamma,
+                                tau=self.sparse_prefill_attn_config.tau,
+                                min_budget=self.sparse_prefill_attn_config.min_budget,
+                                max_budget=self.sparse_prefill_attn_config.max_budget,
+                                softmax_scale=softmax_scale,
+                                block_size=self.sparse_prefill_attn_config.block_size,
+                            ).squeeze(0)
+                            output[qs : qe] = partial_output
+                elif self.sparse_prefill_attn_type == SparsePrefillType.SPARGE_ATTN:
+                    # Sparge Attention
+                    assert logits_soft_cap == 0.0
+                    cu_seqlens_q = prefill_meta.seq_start_loc
+                    cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+                    
+                    max_seq_len = q_seq_len
+                    has_short_query = False
+                    for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                        qs = cu_seqlens_q_cpu[query_idx]
+                        qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                        if qe - qs < 128:
+                            has_short_query = True
+                            break
+                    
+                    if has_short_query:
+                        flash_attn_varlen_func(
+                            q=query,
+                            k=key,
+                            v=value,
+                            cu_seqlens_q=q_seq_start_loc,
+                            cu_seqlens_k=k_seq_start_loc,
+                            max_seqlen_q=q_seq_len,
+                            max_seqlen_k=k_seq_len,
+                            softmax_scale=softmax_scale,
+                            causal=_get_causal_option(attn_type),
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                            q_descale=layer._q_scale.expand(descale_shape),
+                            k_descale=layer._k_scale.expand(descale_shape),
+                            v_descale=layer._v_scale.expand(descale_shape),
+                        )
+                    else:
+                        for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                            qs = cu_seqlens_q_cpu[query_idx]
+                            qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+
+                            current_q = query[qs : qe] # seq_len, num_head, head_dim
+                            group_size = current_q.size(-2) // key.size(-2)
+                            cur_key = key[qs : qe]
+                            cur_value = value[qs : qe]
+
+                            cur_key = torch.repeat_interleave(cur_key, repeats=group_size, dim=1).unsqueeze(0)
+                            cur_value = torch.repeat_interleave(cur_value, repeats=group_size, dim=1).unsqueeze(0)
+                            current_q = current_q.unsqueeze(0)
+
+                            partial_output = spas_sage2_attn_meansim_cuda(
+                                q=current_q,
+                                k=cur_key,
+                                v=cur_value,
+                                is_causal=True,
+                                simthreshd1=self.sparse_prefill_attn_config.simthreshd1,
+                                cdfthreshd=self.sparse_prefill_attn_config.cdfthreshd,
+                                pvthreshd=self.sparse_prefill_attn_config.pvthreshd,
+                                tensor_layout="NHD"
+                            ).squeeze(0)
+                            output[qs : qe] = partial_output
             else:
                 if self.sparse_prefill_attn_type == SparsePrefillType.FULL_ATTN:
                     # prefix-enabled attention
@@ -1273,7 +1487,7 @@ class FlashAttentionImpl(AttentionImpl):
                 elif self.sparse_prefill_attn_type == SparsePrefillType.X_ATTN:
                     # X-Attention
                     # For flash_attn: query -> nhd, while x_attn: query -> 1hnd
-                    # print("============== ENABLE X_ATTN ============")
+                    print("XXXXXXXXXXX ============== ENABLE X_ATTN ============")
                     cu_seqlens_q = prefill_meta.query_start_loc
                     cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
                     assert (prefill_meta.seq_lens_tensor is not None and 
@@ -1328,6 +1542,7 @@ class FlashAttentionImpl(AttentionImpl):
                             f.create_dataset(f'{self.layer_idx}_{seqlen - qlen}', data=prefill_output.clone().detach().float().cpu().numpy())
                 elif self.sparse_prefill_attn_type == SparsePrefillType.FLEX_PREFILL:
                     # Flex Prefill
+                    print("XXXXXXXXXXXXXX ============== ENABLE FLEX_PREFILL ============")
                     max_seq_len = max(prefill_meta.seq_lens)
                     block_size = self.sparse_prefill_attn_config.block_size
                     
@@ -1387,6 +1602,7 @@ class FlashAttentionImpl(AttentionImpl):
                             ).squeeze(0)
                             output[qs : qe] = partial_output
                 elif self.sparse_prefill_attn_type == SparsePrefillType.SPARGE_ATTN:
+                    print("XXXXXXXXXXXXX ============== ENABLE SPARGE_ATTN ============")
                     # Sparge Attention
                     assert logits_soft_cap == 0.0
                     cu_seqlens_q = prefill_meta.query_start_loc
@@ -1456,256 +1672,6 @@ class FlashAttentionImpl(AttentionImpl):
                 else:
                     raise ValueError(f"Unsupported sparse prefill type: {self.sparse_prefill_attn_type}")
 
-        # TODO[shk]: 将 vertical-slash 方式修改为 page 粒度计算
-        # if sparse_index_decode_meta := attn_metadata.sparse_index_decode_metadata:
-        #     assert attn_type == AttentionType.DECODER, (
-        #         "Only decoder-only models support sparse index decode"
-        #     )
-        #     recover_rate = sparse_index_decode_meta.sparse_index_kv_compress_recover_rate
-        #     sparse_index_block = sparse_index_decode_meta.sparse_index_block
-        #     sparse_index_block_tensor = sparse_index_decode_meta.sparse_index_block_tensor
-        #     assert (recover_rate is not None and sparse_index_block is not None and
-        #             sparse_index_block_tensor is not None)
-        #     assert (block_count_gpu_cache is not None and block_index_gpu_cache is not None and
-        #                 column_count_gpu_cache is not None and column_index_gpu_cache is not None)
-        #     # block_count_gpu_cache = block_count_gpu_cache.unsqueeze(-1)
-        #     # block_index_gpu_cache = block_index_gpu_cache.unsqueeze(-2)
-        #     # column_count_gpu_cache = column_count_gpu_cache.unsqueeze(-1)
-        #     # column_index_gpu_cache = column_index_gpu_cache.unsqueeze(-2)
-            
-        #     if sparse_index_decode_meta.num_sparse_index_recomputes > 0:
-        #         max_vertical_slash_topk = block_index_gpu_cache.size(-1)
-        #         # For simple, we handle single batch.
-        #         assert len(sparse_index_block) == 1
-        #         query = sparse_index_decode_query[:self.sparse_index_block_size, ...]
-        #         sparse_index_block_idx = sparse_index_block[0]
-        #         sparse_index_decode_block_table = sparse_index_decode_meta.block_tables[0]
-        #         seq_len = sparse_index_decode_meta.max_decode_seq_len
-        #         n_heads = query.size(-2)
-
-        #         group_size = query.size(-2) // key_cache.size(-2)
-        #         key = key_cache[sparse_index_decode_block_table].view(-1, *key_cache.shape[-2:])[: seq_len]
-
-        #         query = query.transpose(0, 1) # hnd
-        #         # nhd -> hdn
-        #         key = key.permute(1, 2, 0)
-        #         assert key.size(0) == 1
-        #         qk = (query * softmax_scale) @ key
-        #         qk[:, :, -self.sparse_index_block_size:] = torch.where(
-        #             self.last_q_mask,
-        #             qk[:, :, -self.sparse_index_block_size:],
-        #             -torch.inf,
-        #         )
-        #         qk = F.softmax(qk, dim=-1)
-
-        #         # 
-        #         vertical = qk.sum(-2)
-        #         vertical_sorted = vertical.sort(dim=-1, descending=True).values
-        #         cum_vertical_sorted = vertical_sorted.cumsum(dim=-1)
-        #         vertical_targets = torch.ones((n_heads,), device=qk.device) * cum_vertical_sorted[..., -1] * recover_rate
-        #         vindices = torch.searchsorted(cum_vertical_sorted, vertical_targets.view(n_heads, 1), side='left')
-        #         vindices = vindices[..., 0] + 30
-        #         # vertical count
-        #         vindices = torch.clamp(vindices, max=min(max_vertical_slash_topk, seq_len))
-        #         vertical[..., :30] = torch.inf
-        #         # 
-        #         slash = _sum_all_diagonal_matrix(qk)
-        #         slash = slash[..., :-self.sparse_index_block_size + 1]
-        #         slash_sorted = slash.sort(dim=-1, descending=True).values
-        #         cum_slash_sorted = slash_sorted.cumsum(dim=-1)
-        #         slash_targets = torch.ones((n_heads,), device=qk.device) * cum_slash_sorted[..., -1] * recover_rate
-        #         sindices = torch.searchsorted(cum_slash_sorted, slash_targets.view(n_heads, 1), side='left')
-        #         sindices = sindices[..., 0] + 100
-        #         # slash_count
-        #         sindices = torch.clamp(sindices, max=min(max_vertical_slash_topk, seq_len))
-        #         slash[..., -100:] = torch.inf
-                
-        #         vertical_index_buff = torch.full(
-        #             (n_heads, min(max_vertical_slash_topk, seq_len)),
-        #             self.int32_max,
-        #             dtype=torch.int32,
-        #             device=qk.device,
-        #         )
-        #         slash_index_buff = torch.full(
-        #             (n_heads, min(max_vertical_slash_topk, seq_len)),
-        #             self.int32_max,
-        #             dtype=torch.int32,
-        #             device=qk.device,
-        #         )
-        #         for head_i in range(n_heads):
-        #             vtopk = vindices[head_i].item()
-        #             vertical_topk = torch.topk(vertical[head_i:head_i+1], vtopk, -1).indices
-        #             vertical_index_buff[head_i, :vtopk] = vertical_topk
-
-        #             stopk = sindices[head_i].item()
-        #             slash_topk = torch.topk(slash[head_i:head_i+1], stopk, -1).indices
-        #             slash_topk = (seq_len - 1) - slash_topk
-        #             slash_index_buff[head_i, :stopk] = slash_topk
-        #         vertical_index_buff = vertical_index_buff.sort(dim=-1, descending=False)[0]
-        #         slash_index_buff = slash_index_buff.sort(dim=-1, descending=False)[0]
-
-        #         # kv_seq_len = seq_len
-        #         # context_size = self.sparse_index_block_size
-        #         # q_seqlens = torch.tensor([context_size],
-        #         #              dtype=torch.int32,
-        #         #              device=query.device)
-        #         # kv_seqlens = torch.tensor([kv_seq_len],
-        #         #                         dtype=torch.int32,
-        #         #                         device=query.device)
-        #         vcount = vindices.to(torch.int32)
-        #         scount = sindices.to(torch.int32)
-
-        #         block_count_gpu_cache[sparse_index_block_idx, ...] = scount
-        #         column_count_gpu_cache[sparse_index_block_idx, ...] = vcount
-        #         block_index_gpu_cache[sparse_index_block_idx, :, :min(max_vertical_slash_topk, seq_len)] = slash_index_buff
-        #         column_index_gpu_cache[sparse_index_block_idx, :, :min(max_vertical_slash_topk, seq_len)] = vertical_index_buff
-                
-        #         # block_count_gpu_cache[sparse_index_block_idx:sparse_index_block_idx+1, ...] = 
-        #         # (
-        #         #     block_count_gpu_cache[sparse_index_block_idx:sparse_index_block_idx+1, ...],
-        #         #     block_index_gpu_cache[sparse_index_block_idx:sparse_index_block_idx+1, :, :, :seq_len],
-        #         #     column_count_gpu_cache[sparse_index_block_idx:sparse_index_block_idx+1, ...],
-        #         #     column_index_gpu_cache[sparse_index_block_idx:sparse_index_block_idx+1, :, :, :seq_len]
-        #         # ) = ops.convert_vertical_slash_indexes_mergehead(
-        #         #     q_seqlens, kv_seqlens, 
-        #         #     vertical_index_buff.unsqueeze(0), slash_index_buff.unsqueeze(0), 
-        #         #     vindices, sindices, context_size,
-        #         #     self.sparse_index_block_size, self.sparse_index_block_size)
-
-        #     assert sparse_index_decode_meta.max_decode_query_len is not None
-        #     if sparse_index_decode_meta.max_decode_query_len > 1:
-        #         assert attn_type == AttentionType.DECODER, (
-        #             "Only decoder-only models support max_decode_query_len > 1"
-        #         )
-        #         assert sparse_index_decode_meta.query_start_loc is not None
-        #         descale_shape = (sparse_index_decode_meta.query_start_loc.shape[0] - 1,
-        #                          key.shape[1])
-        #         flash_attn_varlen_func(
-        #             q=sparse_index_decode_query,
-        #             k=key_cache,
-        #             v=value_cache,
-        #             cu_seqlens_q=sparse_index_decode_meta.query_start_loc,
-        #             max_seqlen_q=sparse_index_decode_meta.max_decode_query_len,
-        #             seqused_k=sparse_index_decode_meta.seq_lens_tensor,
-        #             max_seqlen_k=sparse_index_decode_meta.max_decode_seq_len,
-        #             softmax_scale=softmax_scale,
-        #             causal=True,
-        #             window_size=window_size,
-        #             alibi_slopes=alibi_slopes,
-        #             softcap=logits_soft_cap,
-        #             block_table=sparse_index_decode_meta.block_tables,
-        #             out=sparse_index_decode_output,
-        #             fa_version=self.vllm_flash_attn_version,
-        #             q_descale=layer._q_scale.expand(descale_shape),
-        #             k_descale=layer._k_scale.expand(descale_shape),
-        #             v_descale=layer._v_scale.expand(descale_shape),
-        #         )
-        #     else:
-        #         # if sparse_index_decode_meta.num_sparse_index_recomputes == 0:
-        #         #     print("DEBUG")
-        #         assert len(sparse_index_block) == 1
-        #         sparse_index_block_idx = sparse_index_block[0]
-        #         sparse_index_decode_block_table = sparse_index_decode_meta.block_tables[0]
-        #         seq_len = sparse_index_decode_meta.max_decode_seq_len
-        #         key = key_cache[sparse_index_decode_block_table].view(-1, *key_cache.shape[-2:])[: seq_len]
-        #         value = value_cache[sparse_index_decode_block_table].view(-1, *value_cache.shape[-2:])[: seq_len]
-
-        #         n_head = sparse_index_decode_query.size(-2)
-        #         kv_head = key.size(-2)
-        #         group_size = n_head // kv_head
-        #         for head_i in range(n_head):
-        #             khead_i = head_i // group_size
-        #             block_count = block_count_gpu_cache[sparse_index_block_idx, head_i]
-        #             column_count = column_count_gpu_cache[sparse_index_block, head_i]
-        #             block_index = block_index_gpu_cache[sparse_index_block_idx, head_i, :block_count]
-        #             column_index = column_index_gpu_cache[sparse_index_block_idx, head_i, :column_count]
-        #             indices = torch.unique(torch.cat([((seq_len - 1) - block_index), column_index]))
-
-        #             q = sparse_index_decode_query[:, head_i:head_i+1, :]
-        #             k = key[indices, khead_i:khead_i+1, :]
-        #             v = value[indices, khead_i:khead_i+1, :]
-        #             flash_attn_varlen_func(
-        #                 q=q,
-        #                 k=k,
-        #                 v=v,
-        #                 softmax_scale=softmax_scale,
-        #                 cu_seqlens_q=torch.tensor([0, 1],
-        #                                         dtype=torch.int32,
-        #                                         device=q.device),
-        #                 max_seqlen_q=1,
-        #                 cu_seqlens_k=torch.tensor([0, k.shape[0]],
-        #                                         dtype=torch.int32,
-        #                                         device=q.device),
-        #                 max_seqlen_k=k.shape[0],
-        #                 causal=True,
-        #                 window_size=window_size,
-        #                 alibi_slopes=alibi_slopes,
-        #                 softcap=logits_soft_cap,
-        #                 out=sparse_index_decode_output[:, head_i:head_i+1, :],
-        #                 fa_version=self.vllm_flash_attn_version,
-        #             )
-
-        #         # # descale_shape = (sparse_index_decode_meta.seq_lens_tensor.shape[0], key_cache.shape[-2])
-        #         # flash_attn_varlen_func(
-        #         #     q=sparse_index_decode_query,
-        #         #     k=key,
-        #         #     v=value,
-        #         #     softmax_scale=softmax_scale,
-        #         #     cu_seqlens_q=torch.tensor([0, 1],
-        #         #                             dtype=torch.int32,
-        #         #                             device=query.device),
-        #         #     max_seqlen_q=1,
-        #         #     cu_seqlens_k=torch.tensor([0, key.shape[0]],
-        #         #                             dtype=torch.int32,
-        #         #                             device=query.device),
-        #         #     max_seqlen_k=key.shape[0],
-        #         #     causal=True,
-        #         #     window_size=window_size,
-        #         #     alibi_slopes=alibi_slopes,
-        #         #     softcap=logits_soft_cap,
-        #         #     out=sparse_index_decode_output,
-        #         #     fa_version=self.vllm_flash_attn_version,
-        #         #     # q_descale=layer._q_scale.expand(descale_shape),
-        #         #     # k_descale=layer._k_scale.expand(descale_shape),
-        #         #     # v_descale=layer._v_scale.expand(descale_shape),
-        #         # )
-        #         # block_count = block_count_gpu_cache[sparse_index_block_idx, ...].unsqueeze(-1)
-        #         # block_offset = block_index_gpu_cache[sparse_index_block_idx, ...].unsqueeze(-2)
-        #         # column_count = column_count_gpu_cache[sparse_index_block_idx, ...].unsqueeze(-1)
-        #         # column_index = column_index_gpu_cache[sparse_index_block_idx, ...].unsqueeze(-2)
-        #         # sparse_attn_func(
-        #         #     q=sparse_index_decode_query.unsqueeze(0),
-        #         #     k=key.unsqueeze(0),
-        #         #     v=value.unsqueeze(0),
-        #         #     block_count=block_count,
-        #         #     block_offset=block_offset,
-        #         #     column_count=column_count,
-        #         #     column_index=column_index,
-        #         #     causal=True,
-        #         #     softmax_scale=softmax_scale,
-        #         #     out=sparse_index_decode_output.unsqueeze(1)
-        #         # )
-        #         # seq_lens_arg = sparse_index_decode_meta.seq_lens_tensor
-        #         # block_tables_arg = sparse_index_decode_meta.block_tables
-        #         # descale_shape = (seq_lens_arg.shape[0], key_cache.shape[-2])
-        #         # flash_attn_with_kvcache(
-        #         #     q=sparse_index_decode_query.unsqueeze(1),
-        #         #     k_cache=key_cache,
-        #         #     v_cache=value_cache,
-        #         #     block_table=block_tables_arg,
-        #         #     cache_seqlens=seq_lens_arg,
-        #         #     softmax_scale=softmax_scale,
-        #         #     causal=True,
-        #         #     window_size=window_size,
-        #         #     alibi_slopes=alibi_slopes,
-        #         #     softcap=logits_soft_cap,
-        #         #     out=sparse_index_decode_output.unsqueeze(1),
-        #         #     fa_version=self.vllm_flash_attn_version,
-        #         #     q_descale=layer._q_scale.expand(descale_shape),
-        #         #     k_descale=layer._k_scale.expand(descale_shape),
-        #         #     v_descale=layer._v_scale.expand(descale_shape),
-        #         # )
-
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
             # Use flash_attn_varlen_func kernel for speculative decoding
@@ -1743,6 +1709,14 @@ class FlashAttentionImpl(AttentionImpl):
                     dim=-1,
                     index=torch.topk(out, k=decode_meta.page_compress_topk, sorted=False).indices
                 )
+                # block_index_gpu_cache[page_compress_cache_ids_tensor[:n_recomputes], :, :] = tmp
+
+                # decode_seq_len = decode_meta.max_decode_seq_len
+                # if decode_seq_len >= 4096 and decode_seq_len <= 8192:
+                #     import h5py
+                #     file_name = f"/data/shanhaikang.shk/vllm/topk_dump/tensor_{self.tp_rank}_{decode_seq_len}.hdf5"
+                #     with h5py.File(file_name, 'a') as f:
+                #         f.create_dataset(f'{self.layer_idx}', data=tmp.float().cpu().numpy())
                 # end_event.record()
                 # torch.cuda.synchronize()
                 # elapsed_time = start_event.elapsed_time(end_event)
@@ -1787,7 +1761,7 @@ class FlashAttentionImpl(AttentionImpl):
                         v=value_cache,
                         cu_seqlens_q=decode_meta.query_start_loc,
                         max_seqlen_q=decode_meta.max_decode_query_len,
-                        seqused_k=decode_meta.seq_lens_tensor,
+                        seqused_k=decode_meta.seq_lens_tensor if not self.enable_pooling else decode_meta.seq_len_after_pooling_for_decode_tensor,
                         max_seqlen_k=decode_meta.max_decode_seq_len,
                         softmax_scale=softmax_scale,
                         causal=True,
@@ -1809,6 +1783,9 @@ class FlashAttentionImpl(AttentionImpl):
                     block_tables_arg,
                 ) = get_seq_len_block_table_args(decode_meta, False, attn_type)
                 descale_shape = (seq_lens_arg.shape[0], key_cache.shape[-2])
+
+                if attn_type == AttentionType.DECODER and self.enable_pooling:
+                    seq_lens_arg = decode_meta.seq_len_after_pooling_for_decode_tensor
 
                 # TODO
                 if self.dump_decode_attn:

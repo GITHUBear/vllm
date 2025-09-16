@@ -134,6 +134,8 @@ class Attention(nn.Module):
         self.impl = impl_cls(num_heads, head_size, scale, num_kv_heads,
                              alibi_slopes, sliding_window, kv_cache_dtype,
                              blocksparse_params, logits_soft_cap, attn_type,
+                             enable_pooling=cache_config.enable_pooling,
+                             pooling_blk_size=cache_config.pooling_blk_size,
                              **extra_impl_args)
         self.backend = backend_name_to_enum(attn_backend.get_name())
         self.dtype = dtype

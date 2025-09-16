@@ -374,6 +374,11 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: DualChunkFlashAttentionMetadata,
+        key_meta_cache: Optional[torch.Tensor] = None,
+        block_count_gpu_cache: Optional[torch.Tensor] = None,
+        block_index_gpu_cache: Optional[torch.Tensor] = None,
+        column_count_gpu_cache: Optional[torch.Tensor] = None,
+        column_index_gpu_cache: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Forward pass with DualChunkFlashAttention.
         Args:

@@ -63,6 +63,9 @@ class TokensPrompt(TypedDict):
     Optional cache salt to be used for prefix caching.
     """
 
+    doc_ranges: Optional[list[tuple]]
+    """document token range"""
+
 
 class EmbedsPrompt(TypedDict):
     """Schema for a prompt provided via token embeddings."""
@@ -182,12 +185,15 @@ class TokenInputs(TypedDict):
     Optional cache salt to be used for prefix caching.
     """
 
+    doc_ranges: NotRequired[list[tuple]]
+
 
 def token_inputs(
     prompt_token_ids: list[int],
     token_type_ids: Optional[list[int]] = None,
     prompt: Optional[str] = None,
     cache_salt: Optional[str] = None,
+    doc_ranges: Optional[str] = None,
 ) -> TokenInputs:
     """Construct {class}`TokenInputs` from optional values."""
     inputs = TokenInputs(type="token", prompt_token_ids=prompt_token_ids)
@@ -198,6 +204,8 @@ def token_inputs(
         inputs["token_type_ids"] = token_type_ids
     if cache_salt is not None:
         inputs["cache_salt"] = cache_salt
+    if doc_ranges is not None:
+        inputs["doc_ranges"] = doc_ranges
 
     return inputs
 

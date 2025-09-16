@@ -468,6 +468,8 @@ class Scheduler:
             num_cpu_blocks=num_cpu_blocks,
             sliding_window=self.cache_config.sliding_window,
             enable_caching=self.cache_config.enable_prefix_caching,
+            enable_pooling=self.cache_config.enable_pooling,
+            pooling_blk_size=self.cache_config.pooling_blk_size,
         )
 
         self.sparse_index_block_manager: SparseIndexBlockManager = None
@@ -1679,6 +1681,14 @@ class Scheduler:
             # It assumes the scheduled_seq_groups is ordered by
             # prefill < decoding.
             if is_first_prefill or not self.scheduler_config.send_delta_data:
+                pooling_token_delta = 0
+                if self.cache_config.enable_pooling:
+                    assert (not self.scheduler_config.chunked_prefill_enabled)
+                    seqs = seq_group.get_seqs()
+                    assert len(seqs) == 1
+                    prompt_len = seqs[0].data.get_prompt_len()
+                    pooling_token_len = (prompt_len + self.cache_config.pooling_blk_size - 1) // self.cache_config.pooling_blk_size
+                    pooling_token_delta = prompt_len - pooling_token_len
                 seq_group_metadata = SequenceGroupMetadata(
                     request_id=seq_group.request_id,
                     is_prompt=is_prompt,
@@ -1705,6 +1715,7 @@ class Scheduler:
                         seq_group.multi_modal_placeholders
                         if scheduler_outputs.num_prefill_groups > 0 else None),
                     prompt_adapter_request=seq_group.prompt_adapter_request,
+                    pooling_token_delta=pooling_token_delta,
                 )
                 if self.sparse_index_block_manager is not None:
                     self.sparse_index_block_manager.build_seq_group_meta_sparse_index_table(
@@ -1853,6 +1864,7 @@ class Scheduler:
             self._async_stopped.clear()
 
     def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
+        # TODO[shk]:对于池化情况，不应该分配完整的数量
         self.block_manager.allocate(seq_group)
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             seq.status = SequenceStatus.RUNNING

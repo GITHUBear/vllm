@@ -1118,6 +1118,9 @@ class SequenceGroupMetadata(
     # seq_id -> sparse_blk_id
     sparse_index_table: dict[int, int] = None
 
+    pooling_token_delta: int = 0
+    doc_ranges: Optional[list[tuple]] = None
+
     def __post_init__(self):
         if self.seq_data is not None and self.token_chunk_size is None:
             if self.is_prompt:

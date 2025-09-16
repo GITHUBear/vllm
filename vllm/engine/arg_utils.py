@@ -420,6 +420,9 @@ class EngineArgs:
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str = LoadConfig.pt_load_map_location
 
+    enable_pooling: bool = CacheConfig.enable_pooling
+    pooling_blk_size: Optional[int] = CacheConfig.pooling_blk_size
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -657,6 +660,10 @@ class EngineArgs:
                                  **cache_kwargs["cpu_offload_gb"])
         cache_group.add_argument("--calculate-kv-scales",
                                  **cache_kwargs["calculate_kv_scales"])
+        cache_group.add_argument("--enable-pooling",
+                                 **cache_kwargs["enable_pooling"])
+        cache_group.add_argument("--pooling-blk-size",
+                                 **cache_kwargs["pooling_blk_size"])
 
         # Tokenizer arguments
         tokenizer_kwargs = get_kwargs(TokenizerPoolConfig)
@@ -1030,6 +1037,8 @@ class EngineArgs:
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             cpu_offload_gb=self.cpu_offload_gb,
             calculate_kv_scales=self.calculate_kv_scales,
+            enable_pooling=self.enable_pooling,
+            pooling_blk_size=self.pooling_blk_size,
         )
 
         # Get the current placement group if Ray is initialized and

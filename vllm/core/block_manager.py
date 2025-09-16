@@ -66,6 +66,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         watermark: float = 0.01,
         sliding_window: Optional[int] = None,
         enable_caching: bool = False,
+        enable_pooling: bool = False,
+        pooling_blk_size: Optional[int] = None,
     ) -> None:
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
@@ -88,6 +90,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         assert watermark >= 0.0
 
         self.enable_caching = enable_caching
+
+        self.enable_pooling = enable_pooling
+        self.pooling_blk_size = pooling_blk_size
 
         self.watermark_blocks = int(watermark * num_gpu_blocks)
 
@@ -150,6 +155,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             block_size=self.block_size,
             block_allocator=self.block_allocator,
             max_block_sliding_window=self.max_block_sliding_window,
+            enable_pooling=self.enable_pooling,
+            pooling_blk_size=self.pooling_blk_size,
         )
         if seq.get_token_ids():
             # NOTE: If there are any factors affecting the block besides

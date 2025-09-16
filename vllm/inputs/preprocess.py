@@ -336,6 +336,7 @@ class InputPreprocessor:
     ) -> Union[TokenInputs, MultiModalInputs]:
         prompt_token_ids = parsed_content["prompt_token_ids"]
         token_type_ids = parsed_content.get("token_type_ids")
+        doc_ranges = parsed_content["doc_ranges"]
 
         inputs: Union[TokenInputs, MultiModalInputs]
         if multi_modal_data := parsed_content.get("multi_modal_data"):
@@ -350,6 +351,7 @@ class InputPreprocessor:
             inputs = token_inputs(
                 prompt_token_ids=prompt_token_ids,
                 token_type_ids=token_type_ids,
+                doc_ranges=doc_ranges,
             )
 
         if cache_salt := parsed_content.get("cache_salt"):

@@ -46,6 +46,8 @@ class BlockTable:
         block_allocator: DeviceAwareBlockAllocator,
         _blocks: Optional[List[Block]] = None,
         max_block_sliding_window: Optional[int] = None,
+        enable_pooling: bool = False,
+        pooling_blk_size: Optional[int] = None
     ):
         self._block_size = block_size
         self._allocator = block_allocator
@@ -55,6 +57,8 @@ class BlockTable:
 
         self._max_block_sliding_window = max_block_sliding_window
         self._num_full_slots = self._get_num_token_ids()
+        self._enable_pooling = enable_pooling
+        self._pooling_blk_size = pooling_blk_size
 
     @staticmethod
     def get_num_required_blocks(token_ids: List[int],
@@ -278,6 +282,17 @@ class BlockTable:
         # ones after the appended ones.
         return sequence_token_ids[self.num_full_slots:]
 
+    def _calc_pooling_token_ids(
+        self,
+        token_ids: List[int],
+    ):
+        if not self._enable_pooling:
+            return token_ids
+        pooling_token_ids = []
+        for i in range(0, len(token_ids), self._pooling_blk_size):
+            pooling_token_ids.append(token_ids[i])
+        return pooling_token_ids
+
     def _allocate_blocks_for_token_ids(
             self,
             prev_block: Optional[Block],
@@ -288,7 +303,9 @@ class BlockTable:
 
         block_token_ids = []
         tail_token_ids = []
-        for cur_token_ids in chunk_list(token_ids, self._block_size):
+
+        pooling_token_ids = self._calc_pooling_token_ids(token_ids)
+        for cur_token_ids in chunk_list(pooling_token_ids, self._block_size):
             if len(cur_token_ids) == self._block_size:
                 block_token_ids.append(cur_token_ids)
             else:

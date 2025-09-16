@@ -107,6 +107,7 @@ AnyResponse = Union[
 class TextTokensPrompt(TypedDict):
     prompt: str
     prompt_token_ids: list[int]
+    doc_ranges: Optional[list[tuple]] = None
 
 
 class EmbedsPrompt(TypedDict):
@@ -477,6 +478,10 @@ class OpenAIServing:
                     "do_lower_case", False)):
             prompt = prompt.lower()
 
+        doc_sep = "<|DOC_SEP|>"
+        tokenizer.add_tokens([doc_sep])
+        doc_sep_id = tokenizer.convert_tokens_to_ids(doc_sep)
+
         if truncate_prompt_tokens is None:
             encoded = tokenizer(prompt, add_special_tokens=add_special_tokens)
         elif truncate_prompt_tokens < 0:
@@ -492,10 +497,22 @@ class OpenAIServing:
                                 max_length=truncate_prompt_tokens)
 
         input_ids = encoded.input_ids
-
+        new_input_ids = []
+        doc_ranges = []
+        doc_start_idx = -1
+        for token_id in input_ids:
+            if token_id == doc_sep_id:
+                if doc_start_idx != -1:
+                    doc_ranges.append((doc_start_idx, len(new_input_ids)))
+                doc_start_idx = len(new_input_ids)
+            else:
+                new_input_ids.append(token_id)
+        logger.info(f"========== DOC OFFSETS: {doc_ranges} ============")
+        if len(doc_ranges) == 0:
+            doc_ranges = None
         input_text = prompt
 
-        return self._validate_input(request, input_ids, input_text)
+        return self._validate_input(request, new_input_ids, input_text, doc_ranges=doc_ranges)
 
     def _normalize_prompt_tokens_to_input(
         self,
@@ -520,6 +537,7 @@ class OpenAIServing:
         request: AnyRequest,
         input_ids: list[int],
         input_text: str,
+        doc_ranges: Optional[list[tuple]] = None,
     ) -> TextTokensPrompt:
         token_num = len(input_ids)
 
@@ -540,14 +558,16 @@ class OpenAIServing:
                     f"{token_num} tokens in the input for {operation}. "
                     f"Please reduce the length of the input.")
             return TextTokensPrompt(prompt=input_text,
-                                    prompt_token_ids=input_ids)
+                                    prompt_token_ids=input_ids,
+                                    doc_ranges=doc_ranges)
 
         # Note: TokenizeRequest and DetokenizeRequest doesn't have max_tokens
         # and does not require model context length validation
         if isinstance(request, (TokenizeCompletionRequest, TokenizeChatRequest,
                                 DetokenizeRequest)):
             return TextTokensPrompt(prompt=input_text,
-                                    prompt_token_ids=input_ids)
+                                    prompt_token_ids=input_ids,
+                                    doc_ranges=doc_ranges)
 
         # chat completion endpoint supports max_completion_tokens
         if isinstance(request, ChatCompletionRequest):
@@ -571,7 +591,9 @@ class OpenAIServing:
                 f"{max_tokens} in the completion). "
                 f"Please reduce the length of the messages or completion.")
 
-        return TextTokensPrompt(prompt=input_text, prompt_token_ids=input_ids)
+        return TextTokensPrompt(
+            prompt=input_text, prompt_token_ids=input_ids, doc_ranges=doc_ranges
+        )
 
     def _tokenize_prompt_input(
         self,
@@ -844,8 +866,10 @@ class OpenAIServing:
                 prompt=tokenizer.decode(request_prompt),
                 prompt_token_ids=request_prompt)
 
+        doc_ranges = None if ("doc_ranges" not in prompt_inputs) else prompt_inputs["doc_ranges"]
         engine_prompt = EngineTokensPrompt(
-            prompt_token_ids=prompt_inputs["prompt_token_ids"])
+            prompt_token_ids=prompt_inputs["prompt_token_ids"],
+            doc_ranges=doc_ranges)
         if mm_data is not None:
             engine_prompt["multi_modal_data"] = mm_data
         if request.mm_processor_kwargs is not None:
