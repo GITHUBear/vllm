@@ -158,6 +158,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             enable_pooling=self.enable_pooling,
             pooling_blk_size=self.pooling_blk_size,
         )
+        doc_ranges = seq.inputs.get("doc_ranges", None)
         if seq.get_token_ids():
             # NOTE: If there are any factors affecting the block besides
             # token_ids, they should be added as input to extra_hash.
@@ -165,7 +166,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
             # Add blocks to the block table only if the sequence is non empty.
             block_table.allocate(token_ids=seq.get_token_ids(),
-                                 extra_hash=extra_hash)
+                                 extra_hash=extra_hash,
+                                 doc_ranges=doc_ranges)
 
         return block_table
 

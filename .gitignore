@@ -238,3 +238,5 @@ topk_dump/*
 qkv_sim/*
 prefill_qkv_dump/*
 *.hdf5
+
+cacheblend/*.json

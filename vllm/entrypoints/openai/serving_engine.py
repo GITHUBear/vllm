@@ -499,14 +499,24 @@ class OpenAIServing:
         input_ids = encoded.input_ids
         new_input_ids = []
         doc_ranges = []
-        doc_start_idx = -1
+        tmp_doc_ranges = []
+        # doc_start_idx = -1
+        # for token_id in input_ids:
+        #     if token_id == doc_sep_id:
+        #         if doc_start_idx != -1:
+        #             doc_ranges.append((doc_start_idx, len(new_input_ids)))
+        #         doc_start_idx = len(new_input_ids)
+        #     else:
+        #         new_input_ids.append(token_id)
         for token_id in input_ids:
             if token_id == doc_sep_id:
-                if doc_start_idx != -1:
-                    doc_ranges.append((doc_start_idx, len(new_input_ids)))
-                doc_start_idx = len(new_input_ids)
+                tmp_doc_ranges.append(len(new_input_ids))
             else:
                 new_input_ids.append(token_id)
+        assert len(tmp_doc_ranges) % 2 == 0
+        for i in range(0, len(tmp_doc_ranges), 2):
+            doc_ranges.append((tmp_doc_ranges[i], tmp_doc_ranges[i + 1]))
+
         logger.info(f"========== DOC OFFSETS: {doc_ranges} ============")
         if len(doc_ranges) == 0:
             doc_ranges = None
@@ -752,7 +762,8 @@ class OpenAIServing:
 
         engine_prompts_text = [
             EngineTokensPrompt(
-                prompt_token_ids=request_prompt_text["prompt_token_ids"])
+                prompt_token_ids=request_prompt_text["prompt_token_ids"],
+                doc_ranges=None if ("doc_ranges" not in request_prompt_text) else request_prompt_text["doc_ranges"])
             for request_prompt_text in request_prompts_text
         ]
 

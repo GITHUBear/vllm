@@ -135,6 +135,8 @@ class Attention(nn.Module):
                              alibi_slopes, sliding_window, kv_cache_dtype,
                              blocksparse_params, logits_soft_cap, attn_type,
                              enable_pooling=cache_config.enable_pooling,
+                             enable_blend_prepare=cache_config.enable_blend_prepare,
+                             enable_cache_blend=cache_config.enable_cache_blend,
                              pooling_blk_size=cache_config.pooling_blk_size,
                              **extra_impl_args)
         self.backend = backend_name_to_enum(attn_backend.get_name())

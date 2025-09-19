@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 from vllm import _custom_ops as ops
 # yapf conflicts with isort for this block
@@ -17,6 +18,7 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadataBuilder,
                                               AttentionType,
                                               is_quantized_kv_cache)
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 # yapf: enable
 from vllm.attention.backends.utils import (
     PAD_SLOT_ID, CommonAttentionState, compute_slot_mapping,
@@ -221,6 +223,10 @@ class FlashAttentionMetadata(AttentionMetadata):
 
     update_meta_block_id_tensor: Optional[torch.Tensor] = None
     seq_len_after_pooling_for_decode_tensor: Optional[torch.Tensor] = None
+    doc_token_ranges: List[Optional[List[tuple]]] = None
+    docs_hash: List[Optional[list]] = None
+    kvcache_path: List[Optional[list]] = None
+    cached_offset: List[Optional[list]] = None
 
     @property
     def is_all_encoder_attn_metadata_set(self):
@@ -295,7 +301,11 @@ class FlashAttentionMetadata(AttentionMetadata):
             encoder_seq_start_loc=self.encoder_seq_start_loc,
             max_encoder_seq_len=self.max_encoder_seq_len,
             cross_slot_mapping=self.cross_slot_mapping,
-            cross_block_tables=self.cross_block_tables)
+            cross_block_tables=self.cross_block_tables,
+            doc_token_ranges=self.doc_token_ranges,
+            docs_hash=self.docs_hash,
+            kvcache_path=self.kvcache_path,
+            cached_offset=self.cached_offset,)
         return self._cached_prefill_metadata
 
     @property
@@ -474,6 +484,10 @@ class FlashAttentionMetadataBuilder(
         self.num_compressed_pages: List[int] = []   # 用于构建 num_compressed_pages_tensor & num_full_blocks_tensor
         # 对于 decode 请求，每个请求被压缩之后的实际 seqlen
         self.actual_curr_seq_lens: List[int] = []   # 用于计算 actual_max_num_blocks_per_seq
+        self.doc_token_ranges: List[List[tuple]] = []
+        self.docs_hash: List[list] = []
+        self.kvcache_path: List[list] = []
+        self.cached_offset: List[list] = []
 
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
@@ -488,6 +502,10 @@ class FlashAttentionMetadataBuilder(
         is_sparse_index = inter_data.is_sparse_index
         is_recitify = inter_data.is_recitify
         pooling_token_delta = inter_data.pooling_token_delta
+        doc_ranges = inter_data.doc_ranges
+        docs_hash = inter_data.docs_hash
+        kvcache_path = inter_data.kvcache_path
+        cached_offset = inter_data.cached_offset
         assert (not is_sparse_index_recompute) or (not is_recitify)
         
         block_tables = inter_data.block_tables
@@ -574,6 +592,11 @@ class FlashAttentionMetadataBuilder(
             self.block_tables.append(block_table)
             # if sparse_index_block and len(sparse_index_block) > 0:
             #     self.sparse_index_blocks.append(sparse_index_block_id)
+
+            self.doc_token_ranges.append(doc_ranges)
+            self.docs_hash.append(docs_hash)
+            self.kvcache_path.append(kvcache_path)
+            self.cached_offset.append(cached_offset)
 
             # Compute slot mapping.
             is_profile_run = is_block_tables_empty(block_tables)
@@ -758,6 +781,10 @@ class FlashAttentionMetadataBuilder(
             page_compress_topk=self.page_compress_topk,
             update_meta_block_id_tensor=update_meta_block_id_tensor,
             seq_len_after_pooling_for_decode_tensor=seq_len_after_pooling_for_decode_tensor,
+            doc_token_ranges=self.doc_token_ranges,
+            docs_hash=self.docs_hash,
+            kvcache_path=self.kvcache_path,
+            cached_offset=self.cached_offset,
         )
 
 class SparsePrefillType(IntEnum):
@@ -893,6 +920,8 @@ class FlashAttentionImpl(AttentionImpl):
         use_irope: bool = False,
         layer_idx: int = -1,
         enable_pooling: bool = False,
+        enable_blend_prepare: bool = False,
+        enable_cache_blend: bool = False,
         pooling_blk_size: Optional[int] = None,
         dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
         enable_attn_out_dump: bool = False,
@@ -942,6 +971,8 @@ class FlashAttentionImpl(AttentionImpl):
 
         self.layer_idx = layer_idx
         self.enable_pooling = enable_pooling
+        self.enable_blend_prepare = enable_blend_prepare
+        self.enable_cache_blend = enable_cache_blend
         self.pooling_blk_size = pooling_blk_size
         self.enable_attn_out_dump = enable_attn_out_dump
         self.enable_last_attn_map_dump = enable_last_attn_map_dump
@@ -994,6 +1025,34 @@ class FlashAttentionImpl(AttentionImpl):
                             >= self.arange[None, None, :])
         self.int32_max = torch.iinfo(torch.int32).max
         self.int32_min = torch.iinfo(torch.int32).min
+
+        # 参数目前硬编码
+        # TODO[shk]: 传入参数
+        self.blend_rotary = RotaryEmbedding(
+            head_size=self.head_size,
+            rotary_dim=self.head_size,
+            max_position_embeddings=131072,
+            base=1000000.0,
+            is_neox_style=True,
+            dtype=torch.bfloat16,
+        )
+    
+    def apply_rotary(
+        self,
+        key:torch.Tensor,
+        offset
+    ):
+        if offset == 0:
+            return key
+        tensor_len = key.shape[0]
+        positions = torch.tensor([offset]*tensor_len, dtype=torch.int64, device=key.device)
+        key, _ = self.blend_rotary.forward_cuda(
+            positions=positions,
+            query=key,
+            key=None,
+        )
+        del positions
+        return key
 
     def forward(
         self,
@@ -1064,18 +1123,120 @@ class FlashAttentionImpl(AttentionImpl):
         key_after_pooling = []
         val_after_pooling = []
         if prefill_meta := attn_metadata.prefill_metadata:
-            if self.enable_pooling:
+            if self.enable_blend_prepare:
                 cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
+                doc_token_ranges = prefill_meta.doc_token_ranges
+                docs_hash = prefill_meta.docs_hash
+                kvcache_paths = prefill_meta.kvcache_path
+                assert (len(doc_token_ranges) + 1 == len(cu_seqlens_cpu) and
+                        len(docs_hash) + 1 == len(cu_seqlens_cpu) and
+                        len(kvcache_paths) + 1 == len(cu_seqlens_cpu))
+
                 for idx in range(0, len(cu_seqlens_cpu) - 1):
+                    cur_doc_ranges = doc_token_ranges[idx]
+                    doc_hash = docs_hash[idx]
+                    kvcache_path = kvcache_paths[idx]
+
                     start_idx = cu_seqlens_cpu[idx]
                     end_idx = cu_seqlens_cpu[idx:idx+2][-1]
                     seqlen = end_idx - start_idx
 
-                    cur_pooling_key = group_mean_vectorized(key[start_idx : end_idx], self.pooling_blk_size)
-                    cur_pooling_val = group_mean_vectorized(value[start_idx : end_idx], self.pooling_blk_size)
-                    
-                    key_after_pooling.append(cur_pooling_key)
-                    val_after_pooling.append(cur_pooling_val)
+                    if cur_doc_ranges is None:
+                        continue
+                        
+                    assert len(cur_doc_ranges) == len(doc_hash) and len(cur_doc_ranges) == len(kvcache_path)
+                    cur_key = key[start_idx : end_idx]
+                    cur_val = value[start_idx : end_idx]
+                    for doc_range, h, kvpath in zip(cur_doc_ranges, doc_hash, kvcache_path):
+                        if kvpath is None:
+                            continue
+                        tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                        ds, de = doc_range
+                        import h5py
+                        with h5py.File(tp_kvpath, 'a') as f:
+                            f.create_dataset(f'K_{h}_{self.layer_idx}', data=cur_key[ds:de].clone().detach().float().cpu().numpy())
+                            f.create_dataset(f'V_{h}_{self.layer_idx}', data=cur_val[ds:de].clone().detach().float().cpu().numpy())
+
+            if self.enable_cache_blend and self.layer_idx > 0:
+                cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
+                doc_token_ranges = prefill_meta.doc_token_ranges
+                docs_hash = prefill_meta.docs_hash
+                kvcache_paths = prefill_meta.kvcache_path
+                cached_offsets = prefill_meta.cached_offset
+                assert (len(doc_token_ranges) + 1 == len(cu_seqlens_cpu) and
+                        len(docs_hash) + 1 == len(cu_seqlens_cpu) and
+                        len(kvcache_paths) + 1 == len(cu_seqlens_cpu) and
+                        len(cached_offsets) + 1 == len(cu_seqlens_cpu))
+                
+                for idx in range(0, len(cu_seqlens_cpu) - 1):
+                    cur_doc_ranges = doc_token_ranges[idx]
+                    doc_hash = docs_hash[idx]
+                    kvcache_path = kvcache_paths[idx]
+                    cur_offset = cached_offsets[idx]
+
+                    start_idx = cu_seqlens_cpu[idx]
+                    end_idx = cu_seqlens_cpu[idx:idx+2][-1]
+                    seqlen = end_idx - start_idx
+
+                    if kvcache_path is None:
+                        continue
+
+                    assert (len(cur_doc_ranges) == len(doc_hash) and 
+                            len(cur_doc_ranges) == len(kvcache_path) and
+                            len(cur_doc_ranges) == len(cur_offset))
+                    import h5py
+                    for doc_range, h, kvpath, offset in zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset):
+                        if kvpath is None:
+                            continue
+                        tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                        ds, de = doc_range
+                        key_tag = f'K_{h}_{self.layer_idx}'
+                        value_tag = f'V_{h}_{self.layer_idx}'
+                        with h5py.File(tp_kvpath, 'a') as f:
+                            key_np = np.array(f[key_tag])
+                            cached_key = torch.from_numpy(key_np).to(device=key.device)
+                            val_np = np.array(f[value_tag])
+                            cached_val = torch.from_numpy(val_np).to(device=value.device)
+                        key[start_idx + ds : start_idx + de] = self.apply_rotary(
+                            cached_key, ds - offset
+                        )
+                        del cached_key
+                        value[start_idx + ds : start_idx + de] = cached_val
+                        del cached_val
+
+            if self.enable_pooling:
+                cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
+                doc_token_ranges = prefill_meta.doc_token_ranges
+                assert len(doc_token_ranges) + 1 == len(cu_seqlens_cpu)
+                for idx in range(0, len(cu_seqlens_cpu) - 1):
+                    cur_doc_ranges = doc_token_ranges[idx]
+                    start_idx = cu_seqlens_cpu[idx]
+                    end_idx = cu_seqlens_cpu[idx:idx+2][-1]
+                    seqlen = end_idx - start_idx
+                    if cur_doc_ranges is None:  
+                        cur_pooling_key = group_mean_vectorized(key[start_idx : end_idx], self.pooling_blk_size)
+                        cur_pooling_val = group_mean_vectorized(value[start_idx : end_idx], self.pooling_blk_size)
+                        
+                        key_after_pooling.append(cur_pooling_key)
+                        val_after_pooling.append(cur_pooling_val)
+                    else:
+                        cur_key = key[start_idx : end_idx]
+                        cur_val = value[start_idx : end_idx]
+                        if cur_doc_ranges[0][0] != 0:
+                            key_after_pooling.append(cur_key[:cur_doc_ranges[0][0]])
+                            val_after_pooling.append(cur_val[:cur_doc_ranges[0][0]])
+
+                        for (ds, de) in cur_doc_ranges:
+                            key_after_pooling.append(
+                                group_mean_vectorized(cur_key[ds:de], self.pooling_blk_size)
+                            )
+                            val_after_pooling.append(
+                                group_mean_vectorized(cur_val[ds:de], self.pooling_blk_size)
+                            )
+
+                        if cur_doc_ranges[-1][1] != seqlen:
+                            key_after_pooling.append(cur_key[cur_doc_ranges[-1][1]:])
+                            val_after_pooling.append(cur_val[cur_doc_ranges[-1][1]:])
             else:
                 key_after_pooling.append(key[:num_prefill_kv_tokens])
                 val_after_pooling.append(value[:num_prefill_kv_tokens])

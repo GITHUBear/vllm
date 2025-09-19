@@ -4,6 +4,12 @@ import enum
 import os
 import random
 import time
+import xxhash
+import re
+import h5py
+import json
+import numpy as np
+from pathlib import Path
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Iterable, List, Optional
@@ -31,6 +37,97 @@ ENABLE_ARTIFICIAL_PREEMPT = bool(
 ARTIFICIAL_PREEMPTION_PROB = 0.5
 ARTIFICIAL_PREEMPTION_MAX_CNT = 500
 
+class DocMetafileHandler:
+    def __init__(self, metafile_path, kvcache_dir):
+        self.metafile_path = metafile_path
+        self.kvcache_dir = kvcache_dir
+
+        self.cur_hdf5_id = 1
+        self.cur_cnter = 0
+        self.threshold = 20
+
+        dir_path = Path(self.kvcache_dir)
+        if not dir_path.exists() or not dir_path.is_dir():
+            raise ValueError(f"Directory not found or not a directory: {self.kvcache_dir}")
+
+        pattern = re.compile(r'^(\d+)_tp\d+\.hdf5$')
+        for item in dir_path.iterdir():
+            if item.is_file():
+                match = pattern.match(item.name)
+                if match:
+                    self.cur_hdf5_id = max(self.cur_hdf5_id, int(match.group(1)) + 1)
+    
+    def maybe_update_hdf5_id(self):
+        if self.cur_cnter > self.threshold:
+            self.cur_cnter = 0
+            self.cur_hdf5_id += 1
+
+    def add_item(self, f, doc_hash, doc_start_offset, token_ids):
+        path = self.kvcache_dir + f"/{self.cur_hdf5_id}"
+        metadata = {
+            "token_ids": token_ids,
+            "path": path,
+            "offset": doc_start_offset,
+        }
+        grp = f.create_group(doc_hash)
+        json_str = json.dumps(metadata, ensure_ascii=False)
+        grp.create_dataset('meta', data=np.bytes_(json_str))
+
+        self.cur_cnter += 1
+        return path, doc_hash
+
+    def save_doc_meta(self, doc_hash, doc_start_offset, token_ids):
+        self.maybe_update_hdf5_id()
+        with h5py.File(self.metafile_path, 'a') as f:
+            if doc_hash not in f:
+                return self.add_item(f, doc_hash, doc_start_offset, token_ids)
+            
+            meta = json.loads(f[doc_hash]['meta'][()].decode('utf-8'))
+            if meta['token_ids'] == token_ids:
+                return None, doc_hash
+            
+            overflow_id = 0
+            overflow_doc_hash = doc_hash + f"_overflow-{overflow_id}"
+            while True:
+                if overflow_doc_hash not in f:
+                    return self.add_item(f, overflow_doc_hash, doc_start_offset, token_ids)
+                
+                meta = json.loads(f[overflow_doc_hash]['meta'][()].decode('utf-8'))
+                if meta['token_ids'] == token_ids:
+                    return None, overflow_doc_hash
+                
+                overflow_id += 1
+                overflow_doc_hash = doc_hash + f"_overflow-{overflow_id}"
+
+    
+    def load_doc_meta(self, doc_hash, token_ids):
+        with h5py.File(self.metafile_path, 'r') as f:
+            if doc_hash not in f:
+                return None, None
+            
+            meta = json.loads(f[doc_hash]['meta'][()].decode('utf-8'))
+            if meta['token_ids'] == token_ids:
+                return {
+                    "path": meta['path'],
+                    "offset": meta['offset'],
+                }, doc_hash
+            
+            overflow_id = 0
+            overflow_doc_hash = doc_hash + f"_overflow-{overflow_id}"
+            while True:
+                if overflow_doc_hash not in f:
+                    return None, None
+                
+                meta = json.loads(f[overflow_doc_hash]['meta'][()].decode('utf-8'))
+                if meta['token_ids'] == token_ids:
+                    return {
+                        "path": meta['path'],
+                        "offset": meta['offset'],
+                    }, overflow_doc_hash
+                
+                overflow_id += 1
+                overflow_doc_hash = doc_hash + f"_overflow-{overflow_id}"
+    
 
 class PreemptionMode(enum.Enum):
     """Preemption modes.
@@ -482,6 +579,16 @@ class Scheduler:
                 kv_compress_num_sample_tokens,
                 self.cache_config.block_size,
                 block_sparse_enable_recitification
+            )
+
+        self.doc_metafile_handler: DocMetafileHandler = None
+        if self.cache_config.enable_blend_prepare or self.cache_config.enable_cache_blend:
+            metafile_path = os.getenv("VLLM_BLEND_METAFILE_PATH", None)
+            kvcache_dir = os.getenv("VLLM_BLEND_KVCACHE_DIR", None)
+            assert metafile_path is not None and kvcache_dir is not None
+            self.doc_metafile_handler = DocMetafileHandler(
+                metafile_path=metafile_path,
+                kvcache_dir=kvcache_dir,
             )
 
         # Sequence groups in the WAITING state.
@@ -1682,13 +1789,94 @@ class Scheduler:
             # prefill < decoding.
             if is_first_prefill or not self.scheduler_config.send_delta_data:
                 pooling_token_delta = 0
+                doc_ranges = None
+                docs_hash = None
+                kvcache_path = None
+                cached_offset = None
+                if self.cache_config.enable_blend_prepare and is_prompt:
+                    assert self.doc_metafile_handler is not None
+                    assert (not self.scheduler_config.chunked_prefill_enabled)
+                    seqs = seq_group.get_seqs()
+                    assert len(seqs) == 1
+                    doc_ranges = seqs[0].inputs["doc_ranges"]
+
+                    def list_to_xxhash(nums) -> str:
+                        ba = bytearray()
+                        for x in nums:
+                            ba.extend(x.to_bytes(4, 'little', signed=True))
+                        return str(xxhash.xxh64(ba).intdigest())
+
+                    prompt_token_ids = seqs[0].data._prompt_token_ids
+                    docs_hash = []
+                    kvcache_path = []
+                    for (ds, de) in doc_ranges:
+                        tmp_doc_hash = list_to_xxhash(prompt_token_ids[ds:de])
+                        path, actual_doc_hash = self.doc_metafile_handler.save_doc_meta(
+                            doc_hash=tmp_doc_hash,
+                            doc_start_offset=ds,
+                            token_ids=(prompt_token_ids[ds:de]).tolist(),
+                        )
+                        docs_hash.append(actual_doc_hash)
+                        kvcache_path.append(path)
+
+                if self.cache_config.enable_cache_blend and is_prompt:
+                    assert self.doc_metafile_handler is not None
+                    assert (not self.scheduler_config.chunked_prefill_enabled)
+                    seqs = seq_group.get_seqs()
+                    assert len(seqs) == 1
+                    if "doc_ranges" not in seqs[0].inputs:
+                        doc_ranges = None
+                    else:
+                        doc_ranges = seqs[0].inputs["doc_ranges"]
+
+                    def list_to_xxhash(nums) -> str:
+                        ba = bytearray()
+                        for x in nums:
+                            ba.extend(x.to_bytes(4, 'little', signed=True))
+                        return str(xxhash.xxh64(ba).intdigest())
+
+                    if doc_ranges is not None:
+                        prompt_token_ids = seqs[0].data._prompt_token_ids
+                        docs_hash = []
+                        kvcache_path = []
+                        cached_offset = []
+                        for (ds, de) in doc_ranges:
+                            doc_hash = list_to_xxhash(prompt_token_ids[ds:de])
+                            meta, actual_doc_hash = self.doc_metafile_handler.load_doc_meta(
+                                doc_hash,
+                                (prompt_token_ids[ds:de]).tolist(),
+                            )
+                            if meta is not None:
+                                assert actual_doc_hash is not None
+                                kvcache_path.append(meta['path'])
+                                cached_offset.append(meta['offset'])
+                                docs_hash.append(actual_doc_hash)
+                            else:
+                                kvcache_path.append(None)
+                                cached_offset.append(None)
+                                docs_hash.append(None)
+
                 if self.cache_config.enable_pooling:
                     assert (not self.scheduler_config.chunked_prefill_enabled)
                     seqs = seq_group.get_seqs()
                     assert len(seqs) == 1
                     prompt_len = seqs[0].data.get_prompt_len()
-                    pooling_token_len = (prompt_len + self.cache_config.pooling_blk_size - 1) // self.cache_config.pooling_blk_size
-                    pooling_token_delta = prompt_len - pooling_token_len
+
+                    doc_ranges = seqs[0].inputs["doc_ranges"]
+                    if doc_ranges is not None:
+                        pooling_token_delta = 0
+                        for (ds, de) in doc_ranges:
+                            doc_len = de - ds
+                            # if doc_len <= 20:
+                            #     continue
+                            # pooling_token_delta += (
+                            #     (doc_len - 20) - ((doc_len - 20 + self.cache_config.pooling_blk_size - 1) // self.cache_config.pooling_blk_size)
+                            # )
+                            pooling_token_delta += (doc_len - ((doc_len + self.cache_config.pooling_blk_size - 1) // self.cache_config.pooling_blk_size))
+                    else:
+                        pooling_token_len = (prompt_len + self.cache_config.pooling_blk_size - 1) // self.cache_config.pooling_blk_size
+                        pooling_token_delta = prompt_len - pooling_token_len
+
                 seq_group_metadata = SequenceGroupMetadata(
                     request_id=seq_group.request_id,
                     is_prompt=is_prompt,
@@ -1716,6 +1904,10 @@ class Scheduler:
                         if scheduler_outputs.num_prefill_groups > 0 else None),
                     prompt_adapter_request=seq_group.prompt_adapter_request,
                     pooling_token_delta=pooling_token_delta,
+                    doc_ranges=doc_ranges,
+                    docs_hash=docs_hash,
+                    kvcache_path=kvcache_path,
+                    cached_offset=cached_offset,
                 )
                 if self.sparse_index_block_manager is not None:
                     self.sparse_index_block_manager.build_seq_group_meta_sparse_index_table(

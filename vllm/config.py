@@ -1472,6 +1472,12 @@ class CacheConfig:
     pooling_blk_size: Optional[int] = None
     """Pooling block size."""
 
+    enable_blend_prepare: bool = False
+    """Enable cache blend preparation."""
+
+    enable_cache_blend: bool = False
+    """"Enable cache blend"""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

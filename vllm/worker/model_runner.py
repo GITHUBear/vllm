@@ -273,6 +273,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             num_computed_token_to_compress: int = -1,
             pooling_token_delta: int = 0,
             seq_len_after_pooling_for_decode: Optional[List[int]] = None,
+            doc_ranges: Optional[list[tuple]] = None,
+            docs_hash: Optional[list] = None,
+            kvcache_path: Optional[list] = None,
+            cached_offset: Optional[list] = None,
         ):
             if reinit:
                 assert len(self.seq_ids) == len(seq_ids)  # type: ignore
@@ -296,6 +300,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.encoder_seq_len = encoder_seq_len
 
             self.pooling_token_delta = pooling_token_delta
+            self.doc_ranges = doc_ranges
+            self.docs_hash = docs_hash
+            self.kvcache_path = kvcache_path
+            self.cached_offset = cached_offset
 
             if reinit:
                 if len(self.seq_ids) == 1 and reinit_use_defaults:
@@ -858,7 +866,11 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             is_recitify=is_recitify,
             sparse_index_block=seq_group_metadata.sparse_index_table,
             num_computed_token_to_compress=num_computed_token_to_compress,
-            pooling_token_delta=seq_group_metadata.pooling_token_delta)
+            pooling_token_delta=seq_group_metadata.pooling_token_delta,
+            doc_ranges=seq_group_metadata.doc_ranges,
+            docs_hash=seq_group_metadata.docs_hash,
+            kvcache_path=seq_group_metadata.kvcache_path,
+            cached_offset=seq_group_metadata.cached_offset,)
 
         self.inter_data_list.append(inter_data)
 

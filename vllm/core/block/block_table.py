@@ -87,7 +87,8 @@ class BlockTable:
     def allocate(self,
                  token_ids: List[int],
                  device: Device = Device.GPU,
-                 extra_hash: Optional[int] = None) -> None:
+                 extra_hash: Optional[int] = None,
+                 doc_ranges: Optional[list[tuple]] = None) -> None:
         """Allocates memory blocks for storing the given sequence of token IDs.
 
         This method allocates the required number of blocks to store the given
@@ -106,7 +107,8 @@ class BlockTable:
         blocks = self._allocate_blocks_for_token_ids(prev_block=None,
                                                      token_ids=token_ids,
                                                      device=device,
-                                                     extra_hash=extra_hash)
+                                                     extra_hash=extra_hash,
+                                                     doc_ranges=doc_ranges)
         self.update(blocks)
         self._num_full_slots = len(token_ids)
 
@@ -285,12 +287,22 @@ class BlockTable:
     def _calc_pooling_token_ids(
         self,
         token_ids: List[int],
+        doc_ranges: Optional[list[tuple]] = None
     ):
         if not self._enable_pooling:
             return token_ids
         pooling_token_ids = []
-        for i in range(0, len(token_ids), self._pooling_blk_size):
-            pooling_token_ids.append(token_ids[i])
+        if doc_ranges is None:
+            for i in range(0, len(token_ids), self._pooling_blk_size):
+                pooling_token_ids.append(token_ids[i])
+        else:
+            if doc_ranges[0][0] != 0:
+                pooling_token_ids.extend(token_ids[:doc_ranges[0][0]])
+            for (ds, de) in doc_ranges:
+                for i in range(ds, de, self._pooling_blk_size):
+                    pooling_token_ids.append(token_ids[i])
+            if doc_ranges[-1][1] != len(token_ids):
+                pooling_token_ids.extend(token_ids[doc_ranges[-1][1]:])
         return pooling_token_ids
 
     def _allocate_blocks_for_token_ids(
@@ -298,13 +310,14 @@ class BlockTable:
             prev_block: Optional[Block],
             token_ids: List[int],
             device: Device,
-            extra_hash: Optional[int] = None) -> List[Block]:
+            extra_hash: Optional[int] = None,
+            doc_ranges: Optional[list[tuple]] = None) -> List[Block]:
         blocks: List[Block] = []
 
         block_token_ids = []
         tail_token_ids = []
 
-        pooling_token_ids = self._calc_pooling_token_ids(token_ids)
+        pooling_token_ids = self._calc_pooling_token_ids(token_ids, doc_ranges=doc_ranges)
         for cur_token_ids in chunk_list(pooling_token_ids, self._block_size):
             if len(cur_token_ids) == self._block_size:
                 block_token_ids.append(cur_token_ids)

@@ -1,0 +1,1 @@
+VLLM_BLEND_METAFILE_PATH="/data/shanhaikang.shk/vllm/cacheblend/meta.hdf5" VLLM_BLEND_KVCACHE_DIR="/data/shanhaikang.shk/vllm/cacheblend" VLLM_ATTENTION_BACKEND="FLASH_ATTN" VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_USE_V1=0 vllm serve /data/shanhaikang.shk/modelscope/qwq32b --tensor-parallel-size 8 --no-enable-chunked-prefill --enforce-eager --enable-blend-prepare

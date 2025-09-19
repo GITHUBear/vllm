@@ -1120,6 +1120,9 @@ class SequenceGroupMetadata(
 
     pooling_token_delta: int = 0
     doc_ranges: Optional[list[tuple]] = None
+    docs_hash: Optional[list] = None
+    kvcache_path: Optional[list] = None
+    cached_offset: Optional[list] = None
 
     def __post_init__(self):
         if self.seq_data is not None and self.token_chunk_size is None:

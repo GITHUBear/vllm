@@ -423,6 +423,9 @@ class EngineArgs:
     enable_pooling: bool = CacheConfig.enable_pooling
     pooling_blk_size: Optional[int] = CacheConfig.pooling_blk_size
 
+    enable_blend_prepare: bool = CacheConfig.enable_blend_prepare
+    enable_cache_blend: bool = CacheConfig.enable_cache_blend
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -664,6 +667,10 @@ class EngineArgs:
                                  **cache_kwargs["enable_pooling"])
         cache_group.add_argument("--pooling-blk-size",
                                  **cache_kwargs["pooling_blk_size"])
+        cache_group.add_argument("--enable-blend-prepare",
+                                 **cache_kwargs["enable_blend_prepare"])
+        cache_group.add_argument("--enable-cache-blend",
+                                 **cache_kwargs["enable_cache_blend"])
 
         # Tokenizer arguments
         tokenizer_kwargs = get_kwargs(TokenizerPoolConfig)
@@ -1039,6 +1046,8 @@ class EngineArgs:
             calculate_kv_scales=self.calculate_kv_scales,
             enable_pooling=self.enable_pooling,
             pooling_blk_size=self.pooling_blk_size,
+            enable_blend_prepare=self.enable_blend_prepare,
+            enable_cache_blend=self.enable_cache_blend,
         )
 
         # Get the current placement group if Ray is initialized and
