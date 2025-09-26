@@ -185,6 +185,7 @@ class Attention(nn.Module):
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
         output_shape: Optional[torch.Size] = None,
+        residual_to_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -237,14 +238,16 @@ class Attention(nn.Module):
                                 block_count_gpu_cache=self.block_count_gpu_cache,
                                 block_index_gpu_cache=self.block_index_gpu_cache,
                                 column_count_gpu_cache=self.column_count_gpu_cache,
-                                column_index_gpu_cache=self.column_index_gpu_cache,)
+                                column_index_gpu_cache=self.column_index_gpu_cache,
+                                residual_to_cache=residual_to_cache,)
             else:
                 torch.ops.vllm.unified_attention_with_output(
                     query, key, value, output, self.layer_name,
                     block_count_gpu_cache=self.block_count_gpu_cache,
                     block_index_gpu_cache=self.block_index_gpu_cache,
                     column_count_gpu_cache=self.column_count_gpu_cache,
-                    column_index_gpu_cache=self.column_index_gpu_cache,)
+                    column_index_gpu_cache=self.column_index_gpu_cache,
+                    residual_to_cache=residual_to_cache,)
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:
@@ -260,14 +263,16 @@ class Attention(nn.Module):
                                     block_count_gpu_cache=self.block_count_gpu_cache,
                                     block_index_gpu_cache=self.block_index_gpu_cache,
                                     column_count_gpu_cache=self.column_count_gpu_cache,
-                                    column_index_gpu_cache=self.column_index_gpu_cache,)
+                                    column_index_gpu_cache=self.column_index_gpu_cache,
+                                    residual_to_cache=residual_to_cache,)
             else:
                 return torch.ops.vllm.unified_attention(
                     query, key, value, self.layer_name,
                     block_count_gpu_cache=self.block_count_gpu_cache,
                     block_index_gpu_cache=self.block_index_gpu_cache,
                     column_count_gpu_cache=self.column_count_gpu_cache,
-                    column_index_gpu_cache=self.column_index_gpu_cache,)
+                    column_index_gpu_cache=self.column_index_gpu_cache,
+                    residual_to_cache=residual_to_cache,)
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
@@ -409,7 +414,8 @@ def unified_attention(
     block_count_gpu_cache: Optional[torch.Tensor] = None,
     block_index_gpu_cache: Optional[torch.Tensor] = None,
     column_count_gpu_cache: Optional[torch.Tensor] = None,
-    column_index_gpu_cache: Optional[torch.Tensor] = None
+    column_index_gpu_cache: Optional[torch.Tensor] = None,
+    residual_to_cache: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     wait_for_kv_layer_from_connector(layer_name)
 
@@ -426,7 +432,8 @@ def unified_attention(
                                block_count_gpu_cache=block_count_gpu_cache,
                                block_index_gpu_cache=block_index_gpu_cache,
                                column_count_gpu_cache=column_count_gpu_cache,
-                               column_index_gpu_cache=column_index_gpu_cache,)
+                               column_index_gpu_cache=column_index_gpu_cache,
+                               residual_to_cache=residual_to_cache,)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
     return output
@@ -458,7 +465,8 @@ def unified_attention_with_output(
     block_count_gpu_cache: Optional[torch.Tensor] = None,
     block_index_gpu_cache: Optional[torch.Tensor] = None,
     column_count_gpu_cache: Optional[torch.Tensor] = None,
-    column_index_gpu_cache: Optional[torch.Tensor] = None
+    column_index_gpu_cache: Optional[torch.Tensor] = None,
+    residual_to_cache: Optional[torch.Tensor] = None,
 ) -> None:
     wait_for_kv_layer_from_connector(layer_name)
     forward_context: ForwardContext = get_forward_context()
@@ -479,7 +487,8 @@ def unified_attention_with_output(
                       block_count_gpu_cache=block_count_gpu_cache,
                       block_index_gpu_cache=block_index_gpu_cache,
                       column_count_gpu_cache=column_count_gpu_cache,
-                      column_index_gpu_cache=column_index_gpu_cache,)
+                      column_index_gpu_cache=column_index_gpu_cache,
+                      residual_to_cache=residual_to_cache,)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 

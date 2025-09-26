@@ -25,7 +25,7 @@
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 import os
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, Tuple
 
 import torch
 from torch import nn
@@ -114,6 +114,7 @@ class Qwen2Attention(nn.Module):
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
+        num_layers: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -183,6 +184,7 @@ class Qwen2Attention(nn.Module):
             dca_recover_rate = float(dca_recover_rate)
         extra_args = {
             "layer_idx": extract_layer_index(prefix),
+            "num_layers": num_layers,
         }
         if dual_chunk_attention_config:
             extra_args = {
@@ -213,11 +215,12 @@ class Qwen2Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        residual_to_cache: Optional[torch.Tensor],
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+        attn_output = self.attn(q, k, v, residual_to_cache=residual_to_cache)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -263,6 +266,7 @@ class Qwen2DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
             dual_chunk_attention_config=dual_chunk_attention_config,
+            num_layers=config.num_hidden_layers,
         )
         self.mlp = Qwen2MLP(
             hidden_size=self.hidden_size,
@@ -292,6 +296,7 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            residual_to_cache=residual,
         )
 
         # Fully Connected

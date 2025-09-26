@@ -227,6 +227,7 @@ class FlashAttentionMetadata(AttentionMetadata):
     docs_hash: List[Optional[list]] = None
     kvcache_path: List[Optional[list]] = None
     cached_offset: List[Optional[list]] = None
+    cache_blend_static_index_cache: Optional[List] = None
 
     @property
     def is_all_encoder_attn_metadata_set(self):
@@ -305,7 +306,8 @@ class FlashAttentionMetadata(AttentionMetadata):
             doc_token_ranges=self.doc_token_ranges,
             docs_hash=self.docs_hash,
             kvcache_path=self.kvcache_path,
-            cached_offset=self.cached_offset,)
+            cached_offset=self.cached_offset,
+            cache_blend_static_index_cache=self.cache_blend_static_index_cache)
         return self._cached_prefill_metadata
 
     @property
@@ -785,7 +787,54 @@ class FlashAttentionMetadataBuilder(
             docs_hash=self.docs_hash,
             kvcache_path=self.kvcache_path,
             cached_offset=self.cached_offset,
+            cache_blend_static_index_cache=None,
         )
+
+class BlendType(IntEnum):
+    NAIVE = 0
+    CACHE_BLEND_STATIC_INDEX = 1
+    CACHE_BLEND_DYNAMIC_INDEX = 2
+    CHANNEL_AWARE = 3
+    ATTN_AWARE = 4
+    CACHE_BLEND_ORIGIN = 5
+    RECOMPUTE_LAST_LAYER = 6
+
+@dataclass
+class CacheBlendConfig:
+    recomp_ratio:float = 0.18
+    recomp_layer:int = 1
+    val_diff_only:bool = False
+    key_diff_only:bool = False
+    query_diff_only:bool = False
+
+@dataclass
+class CacheBlendDynamicConfig:
+    recomp_ratio:float = 0.18
+    recomp_layer:int = 1
+    val_diff_only:bool = False
+    key_diff_only:bool = False
+    query_diff_only:bool = False
+
+    recomp_stride:int = 4
+
+@dataclass
+class ChannelAwareConfig:
+    pivot_stride:int = 8
+    sample_layer:int = 2
+
+@dataclass
+class AttnAwareConfig:
+    topk_ratio:float = 0.18
+    num_full_layer:int = 1
+
+@dataclass
+class CacheBlendOriginConfig:
+    recomp_ratio:float = 0.18
+    recomp_layer:int = 1
+
+@dataclass
+class RecomputeLastLayerConfig:
+    recompute_layer: int = -1
 
 class SparsePrefillType(IntEnum):
     FULL_ATTN = 0
@@ -866,7 +915,6 @@ def group_mean_vectorized(tensor, BLK):
     else:
         remaining_mean = None
 
-    # 合并结果
     if full_means is not None and remaining_mean is not None:
         result = torch.cat([full_means, remaining_mean], dim=0)
     elif full_means is not None:
@@ -878,6 +926,27 @@ def group_mean_vectorized(tensor, BLK):
 
     return result
 
+def get_attn_score_unrecompte_idx(
+    Q, K, # N * h * d -> h * N * d
+          # N * h * d -> h * d * N
+    group_size,
+    softmax_scale,
+    num_key_head,
+    head_dim,
+    topk_ratio,
+):
+    key_expand = K.unsqueeze(2).repeat(1, 1, group_size, 1).reshape(-1, num_key_head * group_size, head_dim)
+    S = (Q.transpose(0, 1) * softmax_scale) @ key_expand.permute(1, 2, 0)
+    del key_expand
+    P = F.softmax(S, dim=-1, dtype=torch.float32)
+    del S
+    score_sum_head_mean = P.sum(dim=-2).mean(dim=0)
+    del P
+    num_key = score_sum_head_mean.shape[0]
+    num_unrecomputed = num_key - int(topk_ratio * num_key)
+    unrecompute_idx = torch.topk(score_sum_head_mean, k=num_unrecomputed, largest=False).indices
+    del score_sum_head_mean
+    return unrecompute_idx
 
 class FlashAttentionImpl(AttentionImpl):
     """
@@ -927,6 +996,7 @@ class FlashAttentionImpl(AttentionImpl):
         enable_attn_out_dump: bool = False,
         enable_last_attn_map_dump: bool = False,
         dump_last_query_len: int = 64,
+        num_layers: Optional[int] = None,
     ) -> None:
         if blocksparse_params is not None:
             raise ValueError(
@@ -1026,12 +1096,30 @@ class FlashAttentionImpl(AttentionImpl):
         self.int32_max = torch.iinfo(torch.int32).max
         self.int32_min = torch.iinfo(torch.int32).min
 
+        self.num_layers = num_layers
+        self.blend_prepare_for_last_layer_recompute = os.getenv("VLLM_FA_BLEND_PREPARE_FOR_LAST_LAYER", None) is not None
+        self.blend_type = BlendType(int(os.getenv("VLLM_FA_BLEND_TYPE", 0)))
+        self.blend_config = None
+        if self.blend_type == BlendType.CACHE_BLEND_STATIC_INDEX:
+            self.blend_config = CacheBlendConfig(key_diff_only=True, recomp_layer=16)
+        if self.blend_type == BlendType.CACHE_BLEND_DYNAMIC_INDEX:
+            self.blend_config = CacheBlendDynamicConfig(recomp_stride=4)
+        if self.blend_type == BlendType.CHANNEL_AWARE:
+            self.blend_config = ChannelAwareConfig()
+        if self.blend_type == BlendType.ATTN_AWARE:
+            self.blend_config = AttnAwareConfig()
+        if self.blend_type == BlendType.CACHE_BLEND_ORIGIN:
+            self.blend_config = CacheBlendOriginConfig()
+        if self.blend_type == BlendType.RECOMPUTE_LAST_LAYER:
+            assert self.num_layers is not None
+            self.blend_config = RecomputeLastLayerConfig(recompute_layer=self.num_layers - 2)
+
         # 参数目前硬编码
         # TODO[shk]: 传入参数
         self.blend_rotary = RotaryEmbedding(
             head_size=self.head_size,
             rotary_dim=self.head_size,
-            max_position_embeddings=131072,
+            max_position_embeddings=32768,
             base=1000000.0,
             is_neox_style=True,
             dtype=torch.bfloat16,
@@ -1067,7 +1155,8 @@ class FlashAttentionImpl(AttentionImpl):
         block_count_gpu_cache: Optional[torch.Tensor] = None,
         block_index_gpu_cache: Optional[torch.Tensor] = None,
         column_count_gpu_cache: Optional[torch.Tensor] = None,
-        column_index_gpu_cache: Optional[torch.Tensor] = None
+        column_index_gpu_cache: Optional[torch.Tensor] = None,
+        residual_to_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 
@@ -1145,19 +1234,42 @@ class FlashAttentionImpl(AttentionImpl):
                         continue
                         
                     assert len(cur_doc_ranges) == len(doc_hash) and len(cur_doc_ranges) == len(kvcache_path)
-                    cur_key = key[start_idx : end_idx]
-                    cur_val = value[start_idx : end_idx]
-                    for doc_range, h, kvpath in zip(cur_doc_ranges, doc_hash, kvcache_path):
-                        if kvpath is None:
-                            continue
-                        tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
-                        ds, de = doc_range
-                        import h5py
-                        with h5py.File(tp_kvpath, 'a') as f:
-                            f.create_dataset(f'K_{h}_{self.layer_idx}', data=cur_key[ds:de].clone().detach().float().cpu().numpy())
-                            f.create_dataset(f'V_{h}_{self.layer_idx}', data=cur_val[ds:de].clone().detach().float().cpu().numpy())
+                    if self.blend_prepare_for_last_layer_recompute:
+                        assert residual_to_cache is not None
+                        assert self.num_layers is not None
+                        cur_key = key[start_idx : end_idx]
+                        cur_val = value[start_idx : end_idx]
+                        if self.layer_idx == self.num_layers - 2:
+                            cur_q = query[start_idx : end_idx]
+                            cur_res = residual_to_cache[start_idx : end_idx]
+                        for doc_range, h, kvpath in zip(cur_doc_ranges, doc_hash, kvcache_path):
+                            if kvpath is None:
+                                continue
+                            tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                            ds, de = doc_range
+                            import h5py
+                            with h5py.File(tp_kvpath, 'a') as f:
+                                f.create_dataset(f'K_{h}_{self.layer_idx}', data=cur_key[ds:de].clone().detach().float().cpu().numpy())
+                                f.create_dataset(f'V_{h}_{self.layer_idx}', data=cur_val[ds:de].clone().detach().float().cpu().numpy())
+                                if self.layer_idx == self.num_layers - 2:
+                                    f.create_dataset(f'Q_{h}_{self.layer_idx}', data=cur_q[ds:de].clone().detach().float().cpu().numpy())
+                                    f.create_dataset(f'R_{h}_{self.layer_idx}', data=cur_res[ds:de].clone().detach().float().cpu().numpy())
+                    else:
+                        cur_key = key[start_idx : end_idx]
+                        cur_val = value[start_idx : end_idx]
+                        cur_q = query[start_idx : end_idx]
+                        for doc_range, h, kvpath in zip(cur_doc_ranges, doc_hash, kvcache_path):
+                            if kvpath is None:
+                                continue
+                            tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                            ds, de = doc_range
+                            import h5py
+                            with h5py.File(tp_kvpath, 'a') as f:
+                                f.create_dataset(f'K_{h}_{self.layer_idx}', data=cur_key[ds:de].clone().detach().float().cpu().numpy())
+                                f.create_dataset(f'V_{h}_{self.layer_idx}', data=cur_val[ds:de].clone().detach().float().cpu().numpy())
+                                f.create_dataset(f'Q_{h}_{self.layer_idx}', data=cur_q[ds:de].clone().detach().float().cpu().numpy())
 
-            if self.enable_cache_blend and self.layer_idx > 0:
+            if self.enable_cache_blend and self.blend_type == BlendType.NAIVE and self.layer_idx > 0:
                 cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
                 doc_token_ranges = prefill_meta.doc_token_ranges
                 docs_hash = prefill_meta.docs_hash
@@ -1194,15 +1306,589 @@ class FlashAttentionImpl(AttentionImpl):
                         value_tag = f'V_{h}_{self.layer_idx}'
                         with h5py.File(tp_kvpath, 'a') as f:
                             key_np = np.array(f[key_tag])
-                            cached_key = torch.from_numpy(key_np).to(device=key.device)
+                            cached_key = torch.from_numpy(key_np).to(device=key.device, dtype=key.dtype)
                             val_np = np.array(f[value_tag])
-                            cached_val = torch.from_numpy(val_np).to(device=value.device)
+                            cached_val = torch.from_numpy(val_np).to(device=value.device, dtype=value.dtype)
                         key[start_idx + ds : start_idx + de] = self.apply_rotary(
                             cached_key, ds - offset
                         )
                         del cached_key
                         value[start_idx + ds : start_idx + de] = cached_val
                         del cached_val
+            
+            if (self.enable_cache_blend and self.blend_type == BlendType.CACHE_BLEND_STATIC_INDEX and
+                self.layer_idx >= self.blend_config.recomp_layer):
+                cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
+                doc_token_ranges = prefill_meta.doc_token_ranges
+                docs_hash = prefill_meta.docs_hash
+                kvcache_paths = prefill_meta.kvcache_path
+                cached_offsets = prefill_meta.cached_offset
+                cache_blend_indice_for_batches = None
+
+                if self.layer_idx == self.blend_config.recomp_layer:
+                    assert prefill_meta.cache_blend_static_index_cache is None
+                elif self.layer_idx > self.blend_config.recomp_layer:
+                    assert prefill_meta.cache_blend_static_index_cache is not None
+                    cache_blend_indice_for_batches = prefill_meta.cache_blend_static_index_cache
+                
+                recomp_index_for_batches = []
+                for idx in range(0, len(cu_seqlens_cpu) - 1):
+                    cur_doc_ranges = doc_token_ranges[idx]
+                    doc_hash = docs_hash[idx]
+                    kvcache_path = kvcache_paths[idx]
+                    cur_offset = cached_offsets[idx]
+                    cur_cache_blend_indice = None
+                    if self.layer_idx > self.blend_config.recomp_layer:
+                        cur_cache_blend_indice = cache_blend_indice_for_batches[idx]
+
+                    start_idx = cu_seqlens_cpu[idx]
+                    end_idx = cu_seqlens_cpu[idx:idx+2][-1]
+                    seqlen = end_idx - start_idx
+
+                    if kvcache_path is None:
+                        if self.layer_idx == self.blend_config.recomp_layer:
+                            recomp_index_for_batches.append(None)
+                        continue
+                    
+                    import h5py
+                    recomp_index_per_batch = []
+                    for doc_id,(doc_range, h, kvpath, offset) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset)):
+                        if kvpath is None:
+                            if self.layer_idx == self.blend_config.recomp_layer:
+                                recomp_index_per_batch.append(None)
+                            continue
+                        tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                        ds, de = doc_range
+                        key_tag = f'K_{h}_{self.layer_idx}'
+                        value_tag = f'V_{h}_{self.layer_idx}'
+                        # q_tag = f'Q_{h}_{self.layer_idx}'
+                        with h5py.File(tp_kvpath, 'a') as f:
+                            key_np = np.array(f[key_tag])
+                            cached_key = self.apply_rotary(
+                                torch.from_numpy(key_np).to(device=key.device, dtype=key.dtype),
+                                ds - offset
+                            )
+                            # q_np = np.array(f[q_tag])
+                            # cached_q = self.apply_rotary(
+                            #     torch.from_numpy(q_np).to(device=query.device, dtype=query.dtype),
+                            #     ds - offset
+                            # )
+                            val_np = np.array(f[value_tag])
+                            cached_val = torch.from_numpy(val_np).to(device=value.device, dtype=value.dtype)
+                        
+                        if self.layer_idx == self.blend_config.recomp_layer:
+                            ntopk = (de - ds) - int(self.blend_config.recomp_ratio * (de - ds))
+                            if self.blend_config.val_diff_only:
+                                diff = torch.sum(
+                                    (value[start_idx + ds : start_idx + de] - cached_val)**2, 
+                                    dim=[1,2]
+                                )
+                            elif self.blend_config.key_diff_only:
+                                diff = torch.sum(
+                                    (key[start_idx + ds : start_idx + de] - cached_key)**2, 
+                                    dim=[1,2]
+                                )
+                            # elif self.blend_config.query_diff_only:
+                            #     diff = torch.sum(
+                            #         (query[start_idx + ds : start_idx + de] - cached_q)**2, 
+                            #         dim=[1,2]
+                            #     )
+                            else:
+                                diff = torch.sum(
+                                    (key[start_idx + ds : start_idx + de] - cached_key)**2 + (value[start_idx + ds : start_idx + de] - cached_val) ** 2, 
+                                    dim=[1,2]
+                                )
+                            recomp_index_per_batch.append(torch.topk(diff, k=ntopk, largest=False).indices)
+                            del diff
+                            # del cached_q
+                            del cached_key
+                            del cached_val
+                        else:
+                            cache_blend_idx = cur_cache_blend_indice[doc_id]
+                            key[cache_blend_idx + (start_idx + ds)] = cached_key[cache_blend_idx]
+                            value[cache_blend_idx + (start_idx + ds)] = cached_val[cache_blend_idx]
+                            del cached_key
+                            del cached_val
+                    
+                    if self.layer_idx == self.blend_config.recomp_layer:
+                        recomp_index_for_batches.append(recomp_index_per_batch)
+                if self.layer_idx == self.blend_config.recomp_layer:
+                    prefill_meta.cache_blend_static_index_cache = recomp_index_for_batches
+
+            if (self.enable_cache_blend and self.blend_type == BlendType.RECOMPUTE_LAST_LAYER and
+                self.layer_idx <= self.blend_config.recompute_layer):
+                cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
+                doc_token_ranges = prefill_meta.doc_token_ranges
+                docs_hash = prefill_meta.docs_hash
+                kvcache_paths = prefill_meta.kvcache_path
+                cached_offsets = prefill_meta.cached_offset
+                need_full_recompute = (self.layer_idx == self.blend_config.recompute_layer)
+                for idx in range(0, len(cu_seqlens_cpu) - 1):
+                    cur_doc_ranges = doc_token_ranges[idx]
+                    doc_hash = docs_hash[idx]
+                    kvcache_path = kvcache_paths[idx]
+                    cur_offset = cached_offsets[idx]
+
+                    start_idx = cu_seqlens_cpu[idx]
+                    end_idx = cu_seqlens_cpu[idx:idx+2][-1]
+                    seqlen = end_idx - start_idx
+
+                    if kvcache_path is None:
+                        continue
+
+                    import h5py
+                    for doc_range, h, kvpath, offset in zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset):
+                        if kvpath is None:
+                            continue
+                        tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                        ds, de = doc_range
+                        key_tag = f'K_{h}_{self.layer_idx}'
+                        value_tag = f'V_{h}_{self.layer_idx}'
+                        if need_full_recompute:
+                            q_tag = f'Q_{h}_{self.layer_idx}'
+                            res_tag = f'R_{h}_{self.layer_idx}'
+                        with h5py.File(tp_kvpath, 'a') as f:
+                            key_np = np.array(f[key_tag])
+                            cached_key = self.apply_rotary(
+                                torch.from_numpy(key_np).to(device=key.device, dtype=key.dtype),
+                                ds - offset
+                            )
+                            val_np = np.array(f[value_tag])
+                            cached_val = torch.from_numpy(val_np).to(device=value.device, dtype=value.dtype)
+                            if need_full_recompute:
+                                assert residual_to_cache is not None
+                                q_np = np.array(f[q_tag])
+                                cached_q = self.apply_rotary(
+                                    torch.from_numpy(q_np).to(device=query.device, dtype=query.dtype),
+                                    ds - offset
+                                )
+                                res_np = np.array(f[res_tag])
+                                cached_res = torch.from_numpy(res_np).to(device=residual_to_cache.device, dtype=residual_to_cache.dtype)
+                            key[start_idx + ds : start_idx + de] = cached_key
+                            value[start_idx + ds : start_idx + de] = cached_val
+                            del cached_key
+                            del cached_val
+                            if need_full_recompute:
+                                query[start_idx + ds : start_idx + de] = cached_q
+                                residual_to_cache[start_idx + ds : start_idx + de] = cached_res
+                                del cached_q
+                                del cached_res
+
+            if (self.enable_cache_blend and self.blend_type == BlendType.CACHE_BLEND_ORIGIN and 
+                self.layer_idx >= self.blend_config.recomp_layer):
+                cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
+                doc_token_ranges = prefill_meta.doc_token_ranges
+                docs_hash = prefill_meta.docs_hash
+                kvcache_paths = prefill_meta.kvcache_path
+                cached_offsets = prefill_meta.cached_offset
+                cache_blend_indice_for_batches = None
+
+                if self.layer_idx == self.blend_config.recomp_layer:
+                    assert prefill_meta.cache_blend_static_index_cache is None
+                elif self.layer_idx > self.blend_config.recomp_layer:
+                    assert prefill_meta.cache_blend_static_index_cache is not None
+                    cache_blend_indice_for_batches = prefill_meta.cache_blend_static_index_cache
+                
+                recomp_index_for_batches = []
+                for idx in range(0, len(cu_seqlens_cpu) - 1):
+                    cur_doc_ranges = doc_token_ranges[idx]
+                    doc_hash = docs_hash[idx]
+                    kvcache_path = kvcache_paths[idx]
+                    cur_offset = cached_offsets[idx]
+                    cur_cache_blend_indice = None
+                    if self.layer_idx > self.blend_config.recomp_layer:
+                        cur_cache_blend_indice = cache_blend_indice_for_batches[idx]
+                    
+                    start_idx = cu_seqlens_cpu[idx]
+                    end_idx = cu_seqlens_cpu[idx:idx+2][-1]
+                    seqlen = end_idx - start_idx
+
+                    if kvcache_path is None:
+                        if self.layer_idx == self.blend_config.recomp_layer:
+                            recomp_index_for_batches.append(None)
+                        continue
+                    
+                    import h5py
+                    if self.layer_idx == self.blend_config.recomp_layer:
+                        shrinked_doc_range = []
+                        total_doc_len = 0
+                        last_len = 0
+                        for (doc_range, kvpath) in zip(cur_doc_ranges, kvcache_path):
+                            if kvpath is None:
+                                shrinked_doc_range.append(None)
+                                continue
+                            ds, de = doc_range
+                            doc_len = (de - ds)
+                            total_doc_len += doc_len
+                            shrinked_doc_range.append((last_len, last_len + doc_len))
+                            last_len += doc_len
+                        _, H, d = key.shape
+
+                        ntopk = total_doc_len - int(self.blend_config.recomp_ratio * total_doc_len)
+                        doc_keys_diff = torch.empty(
+                            (total_doc_len,),
+                            dtype=key.dtype,
+                            device=key.device,
+                        )
+                    
+                        for doc_id,(doc_range, h, kvpath, offset, sdoc_range) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset, shrinked_doc_range)):
+                            if kvpath is None:
+                                continue
+                            tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                            ds, de = doc_range
+                            sds, sde = sdoc_range
+                            key_tag = f'K_{h}_{self.layer_idx}'
+                            with h5py.File(tp_kvpath, 'a') as f:
+                                key_np = np.array(f[key_tag])
+                                cached_key = self.apply_rotary(
+                                    torch.from_numpy(key_np).to(device=key.device, dtype=key.dtype),
+                                    ds - offset
+                                )
+                                doc_keys_diff[sds:sde] = torch.sum(
+                                    (key[start_idx + ds : start_idx + de] - cached_key)**2, 
+                                    dim=[1,2]
+                                )
+                                del cached_key
+
+                        topk_tokens_idx = torch.topk(doc_keys_diff, k=ntopk, largest=False).indices
+                        del doc_keys_diff
+                        recomp_index_per_batch = []
+                        for (doc_range, sdoc_range, kvpath) in zip(cur_doc_ranges, shrinked_doc_range, kvcache_path):
+                            if kvpath is None:
+                                recomp_index_per_batch.append(None)
+                                continue
+                            ds, _ = doc_range
+                            sds, sde = sdoc_range
+                            recomp_index_per_batch.append(topk_tokens_idx[(topk_tokens_idx >= sds) & (topk_tokens_idx < sde)] - sds)
+                        
+                        recomp_index_for_batches.append(recomp_index_per_batch)
+                    else:
+                        for doc_id,(doc_range, h, kvpath, offset) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset)):
+                            if kvpath is None:
+                                continue
+                            tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                            ds, de = doc_range
+                            key_tag = f'K_{h}_{self.layer_idx}'
+                            value_tag = f'V_{h}_{self.layer_idx}'
+                            cache_blend_idx = cur_cache_blend_indice[doc_id]
+                            if cache_blend_idx.shape[0] == 0:
+                                continue
+                            with h5py.File(tp_kvpath, 'a') as f:
+                                key_np = np.array(f[key_tag])
+                                cached_key = self.apply_rotary(
+                                    torch.from_numpy(key_np).to(device=key.device, dtype=key.dtype),
+                                    ds - offset
+                                )
+                                val_np = np.array(f[value_tag])
+                                cached_val = torch.from_numpy(val_np).to(device=value.device, dtype=value.dtype)
+                                key[cache_blend_idx + (start_idx + ds)] = cached_key[cache_blend_idx]
+                                value[cache_blend_idx + (start_idx + ds)] = cached_val[cache_blend_idx]
+                                del cached_key
+                                del cached_val
+
+                if self.layer_idx == self.blend_config.recomp_layer:
+                    prefill_meta.cache_blend_static_index_cache = recomp_index_for_batches
+
+            if (self.enable_cache_blend and self.blend_type == BlendType.CACHE_BLEND_DYNAMIC_INDEX and
+                self.layer_idx >= self.blend_config.recomp_layer):
+                full_compute_mode = ((self.layer_idx - self.blend_config.recomp_layer + 1) % self.blend_config.recomp_stride == 0)
+                calc_compute_idx_mode = ((self.layer_idx - self.blend_config.recomp_layer) % self.blend_config.recomp_stride == 0)
+                use_idx_mode = not (full_compute_mode or calc_compute_idx_mode)
+
+                cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
+                doc_token_ranges = prefill_meta.doc_token_ranges
+                docs_hash = prefill_meta.docs_hash
+                kvcache_paths = prefill_meta.kvcache_path
+                cached_offsets = prefill_meta.cached_offset
+                cache_blend_indice_for_batches = None
+
+                if use_idx_mode or full_compute_mode:
+                    assert prefill_meta.cache_blend_static_index_cache is not None
+                    cache_blend_indice_for_batches = prefill_meta.cache_blend_static_index_cache
+
+                if full_compute_mode:
+                    for idx in range(0, len(cu_seqlens_cpu) - 1):
+                        cur_doc_ranges = doc_token_ranges[idx]
+                        doc_hash = docs_hash[idx]
+                        kvcache_path = kvcache_paths[idx]
+                        cur_offset = cached_offsets[idx]
+                        cur_cache_blend_indice = cache_blend_indice_for_batches[idx]
+
+                        start_idx = cu_seqlens_cpu[idx]
+                        end_idx = cu_seqlens_cpu[idx:idx+2][-1]
+                        seqlen = end_idx - start_idx
+
+                        if kvcache_path is None:
+                            continue
+
+                        import h5py
+                        for doc_id,(doc_range, h, kvpath, offset) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset)):
+                            if kvpath is None:
+                                continue
+                            tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                            ds, de = doc_range
+                            key_tag = f'K_{h}_{self.layer_idx}'
+                            value_tag = f'V_{h}_{self.layer_idx}'
+                            q_tag = f'Q_{h}_{self.layer_idx}'
+                            with h5py.File(tp_kvpath, 'a') as f:
+                                key_np = np.array(f[key_tag])
+                                cached_key = self.apply_rotary(
+                                    torch.from_numpy(key_np).to(device=key.device, dtype=key.dtype),
+                                    ds - offset
+                                )
+                                q_np = np.array(f[q_tag])
+                                cached_q = self.apply_rotary(
+                                    torch.from_numpy(q_np).to(device=query.device, dtype=query.dtype),
+                                    ds - offset
+                                )
+                                val_np = np.array(f[value_tag])
+                                cached_val = torch.from_numpy(val_np).to(device=value.device, dtype=value.dtype)
+                            
+                            cache_blend_idx = cur_cache_blend_indice[doc_id]
+                            key[cache_blend_idx + (start_idx + ds)] = cached_key[cache_blend_idx]
+                            value[cache_blend_idx + (start_idx + ds)] = cached_val[cache_blend_idx]
+                            query[cache_blend_idx + (start_idx + ds)] = cached_q[cache_blend_idx]
+                            del cached_q
+                            del cached_key
+                            del cached_val
+                else:
+                    recomp_index_for_batches = []
+                    for idx in range(0, len(cu_seqlens_cpu) - 1):
+                        cur_doc_ranges = doc_token_ranges[idx]
+                        doc_hash = docs_hash[idx]
+                        kvcache_path = kvcache_paths[idx]
+                        cur_offset = cached_offsets[idx]
+                        cur_cache_blend_indice = None
+
+                        if use_idx_mode:
+                            cur_cache_blend_indice = cache_blend_indice_for_batches[idx]
+                        
+                        start_idx = cu_seqlens_cpu[idx]
+                        end_idx = cu_seqlens_cpu[idx:idx+2][-1]
+                        seqlen = end_idx - start_idx
+
+                        if kvcache_path is None:
+                            if calc_compute_idx_mode:
+                                recomp_index_for_batches.append(None)
+                            continue
+
+                        import h5py
+                        recomp_index_per_batch = []
+                        for doc_id,(doc_range, h, kvpath, offset) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset)):
+                            if kvpath is None:
+                                if calc_compute_idx_mode:
+                                    recomp_index_per_batch.append(None)
+                                continue
+                            tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                            ds, de = doc_range
+                            key_tag = f'K_{h}_{self.layer_idx}'
+                            value_tag = f'V_{h}_{self.layer_idx}'
+                            with h5py.File(tp_kvpath, 'a') as f:
+                                key_np = np.array(f[key_tag])
+                                cached_key = self.apply_rotary(
+                                    torch.from_numpy(key_np).to(device=key.device, dtype=key.dtype),
+                                    ds - offset
+                                )
+                                val_np = np.array(f[value_tag])
+                                cached_val = torch.from_numpy(val_np).to(device=value.device, dtype=value.dtype)
+                            
+                            if calc_compute_idx_mode:
+                                ntopk = (de - ds) - int(self.blend_config.recomp_ratio * (de - ds))
+                                # if self.blend_config.val_diff_only:
+                                #     diff = torch.sum(
+                                #         (value[start_idx + ds : start_idx + de] - cached_val)**2, 
+                                #         dim=[1,2]
+                                #     )
+                                # elif self.blend_config.key_diff_only:
+                                diff = torch.sum(
+                                    (key[start_idx + ds : start_idx + de] - cached_key)**2, 
+                                    dim=[1,2]
+                                )
+                                # else:
+                                #     diff = torch.sum(
+                                #         (key[start_idx + ds : start_idx + de] - cached_key)**2 + (value[start_idx + ds : start_idx + de] - cached_val) ** 2, 
+                                #         dim=[1,2]
+                                #     )
+                                recomp_index_per_batch.append(torch.topk(diff, k=ntopk, largest=False).indices)
+                                key[recomp_index_per_batch[-1] + (start_idx + ds)] = cached_key[recomp_index_per_batch[-1]]
+                                value[recomp_index_per_batch[-1] + (start_idx + ds)] = cached_val[recomp_index_per_batch[-1]]
+                                del diff
+                            else:
+                                cache_blend_idx = cur_cache_blend_indice[doc_id]
+                                key[cache_blend_idx + (start_idx + ds)] = cached_key[cache_blend_idx]
+                                value[cache_blend_idx + (start_idx + ds)] = cached_val[cache_blend_idx]
+                            
+                            del cached_key
+                            del cached_val
+                        if calc_compute_idx_mode:
+                            recomp_index_for_batches.append(recomp_index_per_batch)
+                    if calc_compute_idx_mode:
+                        if prefill_meta.cache_blend_static_index_cache is not None:
+                            del prefill_meta.cache_blend_static_index_cache
+                        prefill_meta.cache_blend_static_index_cache = recomp_index_for_batches
+            
+            if (self.enable_cache_blend and self.blend_type == BlendType.CHANNEL_AWARE and
+                self.layer_idx >= self.blend_config.sample_layer):
+                cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
+                doc_token_ranges = prefill_meta.doc_token_ranges
+                docs_hash = prefill_meta.docs_hash
+                kvcache_paths = prefill_meta.kvcache_path
+                cached_offsets = prefill_meta.cached_offset
+
+                for idx in range(0, len(cu_seqlens_cpu) - 1):
+                    cur_doc_ranges = doc_token_ranges[idx]
+                    doc_hash = docs_hash[idx]
+                    kvcache_path = kvcache_paths[idx]
+                    cur_offset = cached_offsets[idx]
+
+                    start_idx = cu_seqlens_cpu[idx]
+                    end_idx = cu_seqlens_cpu[idx:idx+2][-1]
+                    seqlen = end_idx - start_idx
+
+                    if kvcache_path is None:
+                        continue
+                    
+                    import h5py
+                    for (doc_range, h, kvpath, offset) in zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset):
+                        if kvpath is None:
+                            continue
+                        tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                        ds, de = doc_range
+                        key_tag = f'K_{h}_{self.layer_idx}'
+                        value_tag = f'V_{h}_{self.layer_idx}'
+                        with h5py.File(tp_kvpath, 'a') as f:
+                            key_np = np.array(f[key_tag])
+                            cached_key = self.apply_rotary(
+                                torch.from_numpy(key_np).to(device=key.device, dtype=key.dtype),
+                                ds - offset
+                            )
+                            val_np = np.array(f[value_tag])
+                            cached_val = torch.from_numpy(val_np).to(device=value.device, dtype=value.dtype)
+                        
+                        _, H, d = key.shape
+                        unrecompute_mask = torch.ones(de - ds, dtype=torch.bool)
+                        pivot_idx = torch.arange(0, (de - ds), self.blend_config.pivot_stride)
+                        unrecompute_mask[pivot_idx] = False
+                        unrecompute_idx = (torch.arange(0, (de - ds)))[unrecompute_mask]
+                        # key_pooling = group_mean_vectorized(
+                        #     key[start_idx + ds : start_idx + de],
+                        #     self.blend_config.pivot_stride,
+                        # )
+                        # val_pooling = group_mean_vectorized(
+                        #     value[start_idx + ds : start_idx + de],
+                        #     self.blend_config.pivot_stride,
+                        # )
+                        # key_delta = key_pooling - cached_key[pivot_idx]
+                        # key_delta_expand = (key_delta.unsqueeze(1).expand(-1, self.blend_config.pivot_stride, -1, -1).reshape(-1, H, d))[:de - ds]
+                        # val_delta = val_pooling - cached_val[pivot_idx]
+                        # val_delta_expand = (val_delta.unsqueeze(1).expand(-1, self.blend_config.pivot_stride, -1, -1).reshape(-1, H, d))[:de - ds]
+                        # recitified_cache_key = cached_key + key_delta_expand
+                        # recitified_cache_val = cached_val + val_delta_expand
+                        # key[unrecompute_idx + (start_idx + ds)] = recitified_cache_key[unrecompute_idx]
+                        # value[unrecompute_idx + (start_idx + ds)] = recitified_cache_val[unrecompute_idx]
+
+                        key[unrecompute_idx + (start_idx + ds)] = cached_key[unrecompute_idx]
+                        value[unrecompute_idx + (start_idx + ds)] = cached_val[unrecompute_idx]
+
+                        # del val_pooling
+                        # del key_pooling
+                        del unrecompute_idx
+                        del pivot_idx
+                        del unrecompute_mask
+                        del cached_key
+                        del cached_val
+            
+            if (self.enable_cache_blend and self.blend_type == BlendType.ATTN_AWARE and
+                self.layer_idx >= self.blend_config.num_full_layer):
+                cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
+                doc_token_ranges = prefill_meta.doc_token_ranges
+                docs_hash = prefill_meta.docs_hash
+                kvcache_paths = prefill_meta.kvcache_path
+                cached_offsets = prefill_meta.cached_offset
+                cache_blend_indice_for_batches = None
+
+                if self.layer_idx == self.blend_config.num_full_layer:
+                    assert prefill_meta.cache_blend_static_index_cache is None
+                elif self.layer_idx > self.blend_config.num_full_layer:
+                    assert prefill_meta.cache_blend_static_index_cache is not None
+                    cache_blend_indice_for_batches = prefill_meta.cache_blend_static_index_cache
+
+                num_query_head = query.shape[-2]
+                num_key_head = key.shape[-2]
+                head_dim = query.shape[-1]
+                group_size = num_query_head // num_key_head
+                
+                recomp_index_for_batches = []
+                for idx in range(0, len(cu_seqlens_cpu) - 1):
+                    cur_doc_ranges = doc_token_ranges[idx]
+                    doc_hash = docs_hash[idx]
+                    kvcache_path = kvcache_paths[idx]
+                    cur_offset = cached_offsets[idx]
+                    cur_cache_blend_indice = None
+                    if self.layer_idx > self.blend_config.num_full_layer:
+                        cur_cache_blend_indice = cache_blend_indice_for_batches[idx]
+
+                    start_idx = cu_seqlens_cpu[idx]
+                    end_idx = cu_seqlens_cpu[idx:idx+2][-1]
+                    seqlen = end_idx - start_idx
+
+                    if kvcache_path is None:
+                        if self.layer_idx == self.blend_config.num_full_layer:
+                            recomp_index_for_batches.append(None)
+                        continue
+
+                    import h5py
+                    assert kvcache_path[-1] is not None
+                    recomp_index_per_batch = []
+
+                    question_query = None
+                    if self.layer_idx == self.blend_config.num_full_layer:
+                        question_query = query[start_idx + cur_doc_ranges[-1][1]:]
+                    
+                    for doc_id,(doc_range, h, kvpath, offset) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset)):
+                        if kvpath is None:
+                            if self.layer_idx == self.blend_config.num_full_layer:
+                                recomp_index_per_batch.append(None)
+                            continue
+                        tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+                        ds, de = doc_range
+                        key_tag = f'K_{h}_{self.layer_idx}'
+                        value_tag = f'V_{h}_{self.layer_idx}'
+                        q_tag = f'Q_{h}_{self.layer_idx}'
+                        with h5py.File(tp_kvpath, 'a') as f:
+                            key_np = np.array(f[key_tag])
+                            cached_key = self.apply_rotary(
+                                torch.from_numpy(key_np).to(device=key.device, dtype=key.dtype),
+                                ds - offset
+                            )
+                            val_np = np.array(f[value_tag])
+                            cached_val = torch.from_numpy(val_np).to(device=value.device, dtype=value.dtype)
+                        if self.layer_idx == self.blend_config.num_full_layer:
+                            recomp_index_per_batch.append(get_attn_score_unrecompte_idx(
+                                question_query,
+                                # cached_key,
+                                key[start_idx + ds : start_idx + de],
+                                group_size,
+                                softmax_scale,
+                                num_key_head,
+                                head_dim,
+                                self.blend_config.topk_ratio,
+                            ))
+                        else:
+                            cache_blend_idx = cur_cache_blend_indice[doc_id]
+                            key[cache_blend_idx + (start_idx + ds)] = cached_key[cache_blend_idx]
+                            value[cache_blend_idx + (start_idx + ds)] = cached_val[cache_blend_idx]
+                        del cached_key
+                        del cached_val
+                    
+                    if self.layer_idx == self.blend_config.num_full_layer:
+                        recomp_index_for_batches.append(recomp_index_per_batch)
+                    
+                    if question_query is not None:
+                        del question_query
+                
+                if self.layer_idx == self.blend_config.num_full_layer:
+                    prefill_meta.cache_blend_static_index_cache = recomp_index_for_batches
 
             if self.enable_pooling:
                 cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()

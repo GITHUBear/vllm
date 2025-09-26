@@ -3,7 +3,7 @@ import requests
 # from tqdm import tqdm
 
 def format_prompt(case_prompt: str):
-    prompt = "Answer the question based on the given passages. Only give me the answer and do not output any other words."
+    prompt = "\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words."
     last_pos = case_prompt.rfind(prompt)
     split_idxs = []
     for i in range(1, 15):
@@ -33,7 +33,8 @@ headers = {
 
 def call_llm_gen(prompt):
     data = {
-        "model": "/data/shanhaikang.shk/modelscope/qwq32b",
+        # "model": "/data/shanhaikang.shk/modelscope/qwq32b",
+        "model": "/data/shanhaikang.shk/modelscope/qwen25_32b",
         "messages": [
             {"role": "user", "content": prompt},
         ],

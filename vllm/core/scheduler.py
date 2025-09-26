@@ -1840,6 +1840,7 @@ class Scheduler:
                         docs_hash = []
                         kvcache_path = []
                         cached_offset = []
+                        missed_cnt = 0
                         for (ds, de) in doc_ranges:
                             doc_hash = list_to_xxhash(prompt_token_ids[ds:de])
                             meta, actual_doc_hash = self.doc_metafile_handler.load_doc_meta(
@@ -1852,9 +1853,12 @@ class Scheduler:
                                 cached_offset.append(meta['offset'])
                                 docs_hash.append(actual_doc_hash)
                             else:
+                                missed_cnt += 1
                                 kvcache_path.append(None)
                                 cached_offset.append(None)
                                 docs_hash.append(None)
+                        if missed_cnt > 0:
+                            logger.info(f"REQ:[{seq_group.request_id}] missed {missed_cnt} docs in {len(doc_ranges)}")
 
                 if self.cache_config.enable_pooling:
                     assert (not self.scheduler_config.chunked_prefill_enabled)
