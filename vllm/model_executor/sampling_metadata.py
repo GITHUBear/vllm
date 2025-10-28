@@ -193,7 +193,7 @@ class SamplingMetadata:
             f"selected_token_indices={self.selected_token_indices}, "
             f"categorized_sample_indices={self.categorized_sample_indices})")
 
-
+# TODO:shk: 对于 BlockAttention 来说，SamplingMetadata 逻辑需要调整
 def _prepare_seq_groups(
     seq_group_metadata_list: list[SequenceGroupMetadata],
     seq_lens: list[int],
@@ -307,6 +307,7 @@ def _prepare_seq_groups(
         logits = hidden_states[selected_token_indices]
         """
 
+        # Block Attention 时我们是禁用 prompt_logprobs，或是允许返回不连续块的 prompt_logprobs?
         if sampling_params.prompt_logprobs is not None:
             selected_token_indices.extend(
                 range(model_output_idx, model_output_idx + prompt_logprob_len))

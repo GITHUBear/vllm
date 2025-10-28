@@ -525,6 +525,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                                       is not None)
         # TODO[shk]: page_compress_topk 作为配置项
         self.page_compress_topk = 256
+        
+        self.enable_blk_attn = self.runner.model_config.enable_blk_attn
 
         # Attention metadata inputs.
         if self.attn_backend is not None:
@@ -583,6 +585,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
         # Compute tokens.
         if seq_data.prompt_embeds is None:
+            # TODO:[shk] 对于 block attention 来说 tokens 需要取特定区间
             tokens = seq_data.get_token_ids()[context_len:seq_len]
             prompt_embeds = None
         else:

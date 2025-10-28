@@ -37,10 +37,10 @@ from vllm.vllm_flash_attn import (flash_attn_varlen_func,
 import os
 import math
 from enum import IntEnum
-# from .x_attn import Xattention_prefill
-# from .minference import Minference_prefill
-# from .flex_prefill_attention import flex_prefill_attention
-# from spas_sage_attn import spas_sage2_attn_meansim_cuda
+from .x_attn import Xattention_prefill
+from .minference import Minference_prefill
+from .flex_prefill_attention import flex_prefill_attention
+from spas_sage_attn import spas_sage2_attn_meansim_cuda
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import (ModelInputForGPUBuilder,
@@ -229,6 +229,12 @@ class FlashAttentionMetadata(AttentionMetadata):
     cached_offset: List[Optional[list]] = None
     cache_blend_static_index_cache: Optional[List] = None
 
+    enable_blk_attn: bool = False
+    batch_idx_offset_for_blk_attn_tensor: Optional[torch.Tensor] = None
+    blk_attn_max_prefill_kv_len: Optional[int] = None
+    blk_attn_max_prefill_q_len: Optional[int] = None
+    blk_attn_seq_start_loc_tensor: Optional[torch.Tensor] = None
+
     @property
     def is_all_encoder_attn_metadata_set(self):
         '''
@@ -307,7 +313,12 @@ class FlashAttentionMetadata(AttentionMetadata):
             docs_hash=self.docs_hash,
             kvcache_path=self.kvcache_path,
             cached_offset=self.cached_offset,
-            cache_blend_static_index_cache=self.cache_blend_static_index_cache)
+            cache_blend_static_index_cache=self.cache_blend_static_index_cache,
+            enable_blk_attn=self.enable_blk_attn,
+            batch_idx_offset_for_blk_attn_tensor=self.batch_idx_offset_for_blk_attn_tensor,
+            blk_attn_max_prefill_kv_len=self.blk_attn_max_prefill_kv_len,
+            blk_attn_max_prefill_q_len=self.blk_attn_max_prefill_q_len,
+            blk_attn_seq_start_loc_tensor=self.blk_attn_seq_start_loc_tensor)
         return self._cached_prefill_metadata
 
     @property
@@ -456,6 +467,7 @@ class FlashAttentionMetadataBuilder(
         self.sliding_window = input_builder.sliding_window
         self.block_size = input_builder.block_size
         self.page_compress_topk = input_builder.page_compress_topk
+        self.enble_blk_attn = input_builder.enable_blk_attn
 
     def prepare(self):
         self.slot_mapping: List[int] = []
@@ -490,6 +502,8 @@ class FlashAttentionMetadataBuilder(
         self.docs_hash: List[list] = []
         self.kvcache_path: List[list] = []
         self.cached_offset: List[list] = []
+        self.batch_idx_offset_for_blk_attn: List[int] = []
+        self.blk_attn_prefill_seq_lens: List[int] = []
 
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
@@ -542,6 +556,18 @@ class FlashAttentionMetadataBuilder(
                 self.num_prefills += 1
                 self.num_prefill_tokens += token_len
                 self.prefill_seq_lens.append(seq_len)
+                if not self.enble_blk_attn:
+                    pass
+                elif doc_ranges is None:
+                    assert context_len == 0
+                    self.blk_attn_prefill_seq_lens.append(seq_len)
+                    self.batch_idx_offset_for_blk_attn.append(0)
+                else:
+                    assert context_len == 0
+                    self.blk_attn_prefill_seq_lens.extend([(doc_range[1] - doc_range[0]) for doc_range in doc_ranges])
+                    self.blk_attn_prefill_seq_lens.append(seq_len - doc_ranges[-1][1])
+                    self.batch_idx_offset_for_blk_attn.extend([0] * len(doc_ranges))
+                    self.batch_idx_offset_for_blk_attn.append(len(doc_ranges))
             else:
                 # decode
                 self.num_decode_tokens += query_len
@@ -678,10 +704,20 @@ class FlashAttentionMetadataBuilder(
         max_prefill_seq_len = max(self.prefill_seq_lens, default=0)
         # max_sparse_index_decode_seq_len = max(self.use_sparse_index_seq_lens, default=0)
         max_decode_seq_len = max(self.curr_seq_lens, default=0)
+        if self.enble_blk_attn:
+            blk_attn_max_prefill_q_len = max(self.blk_attn_prefill_seq_lens, default = 0)
+            blk_attn_max_prefill_kv_len = max_prefill_seq_len
+        else:
+            blk_attn_max_prefill_q_len = 0
+            blk_attn_max_prefill_kv_len = None
 
         num_decode_tokens = self.num_decode_tokens
         query_start_loc = list(accumulate(query_lens, initial=0))
         seq_start_loc = list(accumulate(seq_lens, initial=0))
+        if self.enble_blk_attn:
+            blk_attn_seq_start_loc = list(accumulate(self.blk_attn_prefill_seq_lens, initial=0))
+        else:
+            blk_attn_seq_start_loc = []
 
         num_seqs = len(seq_lens)
         if use_captured_graph:
@@ -752,6 +788,16 @@ class FlashAttentionMetadataBuilder(
             for modality, placeholder_map in
             self.multimodal_placeholder_maps.items()
         }
+        batch_idx_offset_for_blk_attn_tensor = async_tensor_h2d(
+            self.batch_idx_offset_for_blk_attn,
+            torch.int32,
+            device, self.runner.pin_memory
+        )
+        blk_attn_seq_start_loc_tensor = async_tensor_h2d(
+            blk_attn_seq_start_loc,
+            torch.int32,
+            device, self.runner.pin_memory
+        )
 
         return FlashAttentionMetadata(
             num_prefills=self.num_prefills,
@@ -788,6 +834,11 @@ class FlashAttentionMetadataBuilder(
             kvcache_path=self.kvcache_path,
             cached_offset=self.cached_offset,
             cache_blend_static_index_cache=None,
+            enable_blk_attn=self.enble_blk_attn,
+            batch_idx_offset_for_blk_attn_tensor=batch_idx_offset_for_blk_attn_tensor,
+            blk_attn_max_prefill_kv_len=blk_attn_max_prefill_kv_len,
+            blk_attn_max_prefill_q_len=blk_attn_max_prefill_q_len,
+            blk_attn_seq_start_loc_tensor=blk_attn_seq_start_loc_tensor,
         )
 
 class BlendType(IntEnum):
@@ -798,6 +849,7 @@ class BlendType(IntEnum):
     ATTN_AWARE = 4
     CACHE_BLEND_ORIGIN = 5
     RECOMPUTE_LAST_LAYER = 6
+    # RECOMPUTE_EVERY_LAYER = 7
 
 @dataclass
 class CacheBlendConfig:
@@ -836,6 +888,12 @@ class CacheBlendOriginConfig:
 class RecomputeLastLayerConfig:
     recompute_layer: int = -1
 
+# @dataclass
+# class RecomputeEveryLayerConfig:
+#     full_recompute_for_last_second_layer: bool = True
+#     recomp_ratio:float = 0.18
+#     recomp_layer:int = 1
+
 class SparsePrefillType(IntEnum):
     FULL_ATTN = 0
     X_ATTN = 1
@@ -846,7 +904,7 @@ class SparsePrefillType(IntEnum):
 @dataclass
 class XAttentionConfig:
     stride: int = 8
-    threshold: float = 0.95
+    threshold: float = 0.8
     block_size: int = 128
     chunk_size: int = 2048
 
@@ -1078,6 +1136,7 @@ class FlashAttentionImpl(AttentionImpl):
         self.dump_decode_which_step = int(os.getenv("VLLM_FA_DUMP_DECODE_STEP", 0))
 
         self.fa_sparse_decoding_recover_rate = os.getenv("VLLM_FA_DECODE_RECOVER_RATE", None)
+        self.dump_cache_blend_path = os.getenv("VLLM_DUMP_CB_PATH", None)
         if self.fa_sparse_decoding_recover_rate is not None:
             self.fa_sparse_decoding_recover_rate = float(self.fa_sparse_decoding_recover_rate)
         self.sparse_prefill_attn_type = SparsePrefillType(int(os.getenv("VLLM_FA_SPARSE_PREFILL", 0)))
@@ -1097,13 +1156,21 @@ class FlashAttentionImpl(AttentionImpl):
         self.int32_min = torch.iinfo(torch.int32).min
 
         self.num_layers = num_layers
+        self.blend_prepare_save_residual_layer = None
         self.blend_prepare_for_last_layer_recompute = os.getenv("VLLM_FA_BLEND_PREPARE_FOR_LAST_LAYER", None) is not None
+        if self.blend_prepare_for_last_layer_recompute:
+            self.blend_prepare_save_residual_layer = [self.num_layers - 2]
+        self.blend_prepare_for_cache_blend_dynamic = int(os.getenv("VLLM_FA_BLEND_PREPARE_FOR_CB_DYN", -1))
+        if self.blend_prepare_for_cache_blend_dynamic != -1:
+            self.blend_prepare_save_residual_layer = list(range(0, self.num_layers, self.blend_prepare_for_cache_blend_dynamic))
+
         self.blend_type = BlendType(int(os.getenv("VLLM_FA_BLEND_TYPE", 0)))
         self.blend_config = None
         if self.blend_type == BlendType.CACHE_BLEND_STATIC_INDEX:
-            self.blend_config = CacheBlendConfig(key_diff_only=True, recomp_layer=16)
+            self.blend_config = CacheBlendConfig(key_diff_only=True)
         if self.blend_type == BlendType.CACHE_BLEND_DYNAMIC_INDEX:
-            self.blend_config = CacheBlendDynamicConfig(recomp_stride=4)
+            assert self.blend_prepare_for_cache_blend_dynamic is not None
+            self.blend_config = CacheBlendDynamicConfig(recomp_stride=self.blend_prepare_for_cache_blend_dynamic)
         if self.blend_type == BlendType.CHANNEL_AWARE:
             self.blend_config = ChannelAwareConfig()
         if self.blend_type == BlendType.ATTN_AWARE:
@@ -1113,6 +1180,9 @@ class FlashAttentionImpl(AttentionImpl):
         if self.blend_type == BlendType.RECOMPUTE_LAST_LAYER:
             assert self.num_layers is not None
             self.blend_config = RecomputeLastLayerConfig(recompute_layer=self.num_layers - 2)
+        # if self.blend_type == BlendType.RECOMPUTE_EVERY_LAYER:
+        #     assert self.num_layers is not None
+        #     self.blend_config = RecomputeEveryLayerConfig()
 
         # 参数目前硬编码
         # TODO[shk]: 传入参数
@@ -1211,6 +1281,7 @@ class FlashAttentionImpl(AttentionImpl):
         
         key_after_pooling = []
         val_after_pooling = []
+        # cache_blend_recomp_every_layer_kept_key_index = None
         if prefill_meta := attn_metadata.prefill_metadata:
             if self.enable_blend_prepare:
                 cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
@@ -1234,12 +1305,12 @@ class FlashAttentionImpl(AttentionImpl):
                         continue
                         
                     assert len(cur_doc_ranges) == len(doc_hash) and len(cur_doc_ranges) == len(kvcache_path)
-                    if self.blend_prepare_for_last_layer_recompute:
+                    if self.blend_prepare_save_residual_layer is not None:
                         assert residual_to_cache is not None
                         assert self.num_layers is not None
                         cur_key = key[start_idx : end_idx]
                         cur_val = value[start_idx : end_idx]
-                        if self.layer_idx == self.num_layers - 2:
+                        if self.layer_idx in self.blend_prepare_save_residual_layer:
                             cur_q = query[start_idx : end_idx]
                             cur_res = residual_to_cache[start_idx : end_idx]
                         for doc_range, h, kvpath in zip(cur_doc_ranges, doc_hash, kvcache_path):
@@ -1251,7 +1322,7 @@ class FlashAttentionImpl(AttentionImpl):
                             with h5py.File(tp_kvpath, 'a') as f:
                                 f.create_dataset(f'K_{h}_{self.layer_idx}', data=cur_key[ds:de].clone().detach().float().cpu().numpy())
                                 f.create_dataset(f'V_{h}_{self.layer_idx}', data=cur_val[ds:de].clone().detach().float().cpu().numpy())
-                                if self.layer_idx == self.num_layers - 2:
+                                if self.layer_idx in self.blend_prepare_save_residual_layer:
                                     f.create_dataset(f'Q_{h}_{self.layer_idx}', data=cur_q[ds:de].clone().detach().float().cpu().numpy())
                                     f.create_dataset(f'R_{h}_{self.layer_idx}', data=cur_res[ds:de].clone().detach().float().cpu().numpy())
                     else:
@@ -1297,8 +1368,8 @@ class FlashAttentionImpl(AttentionImpl):
                             len(cur_doc_ranges) == len(kvcache_path) and
                             len(cur_doc_ranges) == len(cur_offset))
                     import h5py
-                    for doc_range, h, kvpath, offset in zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset):
-                        if kvpath is None:
+                    for doc_id, (doc_range, h, kvpath, offset) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset)):
+                        if kvpath is None or doc_id == 0:
                             continue
                         tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
                         ds, de = doc_range
@@ -1353,7 +1424,7 @@ class FlashAttentionImpl(AttentionImpl):
                     import h5py
                     recomp_index_per_batch = []
                     for doc_id,(doc_range, h, kvpath, offset) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset)):
-                        if kvpath is None:
+                        if kvpath is None or doc_id == 0:
                             if self.layer_idx == self.blend_config.recomp_layer:
                                 recomp_index_per_batch.append(None)
                             continue
@@ -1414,6 +1485,14 @@ class FlashAttentionImpl(AttentionImpl):
                         recomp_index_for_batches.append(recomp_index_per_batch)
                 if self.layer_idx == self.blend_config.recomp_layer:
                     prefill_meta.cache_blend_static_index_cache = recomp_index_for_batches
+
+                # if (self.dump_cache_blend_path is not None) and kv_cache.numel() > 0 and (prefill_meta.block_tables is not None):
+                #     print("================== CACHE_BLEND DUMP KV ================")
+                #     import h5py
+                #     file_name = f"{self.dump_cache_blend_path}/tensor_{self.tp_rank}.hdf5"
+                #     with h5py.File(file_name, 'a') as f:
+                #         f.create_dataset(f'K_{self.layer_idx}', data=key.clone().detach().float().cpu().numpy())
+                #         f.create_dataset(f'V_{self.layer_idx}', data=value.clone().detach().float().cpu().numpy())
 
             if (self.enable_cache_blend and self.blend_type == BlendType.RECOMPUTE_LAST_LAYER and
                 self.layer_idx <= self.blend_config.recompute_layer):
@@ -1564,7 +1643,7 @@ class FlashAttentionImpl(AttentionImpl):
                         recomp_index_for_batches.append(recomp_index_per_batch)
                     else:
                         for doc_id,(doc_range, h, kvpath, offset) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset)):
-                            if kvpath is None:
+                            if kvpath is None or doc_id == 0:
                                 continue
                             tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
                             ds, de = doc_range
@@ -1623,13 +1702,14 @@ class FlashAttentionImpl(AttentionImpl):
 
                         import h5py
                         for doc_id,(doc_range, h, kvpath, offset) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset)):
-                            if kvpath is None:
+                            if kvpath is None or doc_id == 0:
                                 continue
                             tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
                             ds, de = doc_range
                             key_tag = f'K_{h}_{self.layer_idx}'
                             value_tag = f'V_{h}_{self.layer_idx}'
                             q_tag = f'Q_{h}_{self.layer_idx}'
+                            res_tag = f'R_{h}_{self.layer_idx}'
                             with h5py.File(tp_kvpath, 'a') as f:
                                 key_np = np.array(f[key_tag])
                                 cached_key = self.apply_rotary(
@@ -1643,14 +1723,18 @@ class FlashAttentionImpl(AttentionImpl):
                                 )
                                 val_np = np.array(f[value_tag])
                                 cached_val = torch.from_numpy(val_np).to(device=value.device, dtype=value.dtype)
+                                res_np = np.array(f[res_tag])
+                                cached_res = torch.from_numpy(res_np).to(device=residual_to_cache.device, dtype=residual_to_cache.dtype)
                             
                             cache_blend_idx = cur_cache_blend_indice[doc_id]
                             key[cache_blend_idx + (start_idx + ds)] = cached_key[cache_blend_idx]
                             value[cache_blend_idx + (start_idx + ds)] = cached_val[cache_blend_idx]
                             query[cache_blend_idx + (start_idx + ds)] = cached_q[cache_blend_idx]
+                            residual_to_cache[cache_blend_idx + (start_idx + ds)] = cached_res[cache_blend_idx]
                             del cached_q
                             del cached_key
                             del cached_val
+                            del cached_res
                 else:
                     recomp_index_for_batches = []
                     for idx in range(0, len(cu_seqlens_cpu) - 1):
@@ -1675,7 +1759,7 @@ class FlashAttentionImpl(AttentionImpl):
                         import h5py
                         recomp_index_per_batch = []
                         for doc_id,(doc_range, h, kvpath, offset) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset)):
-                            if kvpath is None:
+                            if kvpath is None or doc_id == 0:
                                 if calc_compute_idx_mode:
                                     recomp_index_per_batch.append(None)
                                 continue
@@ -1694,21 +1778,10 @@ class FlashAttentionImpl(AttentionImpl):
                             
                             if calc_compute_idx_mode:
                                 ntopk = (de - ds) - int(self.blend_config.recomp_ratio * (de - ds))
-                                # if self.blend_config.val_diff_only:
-                                #     diff = torch.sum(
-                                #         (value[start_idx + ds : start_idx + de] - cached_val)**2, 
-                                #         dim=[1,2]
-                                #     )
-                                # elif self.blend_config.key_diff_only:
                                 diff = torch.sum(
                                     (key[start_idx + ds : start_idx + de] - cached_key)**2, 
                                     dim=[1,2]
                                 )
-                                # else:
-                                #     diff = torch.sum(
-                                #         (key[start_idx + ds : start_idx + de] - cached_key)**2 + (value[start_idx + ds : start_idx + de] - cached_val) ** 2, 
-                                #         dim=[1,2]
-                                #     )
                                 recomp_index_per_batch.append(torch.topk(diff, k=ntopk, largest=False).indices)
                                 key[recomp_index_per_batch[-1] + (start_idx + ds)] = cached_key[recomp_index_per_batch[-1]]
                                 value[recomp_index_per_batch[-1] + (start_idx + ds)] = cached_val[recomp_index_per_batch[-1]]
@@ -1890,6 +1963,59 @@ class FlashAttentionImpl(AttentionImpl):
                 if self.layer_idx == self.blend_config.num_full_layer:
                     prefill_meta.cache_blend_static_index_cache = recomp_index_for_batches
 
+            # if (self.enable_cache_blend and self.blend_type == BlendType.RECOMPUTE_EVERY_LAYER and
+            #     self.layer_idx >= self.blend_config.recomp_layer):
+            #     num_query_head = query.shape[-2]
+            #     num_key_head = key.shape[-2]
+            #     group_size = num_query_head // num_key_head
+            #     kept_indice = []
+
+            #     cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
+            #     doc_token_ranges = prefill_meta.doc_token_ranges
+            #     docs_hash = prefill_meta.docs_hash
+            #     kvcache_paths = prefill_meta.kvcache_path
+            #     cached_offsets = prefill_meta.cached_offset
+
+            #     for idx in range(0, len(cu_seqlens_cpu) - 1):
+            #         cur_doc_ranges = doc_token_ranges[idx]
+            #         doc_hash = docs_hash[idx]
+            #         kvcache_path = kvcache_paths[idx]
+            #         cur_offset = cached_offsets[idx]
+
+            #         start_idx = cu_seqlens_cpu[idx]
+            #         end_idx = cu_seqlens_cpu[idx:idx+2][-1]
+            #         seqlen = end_idx - start_idx
+
+            #         import h5py
+            #         for doc_id,(doc_range, h, kvpath, offset) in enumerate(zip(cur_doc_ranges, doc_hash, kvcache_path, cur_offset)):
+            #             if kvpath is None or doc_id == 0:
+            #                 continue
+            #             tp_kvpath = kvpath + f"_tp{self.tp_rank}.hdf5"
+            #             ds, de = doc_range
+            #             key_tag = f'K_{h}_{self.layer_idx}'
+            #             value_tag = f'V_{h}_{self.layer_idx}'
+            #             with h5py.File(tp_kvpath, 'a') as f:
+            #                 key_np = np.array(f[key_tag])
+            #                 cached_key = self.apply_rotary(
+            #                     torch.from_numpy(key_np).to(device=key.device, dtype=key.dtype),
+            #                     ds - offset
+            #                 )
+            #                 val_np = np.array(f[value_tag])
+            #                 cached_val = torch.from_numpy(val_np).to(device=value.device, dtype=value.dtype)
+            #             ntopk = (de - ds) - int(self.blend_config.recomp_ratio * (de - ds))
+            #             diff = torch.sum(
+            #                 (key[start_idx + ds : start_idx + de] - cached_key)**2, 
+            #                 dim=[1,2]
+            #             )
+            #             doc_kept_indice = (torch.topk(diff, k=ntopk, largest=False).indices + start_idx + ds).unsqueeze(1)
+            #             topks = doc_kept_indice.shape[0]
+            #             doc_kept_indice = ((torch.arange(0, topks * group_size) % group_size).reshape(topks, -1) + doc_kept_indice * group_size).flatten()
+            #             kept_indice.append(doc_kept_indice)
+            #             del diff
+            #             del cached_key
+            #             del cached_val
+            #     cache_blend_recomp_every_layer_kept_key_index = torch.concat(kept_indice)
+
             if self.enable_pooling:
                 cu_seqlens_cpu = prefill_meta.seq_start_loc.cpu().tolist()
                 doc_token_ranges = prefill_meta.doc_token_ranges
@@ -2018,6 +2144,12 @@ class FlashAttentionImpl(AttentionImpl):
                 q_seq_start_loc, q_seq_len, k_seq_start_loc, k_seq_len = \
                     _get_query_key_seq_metadata(prefill_meta, True, attn_type)
 
+                if prefill_meta.enable_blk_attn:
+                    q_seq_start_loc = prefill_meta.blk_attn_seq_start_loc_tensor
+                    k_seq_start_loc = prefill_meta.blk_attn_seq_start_loc_tensor
+                    q_seq_len = prefill_meta.blk_attn_max_prefill_q_len
+                    k_seq_len = prefill_meta.blk_attn_max_prefill_kv_len
+
                 key = key[:num_prefill_kv_tokens]
                 value = value[:num_prefill_kv_tokens]
 
@@ -2045,6 +2177,10 @@ class FlashAttentionImpl(AttentionImpl):
                 descale_shape = (q_seq_start_loc.shape[0] - 1, key.shape[1])
                 if self.sparse_prefill_attn_type == SparsePrefillType.FULL_ATTN or (
                     kv_cache.numel() == 0 or (prefill_meta.block_tables is None)):
+                    # start_attn = torch.cuda.Event(enable_timing=True)
+                    # end_attn = torch.cuda.Event(enable_timing=True)
+                    # start_attn.record()
+                    # TODO:[shk]
                     flash_attn_varlen_func(
                         q=query,
                         k=key,
@@ -2053,6 +2189,7 @@ class FlashAttentionImpl(AttentionImpl):
                         cu_seqlens_k=k_seq_start_loc,
                         max_seqlen_q=q_seq_len,
                         max_seqlen_k=k_seq_len,
+                        batch_idx_offset_for_blk_attn=prefill_meta.batch_idx_offset_for_blk_attn_tensor if prefill_meta.enable_blk_attn else None,
                         softmax_scale=softmax_scale,
                         causal=_get_causal_option(attn_type),
                         window_size=window_size,
@@ -2064,6 +2201,19 @@ class FlashAttentionImpl(AttentionImpl):
                         k_descale=layer._k_scale.expand(descale_shape),
                         v_descale=layer._v_scale.expand(descale_shape),
                     )
+                    # end_attn.record()
+                    # torch.cuda.synchronize()
+                    # attn_duration = start_attn.elapsed_time(end_attn)
+                    # logger.info(f"===================== FA COST: attn:{attn_duration}ms ========================")
+                    
+                    if (self.dump_cache_blend_path is not None) and kv_cache.numel() > 0 and (prefill_meta.block_tables is not None):
+                        print("================== CACHE_BLEND DUMP KV FA ================")
+                        import h5py
+                        file_name = f"{self.dump_cache_blend_path}/tensor_{self.tp_rank}.hdf5"
+                        with h5py.File(file_name, 'a') as f:
+                            f.create_dataset(f'K_{self.layer_idx}', data=key.clone().detach().float().cpu().numpy())
+                            f.create_dataset(f'V_{self.layer_idx}', data=value.clone().detach().float().cpu().numpy())
+
                     if self.dump_prefill_qkv and kv_cache.numel() > 0 and (prefill_meta.block_tables is not None):
                         print("================== DUMP PREFILL QKV ================")
                         assert query.shape[0] == key.shape[0] and query.shape[0] == value.shape[0]
@@ -2073,6 +2223,154 @@ class FlashAttentionImpl(AttentionImpl):
                             f.create_dataset(f'Q_{self.layer_idx}', data=query.clone().detach().float().cpu().numpy())
                             f.create_dataset(f'V_{self.layer_idx}', data=key.clone().detach().float().cpu().numpy())
                             f.create_dataset(f'K_{self.layer_idx}', data=value.clone().detach().float().cpu().numpy())
+                elif self.sparse_prefill_attn_type == SparsePrefillType.X_ATTN:
+                    cu_seqlens_q = prefill_meta.seq_start_loc
+                    cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+
+                    # Because x_attn can only handle 1 batch_size now, we should do iteration here.
+                    qlen = None
+                    seqlen = None
+                    for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                        qs = cu_seqlens_q_cpu[query_idx]
+                        qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                        qlen = qe - qs
+
+                        current_q = query[qs : qe] # seq_len, num_head, head_dim
+                        group_size = current_q.size(-2) // key.size(-2)
+                        cur_key = key[qs : qe]
+                        cur_value = value[qs : qe]
+                        # x_attn can not handle GQA now, we should repeat key & value
+                        current_q = current_q.permute(1, 0, 2).unsqueeze(0)
+                        cur_key = torch.repeat_interleave(cur_key, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+                        cur_value = torch.repeat_interleave(cur_value, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+
+                        # copy partial_output to output
+                        # print(f"============== stride={self.sparse_prefill_attn_config.stride} ==========")
+                        partial_output = Xattention_prefill(
+                            query_states=current_q,
+                            key_states=cur_key,
+                            value_states=cur_value,
+                            stride=self.sparse_prefill_attn_config.stride,
+                            threshold=self.sparse_prefill_attn_config.threshold,
+                            block_size=self.sparse_prefill_attn_config.block_size,
+                            chunk_size=self.sparse_prefill_attn_config.chunk_size,
+                        ).squeeze(0)
+                        # print(f"================= partial_output shape: {partial_output.shape} ===========")
+                        output[qs : qe] = partial_output.permute(1, 0, 2)                        
+
+                elif self.sparse_prefill_attn_type == SparsePrefillType.FLEX_PREFILL:
+                    # Flex Prefill
+                    max_seq_len = q_seq_len
+                    block_size = self.sparse_prefill_attn_config.block_size
+                    
+                    if max_seq_len <= max(2 * block_size, math.ceil(self.sparse_prefill_attn_config.min_budget / block_size) * block_size):
+                        flash_attn_varlen_func(
+                            q=query,
+                            k=key,
+                            v=value,
+                            cu_seqlens_q=q_seq_start_loc,
+                            cu_seqlens_k=k_seq_start_loc,
+                            max_seqlen_q=q_seq_len,
+                            max_seqlen_k=k_seq_len,
+                            softmax_scale=softmax_scale,
+                            causal=_get_causal_option(attn_type),
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                            q_descale=layer._q_scale.expand(descale_shape),
+                            k_descale=layer._k_scale.expand(descale_shape),
+                            v_descale=layer._v_scale.expand(descale_shape),
+                        )
+                    else:
+                        assert logits_soft_cap == 0.0
+                        cu_seqlens_q = prefill_meta.seq_start_loc
+                        cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+
+                        for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                            qs = cu_seqlens_q_cpu[query_idx]
+                            qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                            current_q = query[qs : qe] # seq_len, num_head, head_dim
+                            # retrieve key & value from kv_cache
+                            cur_key = key[qs : qe]
+                            cur_value = value[qs : qe]
+
+                            current_q = current_q.unsqueeze(0)
+                            cur_key = cur_key.unsqueeze(0)
+                            cur_value = cur_value.unsqueeze(0)
+                            partial_output = flex_prefill_attention(
+                                q=current_q,
+                                k=cur_key,
+                                v=cur_value,
+                                gamma=self.sparse_prefill_attn_config.gamma,
+                                tau=self.sparse_prefill_attn_config.tau,
+                                min_budget=self.sparse_prefill_attn_config.min_budget,
+                                max_budget=self.sparse_prefill_attn_config.max_budget,
+                                softmax_scale=softmax_scale,
+                                block_size=self.sparse_prefill_attn_config.block_size,
+                            ).squeeze(0)
+                            output[qs : qe] = partial_output
+                elif self.sparse_prefill_attn_type == SparsePrefillType.SPARGE_ATTN:
+                    # Sparge Attention
+                    assert logits_soft_cap == 0.0
+                    cu_seqlens_q = prefill_meta.seq_start_loc
+                    cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+                    
+                    max_seq_len = q_seq_len
+                    has_short_query = False
+                    for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                        qs = cu_seqlens_q_cpu[query_idx]
+                        qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                        if qe - qs < 128:
+                            has_short_query = True
+                            break
+                    
+                    if has_short_query:
+                        flash_attn_varlen_func(
+                            q=query,
+                            k=key,
+                            v=value,
+                            cu_seqlens_q=q_seq_start_loc,
+                            cu_seqlens_k=k_seq_start_loc,
+                            max_seqlen_q=q_seq_len,
+                            max_seqlen_k=k_seq_len,
+                            softmax_scale=softmax_scale,
+                            causal=_get_causal_option(attn_type),
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                            q_descale=layer._q_scale.expand(descale_shape),
+                            k_descale=layer._k_scale.expand(descale_shape),
+                            v_descale=layer._v_scale.expand(descale_shape),
+                        )
+                    else:
+                        for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                            qs = cu_seqlens_q_cpu[query_idx]
+                            qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+
+                            current_q = query[qs : qe] # seq_len, num_head, head_dim
+                            group_size = current_q.size(-2) // key.size(-2)
+                            cur_key = key[qs : qe]
+                            cur_value = value[qs : qe]
+
+                            cur_key = torch.repeat_interleave(cur_key, repeats=group_size, dim=1).unsqueeze(0)
+                            cur_value = torch.repeat_interleave(cur_value, repeats=group_size, dim=1).unsqueeze(0)
+                            current_q = current_q.unsqueeze(0)
+
+                            partial_output = spas_sage2_attn_meansim_cuda(
+                                q=current_q,
+                                k=cur_key,
+                                v=cur_value,
+                                is_causal=True,
+                                simthreshd1=self.sparse_prefill_attn_config.simthreshd1,
+                                cdfthreshd=self.sparse_prefill_attn_config.cdfthreshd,
+                                pvthreshd=self.sparse_prefill_attn_config.pvthreshd,
+                                tensor_layout="NHD"
+                            ).squeeze(0)
+                            output[qs : qe] = partial_output
             else:
                 if self.sparse_prefill_attn_type == SparsePrefillType.FULL_ATTN:
                     # prefix-enabled attention
@@ -2125,6 +2423,253 @@ class FlashAttentionImpl(AttentionImpl):
                         import h5py
                         with h5py.File(file_name, 'a') as f:
                             f.create_dataset(f'{self.layer_idx}', data=last_attn_map.float().cpu().numpy())
+                elif self.sparse_prefill_attn_type == SparsePrefillType.MINFERENCE:
+                    assert self.sparse_attention_threshold is not None
+                    assert self.vertical_slash_config is not None
+
+                    min_seq_len = min(prefill_meta.seq_lens)
+                    max_seq_len = max(prefill_meta.seq_lens)
+                    if min_seq_len <= self.sparse_attention_threshold:
+                        flash_attn_varlen_func(  # noqa
+                            q=query,
+                            k=key_cache,
+                            v=value_cache,
+                            cu_seqlens_q=prefill_meta.query_start_loc,
+                            max_seqlen_q=prefill_meta.max_query_len,
+                            seqused_k=prefill_meta.seq_lens_tensor,
+                            max_seqlen_k=max_seq_len,
+                            softmax_scale=softmax_scale,
+                            causal=True,
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            block_table=prefill_meta.block_tables,
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                        )
+                    else:
+                        cu_seqlens_q = prefill_meta.query_start_loc
+                        cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+                        assert (prefill_meta.seq_lens_tensor is not None and 
+                                prefill_meta.seq_lens_tensor.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                                prefill_meta.block_tables is not None and
+                                prefill_meta.block_tables.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                                prefill_meta.seq_lens is not None and
+                                len(prefill_meta.seq_lens) == len(cu_seqlens_q_cpu) - 1)
+
+                        for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                            qs = cu_seqlens_q_cpu[query_idx]
+                            qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+
+                            current_q = query[qs : qe] # seq_len, num_head, head_dim
+                            current_block_table = prefill_meta.block_tables[query_idx]
+                            current_seq_len = prefill_meta.seq_lens[query_idx]
+                            assert current_q.size(-2) % key_cache.size(-2) == 0
+                            group_size = current_q.size(-2) // key_cache.size(-2)
+
+                            key = key_cache[current_block_table].view(-1, *key_cache.shape[-2:])[: current_seq_len]
+                            value = value_cache[current_block_table].view(-1, *value_cache.shape[-2:])[: current_seq_len]
+
+                            current_q = current_q.permute(1, 0, 2).unsqueeze(0)
+                            key = torch.repeat_interleave(key, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+                            value = torch.repeat_interleave(value, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+
+                            partial_output = Minference_prefill(
+                                query_states=current_q,
+                                key_states=key,
+                                value_states=value,
+                                vertical_slash_config=self.vertical_slash_config,
+                            ).squeeze(0)
+                            # print(f"================= partial_output shape: {partial_output.shape} ===========")
+                            output[qs : qe] = partial_output.permute(1, 0, 2)
+                elif self.sparse_prefill_attn_type == SparsePrefillType.X_ATTN:
+                    # X-Attention
+                    # For flash_attn: query -> nhd, while x_attn: query -> 1hnd
+                    print("XXXXXXXXXXX ============== ENABLE X_ATTN ============")
+                    cu_seqlens_q = prefill_meta.query_start_loc
+                    cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+                    assert (prefill_meta.seq_lens_tensor is not None and 
+                            prefill_meta.seq_lens_tensor.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                            prefill_meta.block_tables is not None and
+                            prefill_meta.block_tables.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                            prefill_meta.seq_lens is not None and
+                            len(prefill_meta.seq_lens) == len(cu_seqlens_q_cpu) - 1)
+
+                    # Because x_attn can only handle 1 batch_size now, we should do iteration here.
+                    qlen = None
+                    seqlen = None
+                    for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                        qs = cu_seqlens_q_cpu[query_idx]
+                        qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                        qlen = qe - qs
+
+                        current_q = query[qs : qe] # seq_len, num_head, head_dim
+                        current_block_table = prefill_meta.block_tables[query_idx]
+                        current_seq_len = prefill_meta.seq_lens[query_idx]
+                        seqlen = current_seq_len
+                        assert current_q.size(-2) % key_cache.size(-2) == 0
+                        group_size = current_q.size(-2) // key_cache.size(-2)
+                        # kvcache_block_size = key_cache.size(1)
+                        # retrieve key & value from kv_cache
+                        key = key_cache[current_block_table].view(-1, *key_cache.shape[-2:])[: current_seq_len]
+                        value = value_cache[current_block_table].view(-1, *value_cache.shape[-2:])[: current_seq_len]
+                        # x_attn can not handle GQA now, we should repeat key & value
+                        current_q = current_q.permute(1, 0, 2).unsqueeze(0)
+                        key = torch.repeat_interleave(key, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+                        value = torch.repeat_interleave(value, repeats=group_size, dim=1).permute(1, 0, 2).unsqueeze(0)
+                        # copy partial_output to output
+                        # print(f"============== stride={self.sparse_prefill_attn_config.stride} ==========")
+                        partial_output = Xattention_prefill(
+                            query_states=current_q,
+                            key_states=key,
+                            value_states=value,
+                            stride=self.sparse_prefill_attn_config.stride,
+                            threshold=self.sparse_prefill_attn_config.threshold,
+                            block_size=self.sparse_prefill_attn_config.block_size,
+                            chunk_size=self.sparse_prefill_attn_config.chunk_size,
+                        ).squeeze(0)
+                        # print(f"================= partial_output shape: {partial_output.shape} ===========")
+                        output[qs : qe] = partial_output.permute(1, 0, 2)
+
+                    if self.enable_attn_out_dump:
+                        print(f"================== ENABLE XATTN CHUNKED OUT DUMP {self.tp_rank} {self.layer_idx} {prefill_output.shape} {qlen} {seqlen} ================")
+                        assert len(prefill_meta.seq_lens) == 1
+                        import h5py
+                        file_name = f"/data/shanhaikang.shk/vllm/xattn_chunked_out_dump/tensor_{self.tp_rank}.hdf5"
+                        with h5py.File(file_name, 'a') as f:
+                            f.create_dataset(f'{self.layer_idx}_{seqlen - qlen}', data=prefill_output.clone().detach().float().cpu().numpy())
+                elif self.sparse_prefill_attn_type == SparsePrefillType.FLEX_PREFILL:
+                    # Flex Prefill
+                    print("XXXXXXXXXXXXXX ============== ENABLE FLEX_PREFILL ============")
+                    max_seq_len = max(prefill_meta.seq_lens)
+                    block_size = self.sparse_prefill_attn_config.block_size
+                    
+                    if max_seq_len <= max(2 * block_size, math.ceil(self.sparse_prefill_attn_config.min_budget / block_size) * block_size):
+                        flash_attn_varlen_func(  # noqa
+                            q=query,
+                            k=key_cache,
+                            v=value_cache,
+                            cu_seqlens_q=prefill_meta.query_start_loc,
+                            max_seqlen_q=prefill_meta.max_query_len,
+                            seqused_k=prefill_meta.seq_lens_tensor,
+                            max_seqlen_k=max_seq_len,
+                            softmax_scale=softmax_scale,
+                            causal=True,
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            block_table=prefill_meta.block_tables,
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                        )
+                    else:
+                        assert logits_soft_cap == 0.0
+                        cu_seqlens_q = prefill_meta.query_start_loc
+                        cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+                        assert (prefill_meta.seq_lens_tensor is not None and 
+                                prefill_meta.seq_lens_tensor.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                                prefill_meta.block_tables is not None and
+                                prefill_meta.block_tables.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                                prefill_meta.seq_lens is not None and
+                                len(prefill_meta.seq_lens) == len(cu_seqlens_q_cpu) - 1)
+
+                        for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                            qs = cu_seqlens_q_cpu[query_idx]
+                            qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                            current_q = query[qs : qe] # seq_len, num_head, head_dim
+                            current_block_table = prefill_meta.block_tables[query_idx]
+                            current_seq_len = prefill_meta.seq_lens[query_idx]
+                            assert current_q.size(-2) % key_cache.size(-2) == 0
+                            # retrieve key & value from kv_cache
+                            key = key_cache[current_block_table].view(-1, *key_cache.shape[-2:])[: current_seq_len]
+                            value = value_cache[current_block_table].view(-1, *value_cache.shape[-2:])[: current_seq_len]
+
+                            current_q = current_q.unsqueeze(0)
+                            key = key.unsqueeze(0)
+                            value = value.unsqueeze(0)
+                            partial_output = flex_prefill_attention(
+                                q=current_q,
+                                k=key,
+                                v=value,
+                                gamma=self.sparse_prefill_attn_config.gamma,
+                                tau=self.sparse_prefill_attn_config.tau,
+                                min_budget=self.sparse_prefill_attn_config.min_budget,
+                                max_budget=self.sparse_prefill_attn_config.max_budget,
+                                softmax_scale=softmax_scale,
+                                block_size=self.sparse_prefill_attn_config.block_size,
+                            ).squeeze(0)
+                            output[qs : qe] = partial_output
+                elif self.sparse_prefill_attn_type == SparsePrefillType.SPARGE_ATTN:
+                    print("XXXXXXXXXXXXX ============== ENABLE SPARGE_ATTN ============")
+                    # Sparge Attention
+                    assert logits_soft_cap == 0.0
+                    cu_seqlens_q = prefill_meta.query_start_loc
+                    cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
+                    assert (prefill_meta.seq_lens_tensor is not None and 
+                            prefill_meta.seq_lens_tensor.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                            prefill_meta.block_tables is not None and
+                            prefill_meta.block_tables.shape[0] == len(cu_seqlens_q_cpu) - 1 and
+                            prefill_meta.seq_lens is not None and
+                            len(prefill_meta.seq_lens) == len(cu_seqlens_q_cpu) - 1)
+                    
+                    max_seq_len = max(prefill_meta.seq_lens)
+                    has_short_query = False
+                    for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                        qs = cu_seqlens_q_cpu[query_idx]
+                        qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+                        if qe - qs < 128:
+                            has_short_query = True
+                            break
+                    
+                    if has_short_query:
+                        flash_attn_varlen_func(  # noqa
+                            q=query,
+                            k=key_cache,
+                            v=value_cache,
+                            cu_seqlens_q=prefill_meta.query_start_loc,
+                            max_seqlen_q=prefill_meta.max_query_len,
+                            seqused_k=prefill_meta.seq_lens_tensor,
+                            max_seqlen_k=max_seq_len,
+                            softmax_scale=softmax_scale,
+                            causal=True,
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            block_table=prefill_meta.block_tables,
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                        )
+                    else:
+                        for query_idx in range(0, len(cu_seqlens_q_cpu) - 1):
+                            qs = cu_seqlens_q_cpu[query_idx]
+                            qe = cu_seqlens_q_cpu[query_idx : query_idx + 2][-1]
+
+                            current_q = query[qs : qe] # seq_len, num_head, head_dim
+                            current_block_table = prefill_meta.block_tables[query_idx]
+                            current_seq_len = prefill_meta.seq_lens[query_idx]
+                            assert current_q.size(-2) % key_cache.size(-2) == 0
+                            group_size = current_q.size(-2) // key_cache.size(-2)
+                            key = key_cache[current_block_table].view(-1, *key_cache.shape[-2:])[: current_seq_len]
+                            value = value_cache[current_block_table].view(-1, *value_cache.shape[-2:])[: current_seq_len]
+
+                            key = torch.repeat_interleave(key, repeats=group_size, dim=1).unsqueeze(0)
+                            value = torch.repeat_interleave(value, repeats=group_size, dim=1).unsqueeze(0)
+                            current_q = current_q.unsqueeze(0)
+
+                            partial_output = spas_sage2_attn_meansim_cuda(
+                                q=current_q,
+                                k=key,
+                                v=value,
+                                is_causal=True,
+                                simthreshd1=self.sparse_prefill_attn_config.simthreshd1,
+                                cdfthreshd=self.sparse_prefill_attn_config.cdfthreshd,
+                                pvthreshd=self.sparse_prefill_attn_config.pvthreshd,
+                                tensor_layout="NHD"
+                            ).squeeze(0)
+                            output[qs : qe] = partial_output
+                else:
+                    raise ValueError(f"Unsupported sparse prefill type: {self.sparse_prefill_attn_type}")
+
 
                 
         if decode_meta := attn_metadata.decode_metadata:

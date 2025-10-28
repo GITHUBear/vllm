@@ -6,7 +6,9 @@ from .x_attn_triton_kernel import (
     flat_group_gemm_fuse_reshape,
 )
 from block_sparse_attn import block_sparse_attn_func
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 
 def find_blocks_chunked(
     input_tensor, current_index, threshold, num_to_choose, decoding: bool, mode: str = "both", causal=True
@@ -204,10 +206,10 @@ def xattn_estimate(
     attn_sum_list = []
     simple_mask_list = []
 
-    if use_triton and (
-        "100" not in torch.cuda.get_device_properties(torch.cuda.current_device()).name
-    ):
-        use_triton = False
+    # if use_triton and (
+    #     "100" not in torch.cuda.get_device_properties(torch.cuda.current_device()).name
+    # ):
+    #     use_triton = False
         # print(
         #     "setting use triton to false. Triton kernel not surpported on this device"
         # )
@@ -476,6 +478,10 @@ def Xattention_prefill(
     keep_sink=False,
     keep_recent=False,
 ):
+    start_prepare = torch.cuda.Event(enable_timing=True)
+    end_prepare = torch.cuda.Event(enable_timing=True)
+    start_attn = torch.cuda.Event(enable_timing=True)
+    end_attn = torch.cuda.Event(enable_timing=True)
     # bhnd
     batch_size, num_heads, k_len, head_dim = key_states.shape
     _, _, q_len, _ = query_states.shape
@@ -492,6 +498,7 @@ def Xattention_prefill(
                 2048,
             )
         )
+    start_prepare.record()
     attn_sums, approx_simple_mask = xattn_estimate(
         query_states,
         key_states,
@@ -507,6 +514,9 @@ def Xattention_prefill(
         keep_sink=keep_sink,
         keep_recent=keep_recent,
     )
+    end_prepare.record()
+    torch.cuda.synchronize()
+    prepare_duration = start_prepare.elapsed_time(end_prepare)
 
     if query_states.device != key_states.device:
         key_states = key_states.to(query_states.device)
@@ -538,6 +548,7 @@ def Xattention_prefill(
     assert value_states.device == query_states.device
     assert approx_simple_mask.device == query_states.device
 
+    start_attn.record()
     attn_output = block_sparse_attn_func(
         query_states,
         key_states,
@@ -553,6 +564,11 @@ def Xattention_prefill(
         deterministic=True,
         is_causal=causal,
     )
+    end_attn.record()
+    torch.cuda.synchronize()
+    attn_duration = start_attn.elapsed_time(end_attn)
+    logger.info(f"===================== XATTN COST: prepare:{prepare_duration}ms attn:{attn_duration}ms ========================")
+
     attn_output = attn_output.view(batch_size, q_len, num_heads, head_dim).transpose(
         1, 2
     )

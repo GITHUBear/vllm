@@ -534,6 +534,7 @@ class Scheduler:
         sparse_index_recompute_step: int = None,
         kv_compress_num_sample_tokens: int = None,
         block_sparse_enable_recitification: bool = False,
+        enable_blk_attn_prefill: bool = False,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -541,6 +542,7 @@ class Scheduler:
         # simple and NOT fair. It can lead to starvation of some
         # LoRAs. This should be improved in the future.
         self.lora_config = lora_config
+        self.enable_blk_attn_prefill = enable_blk_attn_prefill
 
         version = "selfattn"
         if (self.scheduler_config.runner_type == "pooling"
@@ -1859,6 +1861,20 @@ class Scheduler:
                                 docs_hash.append(None)
                         if missed_cnt > 0:
                             logger.info(f"REQ:[{seq_group.request_id}] missed {missed_cnt} docs in {len(doc_ranges)}")
+
+                if self.enable_blk_attn_prefill and is_prompt:
+                    assert (not self.scheduler_config.chunked_prefill_enabled)
+                    seqs = seq_group.get_seqs()
+                    assert len(seqs) == 1
+                    if "doc_ranges" not in seqs[0].inputs:
+                        doc_ranges = None
+                    else:
+                        doc_ranges = seqs[0].inputs["doc_ranges"]
+                    
+                    if doc_ranges is not None:
+                        if doc_ranges[0][0] != 0:
+                            doc_ranges = [(0, doc_ranges[0][0])] + doc_ranges
+                        # TODO:[shk] 类似 common_computed_block_nums 判断 doc_ranges 缓存命中情况
 
                 if self.cache_config.enable_pooling:
                     assert (not self.scheduler_config.chunked_prefill_enabled)

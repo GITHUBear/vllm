@@ -478,6 +478,9 @@ class OpenAIServing:
                     "do_lower_case", False)):
             prompt = prompt.lower()
 
+        if self.model_config.enable_blk_attn and self.model_config.blk_attn_special_tokens is not None:
+            prompt = self.model_config.blk_attn_special_tokens + prompt
+
         doc_sep = "<|DOC_SEP|>"
         tokenizer.add_tokens([doc_sep])
         doc_sep_id = tokenizer.convert_tokens_to_ids(doc_sep)

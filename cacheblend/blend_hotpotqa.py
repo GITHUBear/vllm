@@ -75,6 +75,7 @@ with open('./hotpotqa_sample.json', 'r', encoding='utf-8') as f:
         input_prompt += doc
         input_prompt += "<|DOC_SEP|>"
     input_prompt += es
+    # input_prompt += "\n\n你的任务是用列表的形式输出相关的文档编号，文档编号在文本中以Passage 序号的形式给出，无需回答问题，无需添加解释说明"
 
 call_llm_gen(input_prompt)
         # exit(0)

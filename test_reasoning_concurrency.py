@@ -1,35 +1,18 @@
-import requests
-import json
+import asyncio
+import httpx
 import time
+from typing import List, Dict, Any
 
-API_ENDPOINT = "http://127.0.0.1:8000/v1/chat/completions"
+# ----------------------------
+# 配置参数
+# ----------------------------
+BASE_URL = "http://localhost:8000/v1/chat/completions"
 API_KEY = "your-api-key"
-
-headers = {
+HEADERS = {
     "Content-Type": "application/json",
     "Authorization": f"Bearer {API_KEY}"
 }
-
-prompt_template = "You are given a math problem.\n\nProblem: {question}\n\n You need to solve the problem step by step. First, you need to provide the chain-of-thought, then provide the final answer.\n\n Provide the final answer in the format: Final answer:  \\boxed{{}}"
-question = "Let $ABCD$ be a tetrahedron such that $AB=CD= \\sqrt{41}$, $AC=BD= \\sqrt{80}$, and $BC=AD= \\sqrt{89}$. There exists a point $I$ inside the tetrahedron such that the distances from $I$ to each of the faces of the tetrahedron are all equal. This distance can be written in the form $\\frac{m \\sqrt n}{p}$, where $m$, $n$, and $p$ are positive integers, $m$ and $p$ are relatively prime, and $n$ is not divisible by the square of any prime. Find $m+n+p$."
-
-block_system_prompt1 = (
-    "You are an intelligent AI assistant. Please answer questions based on the user's instructions. Below are some reference documents that may help you in answering the user's question.\n\n"
-    "<|DOC_SEP|>- Title: Scott Derrickson\nScott Derrickson (born July 16, 1966) is an American director, screenwriter and producer. He lives in Los Angeles, California. He is best known for directing horror films such as \"Sinister\", \"The Exorcism of Emily Rose\", and \"Deliver Us From Evil\", as well as the 2016 Marvel Cinematic Universe installment, \"Doctor Strange.\"\n<|DOC_SEP|>"
-    "<|DOC_SEP|>- Title: Conrad Brooks\nConrad Brooks (born Conrad Biedrzycki on January 3, 1931 in Baltimore, Maryland) is an American actor. He moved to Hollywood, California in 1948 to pursue a career in acting. He got his start in movies appearing in Ed Wood films such as \"Plan 9 from Outer Space\", \"Glen or Glenda\", and \"Jail Bait.\" He took a break from acting during the 1960s and 1970s but due to the ongoing interest in the films of Ed Wood, he reemerged in the 1980s and has become a prolific actor. He also has since gone on to write, produce and direct several films.\n<|DOC_SEP|>"
-    "<|DOC_SEP|>- Title: Ed Wood (film)\nEd Wood is a 1994 American biographical period comedy-drama film directed and produced by Tim Burton, and starring Johnny Depp as cult filmmaker Ed Wood. The film concerns the period in Wood's life when he made his best-known films as well as his relationship with actor Bela Lugosi, played by Martin Landau. Sarah Jessica Parker, Patricia Arquette, Jeffrey Jones, Lisa Marie, and Bill Murray are among the supporting cast.\n<|DOC_SEP|>"
-    "<|DOC_SEP|>- Title: Ed Wood\nEdward Davis Wood Jr. (October 10, 1924 – December 10, 1978) was an American filmmaker, actor, writer, producer, and director.\n<|DOC_SEP|>"
-    "<|DOC_SEP|>- Title: Adam Collis\nAdam Collis is an American filmmaker and actor. He attended the Duke University from 1986 to 1990 and the University of California, Los Angeles from 2007 to 2010. He also studied cinema at the University of Southern California from 1991 to 1997. Collis first work was the assistant director for the Scott Derrickson's short \"Love in the Ruins\" (1995). In 1998, he played \"Crankshaft\" in Eric Koyanagi's \"Hundred Percent\".\n<|DOC_SEP|>"
-    "<|DOC_SEP|>- Title: Doctor Strange (2016 film)\nDoctor Strange is a 2016 American superhero film based on the Marvel Comics character of the same name, produced by Marvel Studios and distributed by Walt Disney Studios Motion Pictures. It is the fourteenth film of the Marvel Cinematic Universe (MCU). The film was directed by Scott Derrickson, who wrote it with Jon Spaihts and C. Robert Cargill, and stars Benedict Cumberbatch as Stephen Strange, along with Chiwetel Ejiofor, Rachel McAdams, Benedict Wong, Michael Stuhlbarg, Benjamin Bratt, Scott Adkins, Mads Mikkelsen, and Tilda Swinton. In \"Doctor Strange\", surgeon Strange learns the mystic arts after a career-ending car accident.\n<|DOC_SEP|>"
-    "<|DOC_SEP|>- Title: Tyler Bates\nTyler Bates (born June 5, 1965) is an American musician, music producer, and composer for films, television, and video games. Much of his work is in the action and horror film genres, with films like \"Dawn of the Dead, 300, Sucker Punch,\" and \"John Wick.\" He has collaborated with directors like Zack Snyder, Rob Zombie, Neil Marshall, William Friedkin, Scott Derrickson, and James Gunn. With Gunn, he has scored every one of the director's films; including \"Guardians of the Galaxy\", which became one of the highest grossing domestic movies of 2014, and its 2017 sequel. In addition, he is also the lead guitarist of the American rock band Marilyn Manson, and produced its albums \"The Pale Emperor\" and \"Heaven Upside Down\".\n<|DOC_SEP|>"
-    "<|DOC_SEP|>- Title: Deliver Us from Evil (2014 film)\nDeliver Us from Evil is a 2014 American supernatural horror film directed by Scott Derrickson and produced by Jerry Bruckheimer. The film is officially based on a 2001 non-fiction book entitled \"Beware the Night\" by Ralph Sarchie and Lisa Collier Cool, and its marketing campaign highlighted that it was \"inspired by actual accounts\". The film stars Eric Bana, Édgar Ramírez, Sean Harris, Olivia Munn, and Joel McHale in the main roles and was released on July 2, 2014.\n<|DOC_SEP|>"
-    "<|DOC_SEP|>- Title: Woodson, Arkansas\nWoodson is a census-designated place (CDP) in Pulaski County, Arkansas, in the United States. Its population was 403 at the 2010 census. It is part of the Little Rock–North Little Rock–Conway Metropolitan Statistical Area. Woodson and its accompanying Woodson Lake and Wood Hollow are the namesake for Ed Wood Sr., a prominent plantation owner, trader, and businessman at the turn of the 20th century. Woodson is adjacent to the Wood Plantation, the largest of the plantations own by Ed Wood Sr.\n<|DOC_SEP|>"
-    "<|DOC_SEP|>- Title: Sinister (film)\nSinister is a 2012 supernatural horror film directed by Scott Derrickson and written by Derrickson and C. Robert Cargill. It stars Ethan Hawke as fictional true-crime writer Ellison Oswalt who discovers a box of home movies in his attic that puts his family in danger.\n<|DOC_SEP|>"
-)
-user_prompt1 = (
-    "Answer the question based on the given passages. Only give me the answer and do not output any other words.\nQuestion: Were Scott Derrickson and Ed Wood of the same nationality?\n"
-)
-block_system_prompt2 = (
+block_system_prompt = (
     "You are an intelligent AI assistant. Please answer questions based on the user's instructions. Below are some reference documents that may help you in answering the user's question.\n\n"
     "<|DOC_SEP|>- Title: Trusty system (prison)\nThe \"trusty system\" (sometimes incorrectly called \"trustee system\") was a penitentiary system of discipline and security enforced in parts of the United States until the 1980s, in which designated inmates were given various privileges, abilities, and responsibilities not available to all inmates.It was made compulsory under Mississippi state law but was used in other states as well, such as Arkansas, Alabama, Louisiana, New York and Texas. The method of controlling and working inmates at Mississippi State Penitentiary at Parchman was designed in 1901 to replace convict leasing. The case Gates v. Collier ended the flagrant abuse of inmates under the trusty system and other prison abuses that had continued essentially unchanged since the building of the Mississippi State Penitentiary. Other states using the trusty system were also forced to give it up under the ruling.\n\nHistory\nPrisons had trusties as far back as the 1800s.\n\nParchman Farm\nThe prison had approximately 16,000 acres (65 km2) of farmland and grew such cash crops as cotton as well as engaged in livestock production. Although the population of the prison was around 1,900 inmates (two thirds of whom were black and in racially-segregated units), the law allowed only a maximum of 150 staff members to be hired to minimize operating costs. Thus, the farm labor was done by inmates.The bulk of guarding and disciplining of the inmates was performed by inmate trusties. They also performed most of the administrative work, supervised by a few employees. Therefore, the inmate trusties essentially controlled inmate care and custody, basically running the prison system.Highest in the prison inmate hierarchy were the inmates armed with rifles, called the \"trusty shooters\". Their job was to act as prison guards and control other inmates on a day-to-day basis in the residential camps or out on the field work crews. Next came the unarmed trusties who performed janitorial, clerical, and other menial tasks for the prison's staff. Simple tasks, such as distributing medication, were carried out by other categories of inmates such as \"hallboys\". Inmate trusties enforced discipline within the prison inmate living quarters (16 different residential camps) and in the work camps and prison farms. In addition to punishment administered on site, inmate trusties could recommend further punishment in the special punishment area for disobedient or disruptive inmates.According to attorney Roy Haber, who handled the series of litigation cases brought by the American Civil Liberties Union against the trusty system, inmates were whipped with leather straps for failing to pick their daily quota of cotton. The farm's camps of black inmates were supervised by one white sergeant, and under him the black inmate \"trusty shooters\", who were serving sentences for murder, carried rifles and enforced discipline.\n\nAbolition\nGates v. Collier (Gates v. Collier Prison Reform Case, 1970–1971) ended the flagrant abuse of inmates under the trusty system and other prison abuses that had continued essentially unchanged since the building of the prison in 1903. On October 20, 1972, Federal Judge William Keady ordered the end of racial segregation in prison residential quarters. He also required replacement of trusty shooters with civilian prison guards.Any system in which inmates were allowed to be in a position of authority and control other inmates or to use physical abuse or intimidation of other inmates was abolished. It also found some types of corporal punishment were a violation of an inmate's Eighth Amendment rights, including \"handcuffing inmates to the fence and to cells for, long periods of time,... and forcing inmates to stand, sit or lie on crates, stumps, or otherwise maintain awkward positions for prolonged periods.\"Its structure and abuses were detailed in Hope v. Pelzer in which a former inmate sued the prison superintendent for personal injury suffered under the trusty system.Other states using the trusty system, such as Arkansas, Alabama, Louisiana, and Texas were also forced to abolish it under the Gates v. Collier rulings. However, some states, such as Texas, still continued their use of trusty systems (known as \"building tenders\") until the 1980s, when Federal Judge William Wayne Justice, in Ruiz v. Estelle, 503 F. Supp. 1265 (S.D. Tex. 1980), compelled the replacement of the trusty system with the strictly-regulated Support Service Inmate (SSI) system.\n\nSee also\n\"Parchman Farm\" (song)\nLouisiana State Penitentiary\nKapo\n<|DOC_SEP|>"
     "<|DOC_SEP|>- Title: Brockmeyer v. Dun &amp; Bradstreet\nBrockmeyer v. Dun & Bradstreet 113 Wis. 2d 561, 335 N.W.2d 834 (Wis. 1983), was a case in which the Wisconsin Supreme Court first identified that Wisconsin has some judicial exceptions to the employment at will doctrine.\n\nFacts\nCharles J. Brockmeyer was employed at investment firm Dun & Bradstreet as a district manager of credit services, though he lacked a formal employment contract. After the employer settled a sex discrimination suit filed by the employee's former secretary, with whom he allegedly had an affair, the employer fired the employee. The court held that it was appropriate to create a public policy exception to the employment-at-will doctrine, as the termination had clearly violated a well-defined public policy, as evidenced by existing law. While the employer's actions may have constituted bad faith, they did not contravene the policies of any statute or constitutional provision. As the employee failed to prove that his discharge violated fundamental public policy, the decision for the employer was appropriate.\n\nHolding\nThe court affirmed the decision of the lower court in favor of the employer.\n\nCitations\nThe case is cited in Bammert v. Don's Super Valu, Inc.\n<|DOC_SEP|>"
@@ -42,52 +25,86 @@ block_system_prompt2 = (
     "<|DOC_SEP|>- Title: WN Hillas &amp; Co Ltd v Arcos Ltd\nWN Hillas & Co Ltd v Arcos Ltd [1932] UKHL 2 is a landmark House of Lords case on English contract law where the court first began to move away from a strict, literal interpretation of the terms of a contract, and instead interpreted it with a view to preserve the bargain. The Court ruled that judges may imply terms into a contract based on the past dealings of the parties rather than void the agreement.\nLord Wright stated in this case that people who give good consideration can bind themselves to a duty to negotiate in good faith, but this view was controversially rejected in a later House of Lords case, Walford v Miles (1992).Hillas & Company were merchants purchasing timber from Arcos. Hillas and Arcos reached an agreement to purchase 22,000 standards of timber, under the specific condition that they should also have the option of entering into a contract with Arcos to purchase 100,000 standards the following year with a 5% reduction on price. Arcos refused to sell them the 100,000 standards the following year. Hillas was successful at trial, which Arcos appealed successfully to the Court of Appeal.\n\nSee also\nG Scammell & Nephew Ltd v Ouston [1941] 1 AC 251\nSmith v Hughes (1871) LR 6 QB 597\nHartog v Colin & Shields [1939] 3 All ER 566\nFrederick E Rose (London) Ltd v William H Pim Junior & Co Ltd [1953] 2 QB 450\n\nNotes\nExternal links\nFull text of decision from Bailii.org\n<|DOC_SEP|>"
     "<|DOC_SEP|>- Title: Fletcher v. Peck\nFletcher v. Peck, 10 U.S. (6 Cranch) 87 (1810), was a landmark United States Supreme Court decision in which the Supreme Court first ruled a state law unconstitutional. The decision created a growing precedent for the sanctity of legal contracts and hinted that Native Americans did not hold complete title to their own lands (an idea fully realized in Johnson v. McIntosh).\n\nYazoo lands sales\nFollowing the Treaty of Paris ending the American Revolution, Georgia claimed possession of the Yazoo lands, a 54,000 sq mi (140,000 km2) region of the Indian Reserve, west of its own territory. The land later became the northern part of the states of Alabama and Mississippi.\nIn 1795, the Georgia legislature divided the area into four tracts. The state then sold the tracts to four separate land development companies for $500,000, about $0.014 per acre, a bargain even at 1790 prices. The Georgia legislature overwhelmingly approved this land grant, known as the Yazoo Land Act of 1795. However, it was later revealed that the Yazoo Land Act had been approved in return for bribes in a scandal known as the Yazoo Land Scandal. The voters rejected most of the incumbents in the next election; the new legislature, reacting to the public outcry, repealed the law and voided the transactions made under it.\nRobert Fletcher and especially John Peck were speculators in the Yazoo lands. Fletcher bought a tract of land from Peck after the 1795 act was repealed. Fletcher, in 1803, brought a suit against Peck, claiming that Peck had not had clear title to the land when he sold it.\nThere was collusion between the two. Both would have their land secured if the Supreme Court decided that Native Americans did not hold original title. Fletcher set out to win the case.\n\nCourt ruling\nThe Supreme Court unanimously (with a separate concurring opinion written by William Johnson) ruled that the legislature's repeal of the law was unconstitutional. John Marshall wrote that the sale was a binding contract, which under Article I, Section 10, Clause I (the Contract Clause) of the Constitution, cannot be invalidated even if it is illegally secured.\nThe ruling lent further protection to property rights against popular pressure and is the earliest case of the Court asserting its right to invalidate state laws which are in conflict with or are otherwise contrary to the Constitution. A later Chief Justice, William H. Rehnquist, wrote that Fletcher v. Peck \"represented an attempt by Chief Justice Marshall to extend the protection of the contract clause to infant business\".\n\nSee also\nList of United States Supreme Court cases, volume 10\nYazoo land scandal\n<|DOC_SEP|>"
 )
-user_prompt2 = (
+user_prompt = (
     "Answer the question based on the given passages. Only give me the answer and do not output any other words.\nQuestion: Which case was brought to court first Miller v. California or Gates v. Collier ?\n"
 )
+# block_system_prompt = (
+#     "You are an intelligent AI assistant. Please answer questions based on the user's instructions. Below are some reference documents that may help you in answering the user's question.\n\n"
+#     "<|DOC_SEP|>- Title: Scott Derrickson\nScott Derrickson (born July 16, 1966) is an American director, screenwriter and producer. He lives in Los Angeles, California. He is best known for directing horror films such as \"Sinister\", \"The Exorcism of Emily Rose\", and \"Deliver Us From Evil\", as well as the 2016 Marvel Cinematic Universe installment, \"Doctor Strange.\"\n<|DOC_SEP|>"
+#     "<|DOC_SEP|>- Title: Conrad Brooks\nConrad Brooks (born Conrad Biedrzycki on January 3, 1931 in Baltimore, Maryland) is an American actor. He moved to Hollywood, California in 1948 to pursue a career in acting. He got his start in movies appearing in Ed Wood films such as \"Plan 9 from Outer Space\", \"Glen or Glenda\", and \"Jail Bait.\" He took a break from acting during the 1960s and 1970s but due to the ongoing interest in the films of Ed Wood, he reemerged in the 1980s and has become a prolific actor. He also has since gone on to write, produce and direct several films.\n<|DOC_SEP|>"
+#     "<|DOC_SEP|>- Title: Ed Wood (film)\nEd Wood is a 1994 American biographical period comedy-drama film directed and produced by Tim Burton, and starring Johnny Depp as cult filmmaker Ed Wood. The film concerns the period in Wood's life when he made his best-known films as well as his relationship with actor Bela Lugosi, played by Martin Landau. Sarah Jessica Parker, Patricia Arquette, Jeffrey Jones, Lisa Marie, and Bill Murray are among the supporting cast.\n<|DOC_SEP|>"
+#     "<|DOC_SEP|>- Title: Ed Wood\nEdward Davis Wood Jr. (October 10, 1924 – December 10, 1978) was an American filmmaker, actor, writer, producer, and director.\n<|DOC_SEP|>"
+#     "<|DOC_SEP|>- Title: Adam Collis\nAdam Collis is an American filmmaker and actor. He attended the Duke University from 1986 to 1990 and the University of California, Los Angeles from 2007 to 2010. He also studied cinema at the University of Southern California from 1991 to 1997. Collis first work was the assistant director for the Scott Derrickson's short \"Love in the Ruins\" (1995). In 1998, he played \"Crankshaft\" in Eric Koyanagi's \"Hundred Percent\".\n<|DOC_SEP|>"
+#     "<|DOC_SEP|>- Title: Doctor Strange (2016 film)\nDoctor Strange is a 2016 American superhero film based on the Marvel Comics character of the same name, produced by Marvel Studios and distributed by Walt Disney Studios Motion Pictures. It is the fourteenth film of the Marvel Cinematic Universe (MCU). The film was directed by Scott Derrickson, who wrote it with Jon Spaihts and C. Robert Cargill, and stars Benedict Cumberbatch as Stephen Strange, along with Chiwetel Ejiofor, Rachel McAdams, Benedict Wong, Michael Stuhlbarg, Benjamin Bratt, Scott Adkins, Mads Mikkelsen, and Tilda Swinton. In \"Doctor Strange\", surgeon Strange learns the mystic arts after a career-ending car accident.\n<|DOC_SEP|>"
+#     "<|DOC_SEP|>- Title: Tyler Bates\nTyler Bates (born June 5, 1965) is an American musician, music producer, and composer for films, television, and video games. Much of his work is in the action and horror film genres, with films like \"Dawn of the Dead, 300, Sucker Punch,\" and \"John Wick.\" He has collaborated with directors like Zack Snyder, Rob Zombie, Neil Marshall, William Friedkin, Scott Derrickson, and James Gunn. With Gunn, he has scored every one of the director's films; including \"Guardians of the Galaxy\", which became one of the highest grossing domestic movies of 2014, and its 2017 sequel. In addition, he is also the lead guitarist of the American rock band Marilyn Manson, and produced its albums \"The Pale Emperor\" and \"Heaven Upside Down\".\n<|DOC_SEP|>"
+#     "<|DOC_SEP|>- Title: Deliver Us from Evil (2014 film)\nDeliver Us from Evil is a 2014 American supernatural horror film directed by Scott Derrickson and produced by Jerry Bruckheimer. The film is officially based on a 2001 non-fiction book entitled \"Beware the Night\" by Ralph Sarchie and Lisa Collier Cool, and its marketing campaign highlighted that it was \"inspired by actual accounts\". The film stars Eric Bana, Édgar Ramírez, Sean Harris, Olivia Munn, and Joel McHale in the main roles and was released on July 2, 2014.\n<|DOC_SEP|>"
+#     "<|DOC_SEP|>- Title: Woodson, Arkansas\nWoodson is a census-designated place (CDP) in Pulaski County, Arkansas, in the United States. Its population was 403 at the 2010 census. It is part of the Little Rock–North Little Rock–Conway Metropolitan Statistical Area. Woodson and its accompanying Woodson Lake and Wood Hollow are the namesake for Ed Wood Sr., a prominent plantation owner, trader, and businessman at the turn of the 20th century. Woodson is adjacent to the Wood Plantation, the largest of the plantations own by Ed Wood Sr.\n<|DOC_SEP|>"
+#     "<|DOC_SEP|>- Title: Sinister (film)\nSinister is a 2012 supernatural horror film directed by Scott Derrickson and written by Derrickson and C. Robert Cargill. It stars Ethan Hawke as fictional true-crime writer Ellison Oswalt who discovers a box of home movies in his attic that puts his family in danger.\n<|DOC_SEP|>"
+# )
+# user_prompt = (
+#     "Answer the question based on the given passages. Only give me the answer and do not output any other words.\nQuestion: Were Scott Derrickson and Ed Wood of the same nationality?\n"
+# )
 
-data = {
-    # "model": "/data/shanhaikang.shk/modelscope/qwen25_32b",
-    "model": "/data/shanhaikang.shk/Block-Attention/save_dir/checkpoint-1201",
-    # "model": "/data/shanhaikang.shk/modelscope/qwq32b",
-    # "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
-    "messages": [
-        {"role": "system", "content": block_system_prompt2},
-        {"role": "user", "content": user_prompt2},
-        # {"role": "user", "content": prompt_template.format(question=question)},
-        # {"role": "user", "content": prompt},
-    ],
-    "temperature": 0.8,
-    "stream": True,
-    # "ignore_eos": True,
-    # "max_tokens": 65537,
-}
+# 多个对话任务
+CONVERSATIONS = [
+    {
+        "model": "/data/shanhaikang.shk/Block-Attention/save_dir/checkpoint-1201",
+        "messages": [
+            {"role": "system", "content": block_system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.8,
+        "stream": True
+    },
+] * 20
 
-ttft = 0.0
-st = time.perf_counter()
-try:
-    with requests.post(API_ENDPOINT, headers=headers, json=data, stream=True) as response:
-        if response.status_code != 200:
-            print(f"请求失败，状态码：{response.status_code}")
-            print(response.text)
-            exit(1)
+# ----------------------------
+# 异步函数：处理单个流式请求，测量 TTFT
+# ----------------------------
+async def process_conversation(client: httpx.AsyncClient, conv_data: dict, idx: int):
+    print(f"[请求 {idx}] 开始...")
+    start_time = time.perf_counter()
+    first_token = False
 
-        for line in response.iter_lines():
-            if ttft == 0.0:
-                ttft = time.perf_counter() - st
-            if line:
-                line_str = line.decode('utf-8')
-                if line_str.startswith("data: [DONE]"):
-                    break
-                if line_str.startswith("data: "):
+    try:
+        # ✅ 使用 .stream() 方法开启流式请求
+        async with client.stream("POST", BASE_URL, json=conv_data) as response:
+            if response.status_code != 200:
+                print(f"[请求 {idx}] 失败，状态码: {response.status_code}")
+                return
+
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line or line == "data: [DONE]" or line == "[DONE]":
+                    continue
+                if line.startswith("data:"):
+                    text = line[5:].strip()  # 去掉 "data:" 前缀
+                    if text.startswith("[DONE]"):
+                        break
                     try:
-                        data_json = json.loads(line_str[6:])
-                        content = data_json.get('choices', [{}])[0].get('delta', {}).get('content', '')
-                        if content:
-                            print(content, end='', flush=True)
-                    except json.JSONDecodeError as e:
-                        print(f"JSON 解析错误: {e}")
-except requests.exceptions.RequestException as e:
-    print(f"请求异常: {e}")
+                        import json
+                        data = json.loads(text)
+                        content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if content and not first_token:
+                            ttft = time.perf_counter() - start_time
+                            print(f"[请求 {idx}] TTFT: {ttft:.4f} 秒")
+                            first_token = True
+                    except Exception as e:
+                        pass  # 忽略解析错误
+    except Exception as e:
+        print(f"[请求 {idx}] 异常: {e}")
 
-print(f"\nTTFT: {ttft} s")
+# ----------------------------
+# 主函数：批量并发执行
+# ----------------------------
+async def main():
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0), headers=HEADERS) as client:
+        tasks = [
+            process_conversation(client, conv, i)
+            for i, conv in enumerate(CONVERSATIONS)
+        ]
+        await asyncio.gather(*tasks)
+
+# 运行
+if __name__ == "__main__":
+    asyncio.run(main())

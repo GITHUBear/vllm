@@ -426,6 +426,9 @@ class EngineArgs:
     enable_blend_prepare: bool = CacheConfig.enable_blend_prepare
     enable_cache_blend: bool = CacheConfig.enable_cache_blend
 
+    enable_blk_attn: bool = ModelConfig.enable_blk_attn
+    blk_attn_special_tokens: Optional[str] = ModelConfig.blk_attn_special_tokens
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -532,6 +535,13 @@ class EngineArgs:
         model_group.add_argument("--model-impl",
                                  choices=[f.value for f in ModelImpl],
                                  **model_kwargs["model_impl"])
+        model_group.add_argument(
+            "--enable-blk-attn", 
+            action="store_true",
+            default=EngineArgs.enable_blk_attn,
+            help="Enbale Block Attention.")
+        model_group.add_argument("--blk-attn-special-tokens",
+                                 **model_kwargs["blk_attn_special_tokens"])
 
         # Model loading arguments
         load_kwargs = get_kwargs(LoadConfig)
@@ -925,6 +935,8 @@ class EngineArgs:
             override_generation_config=self.override_generation_config,
             enable_sleep_mode=self.enable_sleep_mode,
             model_impl=self.model_impl,
+            enable_blk_attn=self.enable_blk_attn,
+            blk_attn_special_tokens=self.blk_attn_special_tokens,
         )
 
     def create_load_config(self) -> LoadConfig:

@@ -409,6 +409,12 @@ class ModelConfig:
     - "vllm" will use the vLLM model implementation.\n
     - "transformers" will use the Transformers model implementation."""
 
+    # For models that support block attention:
+    enable_blk_attn: bool = False
+    """If `True`, this model supports block attention."""
+    blk_attn_special_tokens: Optional[str] = None
+    """The special tokens prefix for prompt."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
