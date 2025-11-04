@@ -8,7 +8,7 @@ from typing import Final, Optional, Union, cast
 
 from fastapi import Request
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, CacheConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import (
@@ -150,6 +150,7 @@ class OpenAIServingTranscription(OpenAIServing):
         self,
         engine_client: EngineClient,
         model_config: ModelConfig,
+        cache_config: CacheConfig,
         models: OpenAIServingModels,
         *,
         request_logger: Optional[RequestLogger],
@@ -157,6 +158,7 @@ class OpenAIServingTranscription(OpenAIServing):
     ):
         super().__init__(engine_client=engine_client,
                          model_config=model_config,
+                         cache_config=cache_config,
                          models=models,
                          request_logger=request_logger,
                          return_tokens_as_token_ids=return_tokens_as_token_ids)

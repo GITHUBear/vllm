@@ -163,7 +163,8 @@ class BlockAllocator(ABC):
 
     @abstractmethod
     def mark_blocks_as_accessed(self, block_ids: List[int],
-                                now: float) -> None:
+                                now: float,
+                                chunk_hashes: Optional[List[str]] = None) -> None:
         pass
 
     @abstractmethod
@@ -264,7 +265,8 @@ class DeviceAwareBlockAllocator(ABC):
 
     @abstractmethod
     def mark_blocks_as_accessed(self, block_ids: List[int],
-                                now: float) -> None:
+                                now: float,
+                                chunk_hashes: Optional[List[str]] = None) -> None:
         pass
 
     @abstractmethod

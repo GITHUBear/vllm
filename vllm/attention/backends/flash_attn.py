@@ -606,7 +606,7 @@ class FlashAttentionMetadataBuilder(
             # only allowing multiple of block_size chunk size.
             # NOTE: This only works for oooooooxxx style attention.
             block_table = []
-            if prefix_cache_hit:
+            if prefix_cache_hit or (self.enble_blk_attn and block_tables is not None):
                 # NOTE(woosuk): For flash-attn, the block table should
                 # include the entries for the incoming prefill tokens.
                 block_table = block_tables[seq_id]

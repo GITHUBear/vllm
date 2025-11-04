@@ -5,6 +5,7 @@ from typing import List, Optional
 
 from vllm.core.block.common import BlockList
 from vllm.core.block.interfaces import Block, DeviceAwareBlockAllocator
+from vllm.core.block.chunk_block import ChunkAllocationInfo
 from vllm.utils import Device, cdiv, chunk_list
 
 
@@ -47,8 +48,11 @@ class BlockTable:
         _blocks: Optional[List[Block]] = None,
         max_block_sliding_window: Optional[int] = None,
         enable_pooling: bool = False,
-        pooling_blk_size: Optional[int] = None
+        pooling_blk_size: Optional[int] = None,
+        enable_chunk_caching: bool = False,
+        chunk_alloc_info: Optional[List[ChunkAllocationInfo]] = None,
     ):
+        assert (not enable_pooling) or (not enable_chunk_caching)
         self._block_size = block_size
         self._allocator = block_allocator
         if _blocks is None:
@@ -59,6 +63,12 @@ class BlockTable:
         self._num_full_slots = self._get_num_token_ids()
         self._enable_pooling = enable_pooling
         self._pooling_blk_size = pooling_blk_size
+        self._enable_chunk_caching = enable_chunk_caching
+        self._chunk_alloc_info = None
+        if self._enable_chunk_caching:
+            if chunk_alloc_info is None:
+                chunk_alloc_info = []
+            self._chunk_alloc_info: List[ChunkAllocationInfo] = chunk_alloc_info
 
     @staticmethod
     def get_num_required_blocks(token_ids: List[int],
@@ -229,12 +239,20 @@ class BlockTable:
         """
         assert self._is_allocated
         assert len(self._blocks) > 0
-        forked_blocks = self._allocator.fork(self._blocks[-1])
+        if not self._enable_chunk_caching:
+            forked_blocks = self._allocator.fork(self._blocks[-1])
+        else:
+            forked_blocks = self._allocator.fork(
+                last_block=self._blocks[-1],
+                chunk_hashes=[info._chunk_hash for info in self._chunk_alloc_info]
+            )
         return BlockTable(
             block_size=self._block_size,
             block_allocator=self._allocator,
             _blocks=forked_blocks,
             max_block_sliding_window=self._max_block_sliding_window,
+            enable_chunk_caching=self._enable_chunk_caching,
+            chunk_alloc_info=self._chunk_alloc_info,
         )
 
     def free(self) -> None:
@@ -248,6 +266,8 @@ class BlockTable:
         for block in self.blocks:
             self._allocator.free(block)
         self._blocks.reset()
+        if self._chunk_alloc_info is not None:
+            self._chunk_alloc_info = []
 
     @property
     def physical_block_ids(self) -> List[int]:
@@ -298,20 +318,21 @@ class BlockTable:
         else:
             if doc_ranges[0][0] != 0:
                 pooling_token_ids.extend(token_ids[:doc_ranges[0][0]])
-            for (ds, de) in doc_ranges:
+            for (ds, de, _) in doc_ranges:
                 for i in range(ds, de, self._pooling_blk_size):
                     pooling_token_ids.append(token_ids[i])
             if doc_ranges[-1][1] != len(token_ids):
                 pooling_token_ids.extend(token_ids[doc_ranges[-1][1]:])
         return pooling_token_ids
 
-    def _allocate_blocks_for_token_ids(
-            self,
-            prev_block: Optional[Block],
-            token_ids: List[int],
-            device: Device,
-            extra_hash: Optional[int] = None,
-            doc_ranges: Optional[list[tuple]] = None) -> List[Block]:
+    def _allocate_blocks_for_token_ids_common_mode(
+        self,
+        prev_block: Optional[Block],
+        token_ids: List[int],
+        device: Device,
+        extra_hash: Optional[int] = None,
+        doc_ranges: Optional[list[tuple]] = None
+    ) -> List[Block]:
         blocks: List[Block] = []
 
         block_token_ids = []
@@ -344,6 +365,88 @@ class BlockTable:
             blocks.append(block)
 
         return blocks
+
+    def _allocate_blocks_for_token_ids_chunk_mode(
+        self,
+        prev_block: Optional[Block],
+        token_ids: List[int],
+        device: Device,
+        extra_hash: Optional[int] = None,
+        doc_ranges: Optional[list[tuple]] = None
+    ) -> List[Block]:
+        assert doc_ranges is not None
+        blocks: List[Block] = []
+        for doc_range in doc_ranges:
+            assert (doc_range[0] % self._block_size == 0) and (doc_range[1] % self._block_size == 0)
+            block_token_ids = [
+                cur_token_ids
+                for cur_token_ids in chunk_list(token_ids[doc_range[0]:doc_range[1]], self._block_size)
+            ]
+            blocks.extend(
+                self._allocator.allocate_immutable_blocks(
+                    prev_block=prev_block,
+                    block_token_ids=block_token_ids,
+                    device=device,
+                    extra_hash=extra_hash,
+                    doc_range=doc_range,
+                    chunk_alloc_states=self._chunk_alloc_info,
+                )
+            )
+            prev_block = blocks[-1]
+        
+        # last
+        last_tokens = token_ids[doc_ranges[-1][1]:]
+        block_token_ids = []
+        tail_token_ids = []
+        for cur_token_ids in chunk_list(last_tokens, self._block_size):
+            if len(cur_token_ids) == self._block_size:
+                block_token_ids.append(cur_token_ids)
+            else:
+                tail_token_ids.append(cur_token_ids)
+
+        if block_token_ids:
+            blocks.extend(
+                self._allocator.allocate_immutable_blocks(
+                    prev_block,
+                    block_token_ids=block_token_ids,
+                    device=device,
+                    extra_hash=extra_hash))
+            prev_block = blocks[-1]
+
+        if tail_token_ids:
+            assert len(tail_token_ids) == 1
+            cur_token_ids = tail_token_ids[0]
+
+            block = self._allocator.allocate_mutable_block(
+                prev_block=prev_block, device=device, extra_hash=extra_hash)
+            block.append_token_ids(cur_token_ids)
+
+            blocks.append(block)
+        
+        return blocks
+
+    def _allocate_blocks_for_token_ids(
+        self,
+        prev_block: Optional[Block],
+        token_ids: List[int],
+        device: Device,
+        extra_hash: Optional[int] = None,
+        doc_ranges: Optional[list[tuple]] = None) -> List[Block]:
+        if not self._enable_chunk_caching:
+            return self._allocate_blocks_for_token_ids_common_mode(
+                prev_block=prev_block,
+                token_ids=token_ids,
+                device=device,
+                extra_hash=extra_hash,
+                doc_ranges=doc_ranges,
+            )
+        return self._allocate_blocks_for_token_ids_chunk_mode(
+            prev_block=prev_block,
+            token_ids=token_ids,
+            device=device,
+            extra_hash=extra_hash,
+            doc_ranges=doc_ranges,
+        )
 
     def _get_all_token_ids(self) -> List[int]:
         # NOTE: This function is O(seq_len); use sparingly.

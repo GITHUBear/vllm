@@ -5,7 +5,7 @@ from typing import Final, Optional, Union
 import jinja2
 from fastapi import Request
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, CacheConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
 from vllm.entrypoints.logger import RequestLogger
@@ -31,6 +31,7 @@ class OpenAIServingTokenization(OpenAIServing):
         self,
         engine_client: EngineClient,
         model_config: ModelConfig,
+        cache_config: CacheConfig,
         models: OpenAIServingModels,
         *,
         request_logger: Optional[RequestLogger],
@@ -39,6 +40,7 @@ class OpenAIServingTokenization(OpenAIServing):
     ) -> None:
         super().__init__(engine_client=engine_client,
                          model_config=model_config,
+                         cache_config=cache_config,
                          models=models,
                          request_logger=request_logger)
 

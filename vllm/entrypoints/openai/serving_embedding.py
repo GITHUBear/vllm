@@ -7,7 +7,7 @@ import numpy as np
 from fastapi import Request
 from typing_extensions import assert_never, override
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, CacheConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
 from vllm.entrypoints.logger import RequestLogger
@@ -140,6 +140,7 @@ class OpenAIServingEmbedding(EmbeddingMixin):
         self,
         engine_client: EngineClient,
         model_config: ModelConfig,
+        cache_config: CacheConfig,
         models: OpenAIServingModels,
         *,
         request_logger: Optional[RequestLogger],
@@ -148,6 +149,7 @@ class OpenAIServingEmbedding(EmbeddingMixin):
     ) -> None:
         super().__init__(engine_client=engine_client,
                          model_config=model_config,
+                         cache_config=cache_config,
                          models=models,
                          request_logger=request_logger)
 

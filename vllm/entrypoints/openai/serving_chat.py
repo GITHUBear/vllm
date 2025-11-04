@@ -13,7 +13,7 @@ import partial_json_parser
 from fastapi import Request
 from pydantic import TypeAdapter
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, CacheConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (ChatTemplateContentFormatOption,
                                          ConversationMessage,
@@ -52,6 +52,7 @@ class OpenAIServingChat(OpenAIServing):
         self,
         engine_client: EngineClient,
         model_config: ModelConfig,
+        cache_config: CacheConfig,
         models: OpenAIServingModels,
         response_role: str,
         *,
@@ -66,6 +67,7 @@ class OpenAIServingChat(OpenAIServing):
     ) -> None:
         super().__init__(engine_client=engine_client,
                          model_config=model_config,
+                         cache_config=cache_config,
                          models=models,
                          request_logger=request_logger,
                          return_tokens_as_token_ids=return_tokens_as_token_ids)

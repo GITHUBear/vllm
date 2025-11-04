@@ -9,6 +9,7 @@ from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
 from vllm.core.block.interfaces import Block
 from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
+from vllm.core.block.chunk_block import ChunkAllocationTracker
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
@@ -68,7 +69,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         enable_caching: bool = False,
         enable_pooling: bool = False,
         pooling_blk_size: Optional[int] = None,
+        enable_chunk_caching: bool = False,
     ) -> None:
+        assert (not enable_caching) or (not enable_chunk_caching)
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
         self.num_total_cpu_blocks = num_cpu_blocks
@@ -90,14 +93,20 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         assert watermark >= 0.0
 
         self.enable_caching = enable_caching
+        self.enable_chunk_caching = enable_chunk_caching
 
         self.enable_pooling = enable_pooling
         self.pooling_blk_size = pooling_blk_size
 
         self.watermark_blocks = int(watermark * num_gpu_blocks)
 
+        allocator_type = "naive"
+        if enable_caching:
+            allocator_type = "prefix_caching"
+        if enable_chunk_caching:
+            allocator_type = "chunk"
         self.block_allocator = CpuGpuBlockAllocator.create(
-            allocator_type="prefix_caching" if enable_caching else "naive",
+            allocator_type=allocator_type,
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
             block_size=block_size,
@@ -110,6 +119,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             self.block_allocator, self.block_size, self.enable_caching)
         self._last_access_blocks_tracker = LastAccessBlocksTracker(
             self.block_allocator)
+        self._chunk_allocation_tracker = None
+        if enable_chunk_caching:
+            self._chunk_allocation_tracker = ChunkAllocationTracker(
+                self.block_allocator
+            )
 
     def can_allocate(self,
                      seq_group: SequenceGroup,
@@ -157,6 +171,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             max_block_sliding_window=self.max_block_sliding_window,
             enable_pooling=self.enable_pooling,
             pooling_blk_size=self.pooling_blk_size,
+            enable_chunk_caching=self.enable_chunk_caching,
         )
         doc_ranges = seq.inputs.get("doc_ranges", None)
         if seq.get_token_ids():
@@ -186,6 +201,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         # Track seq
         self._last_access_blocks_tracker.add_seq(seq.seq_id)
+        if self._chunk_allocation_tracker is not None:
+            self._chunk_allocation_tracker.add_seq(
+                seq_id=seq.seq_id,
+                chunk_alloc_info=block_table._chunk_alloc_info,
+            )
 
         # Assign the block table for each sequence.
         for seq in waiting_seqs[1:]:
@@ -193,6 +213,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
             # Track seq
             self._last_access_blocks_tracker.add_seq(seq.seq_id)
+            if self._chunk_allocation_tracker is not None:
+                self._chunk_allocation_tracker.add_seq(
+                    seq_id=seq.seq_id,
+                    chunk_alloc_info=block_table._chunk_alloc_info,
+                )
 
         # Allocate cross-attention block table for encoder sequence
         #
@@ -266,13 +291,19 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             # Already freed or haven't been scheduled yet.
             return
 
+        chunk_hashes = None
+        if self.enable_chunk_caching:
+            assert self._chunk_allocation_tracker is not None
+            chunk_hashes = self._chunk_allocation_tracker.get_chunk_hashes(seq_id)
+
         # Update seq block ids with the latest access time
         self._last_access_blocks_tracker.update_seq_blocks_last_access(
-            seq_id, self.block_tables[seq.seq_id].physical_block_ids)
+            seq_id, self.block_tables[seq.seq_id].physical_block_ids, chunk_hashes)
 
         # Untrack seq
         self._last_access_blocks_tracker.remove_seq(seq_id)
         self._computed_blocks_tracker.remove_seq(seq_id)
+        self._chunk_allocation_tracker.remove_seq(seq_id)
 
         # Free table/blocks
         self.block_tables[seq_id].free()
@@ -298,7 +329,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         return block_ids  # type: ignore
 
     def access_all_blocks_in_seq(self, seq: Sequence, now: float):
-        if self.enable_caching:
+        # TODO:[shk] block cache情况也开启
+        if self.enable_caching or self.enable_chunk_caching:
             # Record the latest access time for the sequence. The actual update
             # of the block ids is deferred to the sequence free(..) call, since
             # only during freeing of block ids, the blocks are actually added to
@@ -313,8 +345,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # right after they have been scheduled (for prefill). This assumes
         # the scheduler is synchronous so blocks are actually computed when
         # scheduling the next batch.
-        self.block_allocator.mark_blocks_as_computed([])
+        self.block_allocator.mark_blocks_as_computed(block_ids=[])
 
+    # [shk]:在prefix cache模式下在此处计算命中长度
     def get_common_computed_block_ids(
             self, seqs: List[Sequence]) -> GenericSequence[int]:
         """Determine which blocks for which we skip prefill.
@@ -349,6 +382,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         # Track child seq
         self._last_access_blocks_tracker.add_seq(child_seq.seq_id)
+        if self._chunk_allocation_tracker is not None:
+            self._chunk_allocation_tracker.add_seq(
+                seq_id=child_seq.seq_id,
+                chunk_alloc_info=src_block_table._chunk_alloc_info,
+            )
 
     def can_swap_in(self, seq_group: SequenceGroup,
                     num_lookahead_slots: int) -> AllocStatus:

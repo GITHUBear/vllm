@@ -10,7 +10,7 @@ import jinja2
 from fastapi import Request
 from typing_extensions import assert_never
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, CacheConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.logger import RequestLogger
 # yapf conflicts with isort for this block
@@ -47,6 +47,7 @@ class OpenAIServingCompletion(OpenAIServing):
         self,
         engine_client: EngineClient,
         model_config: ModelConfig,
+        cache_config: CacheConfig,
         models: OpenAIServingModels,
         *,
         request_logger: Optional[RequestLogger],
@@ -54,6 +55,7 @@ class OpenAIServingCompletion(OpenAIServing):
     ):
         super().__init__(engine_client=engine_client,
                          model_config=model_config,
+                         cache_config=cache_config,
                          models=models,
                          request_logger=request_logger,
                          return_tokens_as_token_ids=return_tokens_as_token_ids)

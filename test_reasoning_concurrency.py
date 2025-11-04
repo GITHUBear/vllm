@@ -3,9 +3,6 @@ import httpx
 import time
 from typing import List, Dict, Any
 
-# ----------------------------
-# 配置参数
-# ----------------------------
 BASE_URL = "http://localhost:8000/v1/chat/completions"
 API_KEY = "your-api-key"
 HEADERS = {
@@ -58,16 +55,12 @@ CONVERSATIONS = [
     },
 ] * 20
 
-# ----------------------------
-# 异步函数：处理单个流式请求，测量 TTFT
-# ----------------------------
 async def process_conversation(client: httpx.AsyncClient, conv_data: dict, idx: int):
     print(f"[请求 {idx}] 开始...")
     start_time = time.perf_counter()
     first_token = False
 
     try:
-        # ✅ 使用 .stream() 方法开启流式请求
         async with client.stream("POST", BASE_URL, json=conv_data) as response:
             if response.status_code != 200:
                 print(f"[请求 {idx}] 失败，状态码: {response.status_code}")
@@ -94,9 +87,6 @@ async def process_conversation(client: httpx.AsyncClient, conv_data: dict, idx: 
     except Exception as e:
         print(f"[请求 {idx}] 异常: {e}")
 
-# ----------------------------
-# 主函数：批量并发执行
-# ----------------------------
 async def main():
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0), headers=HEADERS) as client:
         tasks = [
@@ -105,6 +95,5 @@ async def main():
         ]
         await asyncio.gather(*tasks)
 
-# 运行
 if __name__ == "__main__":
     asyncio.run(main())

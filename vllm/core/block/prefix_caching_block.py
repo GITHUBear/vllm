@@ -561,7 +561,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         return self._cow_tracker.clear_cows()
 
     def mark_blocks_as_accessed(self, block_ids: List[int],
-                                now: float) -> None:
+                                now: float,
+                                chunk_hashes: Optional[List[str]] = None) -> None:
         """Mark blocks as accessed, used in prefix caching.
 
         If the block is added into evictor, we need to update corresponding
@@ -1115,7 +1116,8 @@ class LastAccessBlocksTracker:
         self._seq_last_access[seq_id] = time
 
     def update_seq_blocks_last_access(self, seq_id: int,
-                                      block_ids: List[int]) -> None:
+                                      block_ids: List[int],
+                                      chunk_hashes: Optional[List[str]] = None) -> None:
         assert seq_id in self._seq_last_access
 
         ts = self._seq_last_access[seq_id]
@@ -1124,7 +1126,7 @@ class LastAccessBlocksTracker:
             # No last access was recorded, no need to update.
             return
 
-        self._allocator.mark_blocks_as_accessed(block_ids, ts)
+        self._allocator.mark_blocks_as_accessed(block_ids, ts, chunk_hashes)
 
 
 def assert_prefix_caching_block_or_none(block: Optional[Block]):

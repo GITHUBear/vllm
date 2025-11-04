@@ -6,6 +6,8 @@ from vllm.core.block.interfaces import (Block, BlockAllocator, BlockId,
                                         DeviceAwareBlockAllocator)
 from vllm.core.block.naive_block import NaiveBlock, NaiveBlockAllocator
 from vllm.core.block.prefix_caching_block import PrefixCachingBlockAllocator
+from vllm.core.block.chunk_block import (ChunkAllocationInfo, ChunkAllocationState, 
+                                         ChunkCachingBlockAllocator, ChunkAllocationTracker)
 from vllm.platforms import current_platform
 from vllm.utils import Device
 
@@ -63,6 +65,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         gpu_block_ids = block_ids[:num_gpu_blocks]
         cpu_block_ids = block_ids[num_gpu_blocks:]
 
+        chunk_alloc_type = False
         if allocator_type == "naive":
             gpu_allocator: BlockAllocator = NaiveBlockAllocator(
                 create_block=NaiveBlock,  # type: ignore
@@ -89,16 +92,34 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
                 block_size=block_size,
                 block_ids=cpu_block_ids,
             )
+        elif allocator_type == "chunk":
+            gpu_allocator = ChunkCachingBlockAllocator(
+                create_block=NaiveBlock,
+                num_blocks=num_gpu_blocks,
+                block_size=block_size,
+                block_ids=gpu_block_ids,
+            )
+
+            cpu_allocator = ChunkCachingBlockAllocator(
+                create_block=NaiveBlock,
+                num_blocks=num_cpu_blocks,
+                block_size=block_size,
+                block_ids=cpu_block_ids,
+            )
+
+            chunk_alloc_type = True
         else:
             raise ValueError(f"Unknown allocator type {allocator_type=}")
 
         return CpuGpuBlockAllocator(
             cpu_block_allocator=cpu_allocator,
             gpu_block_allocator=gpu_allocator,
+            chunk_alloc_type=chunk_alloc_type,
         )
 
     def __init__(self, cpu_block_allocator: BlockAllocator,
-                 gpu_block_allocator: BlockAllocator):
+                 gpu_block_allocator: BlockAllocator,
+                 chunk_alloc_type = False):
         assert not (
             cpu_block_allocator.all_block_ids
             & gpu_block_allocator.all_block_ids
@@ -108,6 +129,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             Device.CPU: cpu_block_allocator,
             Device.GPU: gpu_block_allocator,
         }
+        self.chunk_alloc_type = chunk_alloc_type
 
         self._swap_mapping: Dict[int, int] = {}
         self._null_block: Optional[Block] = None
@@ -148,7 +170,10 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             prev_block: Optional[Block],
             block_token_ids: List[List[int]],
             device: Device,
-            extra_hash: Optional[int] = None) -> List[Block]:
+            extra_hash: Optional[int] = None,
+
+            doc_range: Optional[Tuple] = None,
+            chunk_alloc_states: Optional[List[ChunkAllocationInfo]] = None) -> List[Block]:
         """Allocates a new group of immutable blocks with the provided block 
         token IDs on the specified device.
 
@@ -166,6 +191,14 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             List[Block]: The newly allocated list of immutable blocks 
                 containing the provided block token IDs.
         """
+        if self.chunk_alloc_type:
+            return self._allocators[device].allocate_immutable_blocks(
+                prev_block=prev_block,
+                block_token_ids=block_token_ids,
+                extra_hash=extra_hash,
+                doc_range=doc_range,
+                chunk_alloc_states=chunk_alloc_states,
+            )
         return self._allocators[device].allocate_immutable_blocks(
             prev_block, block_token_ids, extra_hash=extra_hash)
 
@@ -313,11 +346,12 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         return self._allocators[device].clear_copy_on_writes()
 
     def mark_blocks_as_accessed(self, block_ids: List[int],
-                                now: float) -> None:
+                                now: float,
+                                chunk_hashes: Optional[List[str]] = None) -> None:
         """Mark blocks as accessed, only use for prefix caching."""
         # Prefix caching only supported on GPU.
         device = Device.GPU
-        return self._allocators[device].mark_blocks_as_accessed(block_ids, now)
+        return self._allocators[device].mark_blocks_as_accessed(block_ids, now, chunk_hashes)
 
     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
         """Mark blocks as accessed, only use for prefix caching."""

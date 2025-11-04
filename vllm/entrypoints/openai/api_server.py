@@ -1166,6 +1166,7 @@ async def init_app_state(
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
     model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
 
     resolved_chat_template = load_chat_template(args.chat_template)
     if resolved_chat_template is not None:
@@ -1202,6 +1203,7 @@ async def init_app_state(
     state.openai_serving_chat = OpenAIServingChat(
         engine_client,
         model_config,
+        cache_config,
         state.openai_serving_models,
         args.response_role,
         request_logger=request_logger,
@@ -1216,6 +1218,7 @@ async def init_app_state(
     state.openai_serving_completion = OpenAIServingCompletion(
         engine_client,
         model_config,
+        cache_config,
         state.openai_serving_models,
         request_logger=request_logger,
         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
@@ -1223,6 +1226,7 @@ async def init_app_state(
     state.openai_serving_pooling = OpenAIServingPooling(
         engine_client,
         model_config,
+        cache_config,
         state.openai_serving_models,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
@@ -1231,6 +1235,7 @@ async def init_app_state(
     state.openai_serving_embedding = OpenAIServingEmbedding(
         engine_client,
         model_config,
+        cache_config,
         state.openai_serving_models,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
@@ -1239,24 +1244,28 @@ async def init_app_state(
     state.openai_serving_scores = ServingScores(
         engine_client,
         model_config,
+        cache_config,
         state.openai_serving_models,
         request_logger=request_logger) if model_config.task in (
             "score", "embed", "pooling") else None
     state.openai_serving_classification = ServingClassification(
         engine_client,
         model_config,
+        cache_config,
         state.openai_serving_models,
         request_logger=request_logger,
     ) if model_config.task == "classify" else None
     state.jinaai_serving_reranking = ServingScores(
         engine_client,
         model_config,
+        cache_config,
         state.openai_serving_models,
         request_logger=request_logger
     ) if model_config.task == "score" else None
     state.openai_serving_tokenization = OpenAIServingTokenization(
         engine_client,
         model_config,
+        cache_config,
         state.openai_serving_models,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
@@ -1265,6 +1274,7 @@ async def init_app_state(
     state.openai_serving_transcription = OpenAIServingTranscription(
         engine_client,
         model_config,
+        cache_config,
         state.openai_serving_models,
         request_logger=request_logger,
     ) if model_config.runner_type == "transcription" else None

@@ -144,6 +144,7 @@ class SamplingMetadata:
         self.skip_sampler_cpu_output = skip_sampler_cpu_output
         self.reuse_sampling_tensors = reuse_sampling_tensors
 
+    # TODO[shk]: Block Attention需要修改sample位置selected_token_indices
     @staticmethod
     def prepare(
         seq_group_metadata_list: list[SequenceGroupMetadata],
@@ -193,7 +194,7 @@ class SamplingMetadata:
             f"selected_token_indices={self.selected_token_indices}, "
             f"categorized_sample_indices={self.categorized_sample_indices})")
 
-# TODO:shk: 对于 BlockAttention 来说，SamplingMetadata 逻辑需要调整
+# TODO:[shk]: 对于 BlockAttention 来说，SamplingMetadata 逻辑需要调整
 def _prepare_seq_groups(
     seq_group_metadata_list: list[SequenceGroupMetadata],
     seq_lens: list[int],

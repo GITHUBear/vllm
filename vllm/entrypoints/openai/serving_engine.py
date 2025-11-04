@@ -28,7 +28,7 @@ else:
     from typing_extensions import TypedDict
 
 import vllm.envs as envs
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, CacheConfig
 from vllm.engine.protocol import EngineClient
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -206,6 +206,7 @@ class OpenAIServing:
         self,
         engine_client: EngineClient,
         model_config: ModelConfig,
+        cache_config: CacheConfig,
         models: OpenAIServingModels,
         *,
         request_logger: Optional[RequestLogger],
@@ -215,6 +216,7 @@ class OpenAIServing:
 
         self.engine_client = engine_client
         self.model_config = model_config
+        self.cache_config = cache_config
         self.max_model_len = model_config.max_model_len
 
         self.models = models
@@ -229,6 +231,9 @@ class OpenAIServing:
         self._tokenize_prompt_input_or_inputs_async = make_async(
             self._tokenize_prompt_input_or_inputs,
             executor=self._tokenizer_executor)
+        
+        # TODO[shk]:在开发完成后将padding作为默认行为
+        self._enable_doc_padding = True
 
     async def _preprocess(
         self,
@@ -484,6 +489,8 @@ class OpenAIServing:
         doc_sep = "<|DOC_SEP|>"
         tokenizer.add_tokens([doc_sep])
         doc_sep_id = tokenizer.convert_tokens_to_ids(doc_sep)
+        padding_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+        assert padding_token_id is not None
 
         if truncate_prompt_tokens is None:
             encoded = tokenizer(prompt, add_special_tokens=add_special_tokens)
@@ -503,22 +510,29 @@ class OpenAIServing:
         new_input_ids = []
         doc_ranges = []
         tmp_doc_ranges = []
-        # doc_start_idx = -1
-        # for token_id in input_ids:
-        #     if token_id == doc_sep_id:
-        #         if doc_start_idx != -1:
-        #             doc_ranges.append((doc_start_idx, len(new_input_ids)))
-        #         doc_start_idx = len(new_input_ids)
-        #     else:
-        #         new_input_ids.append(token_id)
+        actual_len = []
+        prev_actual_len = 0
+        non_sep_token_cnter = 0
+        block_size = self.cache_config.block_size
         for token_id in input_ids:
             if token_id == doc_sep_id:
+                if non_sep_token_cnter != prev_actual_len:
+                    actual_len.append(non_sep_token_cnter - prev_actual_len)
+                    prev_actual_len = non_sep_token_cnter
+                if self._enable_doc_padding:
+                    cur_len = len(new_input_ids)
+                    if cur_len % block_size != 0:
+                        for _ in range(block_size - (cur_len % block_size)):
+                            new_input_ids.append(padding_token_id)
                 tmp_doc_ranges.append(len(new_input_ids))
             else:
+                non_sep_token_cnter += 1
                 new_input_ids.append(token_id)
         assert len(tmp_doc_ranges) % 2 == 0
-        for i in range(0, len(tmp_doc_ranges), 2):
-            doc_ranges.append((tmp_doc_ranges[i], tmp_doc_ranges[i + 1]))
+        if len(tmp_doc_ranges) > 0:
+            doc_ranges.append((0, tmp_doc_ranges[0], actual_len[0]))
+        for i, l in zip(range(0, len(tmp_doc_ranges), 2), actual_len[1:]):
+            doc_ranges.append((tmp_doc_ranges[i], tmp_doc_ranges[i + 1], l))
 
         logger.info(f"========== DOC OFFSETS: {doc_ranges} ============")
         if len(doc_ranges) == 0:

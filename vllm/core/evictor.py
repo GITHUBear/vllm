@@ -3,7 +3,8 @@
 import enum
 import heapq
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from vllm.core.block.common import RefCounter
 
 
 class EvictionPolicy(enum.Enum):
@@ -148,9 +149,112 @@ class LRUEvictor(Evictor):
     def num_blocks(self) -> int:
         return len(self.free_table)
 
+class ChunkMetaData:
+    def __init__(self, chunk_hash: str, block_ids: List[int],
+                 last_accessed: float):
+        self.chunk_hash = chunk_hash
+        self.block_ids = block_ids
+        self.num_blocks = len(self.block_ids)
+        self.last_accessed = last_accessed
 
-def make_evictor(eviction_policy: EvictionPolicy) -> Evictor:
+class LRUChunkBasedEvictor(Evictor):
+    CLEANUP_THRESHOLD = 50
+
+    def __init__(self, block_ref_counter: RefCounter):
+        self._block_ref_counter = block_ref_counter
+        self._free_table: Dict[str, ChunkMetaData] = {}
+        self._total_blocks = 0
+        self.priority_queue = []
+    
+    def __contains__(self, chunk_hash: str) -> bool:
+        return chunk_hash in self._free_table
+    
+    def _evict_blocks(self, chunk_metadata: ChunkMetaData):
+        block_ids = chunk_metadata.block_ids
+        evicted_block_ids = []
+        for block_id in block_ids:
+            ref_cnt = self._block_ref_counter.decr(block_id)
+            assert ref_cnt == 0
+            evicted_block_ids.append(block_id)
+        self._total_blocks -= len(block_ids)
+        return evicted_block_ids
+
+    # Note: give the evicted blocks back to free list!
+    def evict(self) -> Tuple[List[int], List[str]]:
+        if len(self._free_table) == 0:
+            raise ValueError("No usable cache memory left")
+
+        while self.priority_queue:
+            # We do not remove outdated entries from the priority queue at the
+            # time of updating the last_accessed timestamp. Instead, outdated
+            # entries are filtered out here during eviction. Outdated entries
+            # would either not in the free table, or have older last accessed
+            # time.
+            last_accessed, _, chunk_hash = heapq.heappop(
+                self.priority_queue)
+            if (chunk_hash in self._free_table and
+                    self._free_table[chunk_hash].last_accessed == last_accessed):
+                chunk_metadata = self._free_table.pop(chunk_hash)
+                evicted_block_ids = self._evict_blocks(chunk_metadata)
+                assert len(evicted_block_ids) != 0
+                return evicted_block_ids, chunk_metadata.chunk_hash
+
+        raise ValueError("No usable cache memory left")
+
+    def add(self, chunk_hash: str, block_ids: List[int],
+            last_accessed: float):
+        self._free_table[chunk_hash] = ChunkMetaData(
+            chunk_hash=chunk_hash,
+            block_ids=block_ids,
+            last_accessed=last_accessed,
+        )
+        self._total_blocks += len(block_ids)
+        heapq.heappush(
+            self.priority_queue,
+            (last_accessed, len(block_ids), chunk_hash))
+        self._cleanup_if_necessary()
+
+    def update(self, chunk_hash: str, last_accessed: float):
+        self._free_table[chunk_hash].last_accessed = last_accessed
+
+    def _cleanup_if_necessary(self):
+        if len(self.priority_queue) > LRUEvictor.CLEANUP_THRESHOLD * len(
+                self.free_table):
+            self._cleanup()
+
+    def _cleanup(self):
+        new_priority_queue: List[Tuple[float, int, int, int]] = []
+
+        for chunk_hash, chunk_meta in self._free_table.items():
+            new_priority_queue.append(
+                (chunk_meta.last_accessed, chunk_meta.num_blocks, chunk_hash))
+        heapq.heapify(new_priority_queue)
+
+        self.priority_queue = new_priority_queue
+
+    def remove(self, chunk_hash: str):
+        if chunk_hash not in self._free_table:
+            raise ValueError(
+                "Attempting to remove chunk that's not in the evictor")
+        chunk_meta = self._free_table.pop(chunk_hash)
+        # for block_id in chunk_meta.block_ids:
+        #     ref_cnt = self._block_ref_counter.get(block_id)
+        #     assert ref_cnt == 1
+        self._total_blocks -= len(chunk_meta.block_ids)
+
+    @property
+    def num_blocks(self) -> int:
+        return self._total_blocks
+
+
+def make_evictor(eviction_policy: EvictionPolicy,
+                 chunk_based: bool = False, 
+                 block_ref_counter: Optional[RefCounter] = None) -> Evictor:
     if eviction_policy == EvictionPolicy.LRU:
-        return LRUEvictor()
+        if not chunk_based:
+            return LRUEvictor()
+        else:
+            assert block_ref_counter is not None
+            return LRUChunkBasedEvictor(block_ref_counter)
     else:
         raise ValueError(f"Unknown cache eviction policy: {eviction_policy}")

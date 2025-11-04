@@ -101,32 +101,35 @@ class DocMetafileHandler:
 
     
     def load_doc_meta(self, doc_hash, token_ids):
-        with h5py.File(self.metafile_path, 'r') as f:
-            if doc_hash not in f:
-                return None, None
-            
-            meta = json.loads(f[doc_hash]['meta'][()].decode('utf-8'))
-            if meta['token_ids'] == token_ids:
-                return {
-                    "path": meta['path'],
-                    "offset": meta['offset'],
-                }, doc_hash
-            
-            overflow_id = 0
-            overflow_doc_hash = doc_hash + f"_overflow-{overflow_id}"
-            while True:
-                if overflow_doc_hash not in f:
+        try:
+            with h5py.File(self.metafile_path, 'r') as f:
+                if doc_hash not in f:
                     return None, None
                 
-                meta = json.loads(f[overflow_doc_hash]['meta'][()].decode('utf-8'))
+                meta = json.loads(f[doc_hash]['meta'][()].decode('utf-8'))
                 if meta['token_ids'] == token_ids:
                     return {
                         "path": meta['path'],
                         "offset": meta['offset'],
-                    }, overflow_doc_hash
+                    }, doc_hash
                 
-                overflow_id += 1
+                overflow_id = 0
                 overflow_doc_hash = doc_hash + f"_overflow-{overflow_id}"
+                while True:
+                    if overflow_doc_hash not in f:
+                        return None, None
+                    
+                    meta = json.loads(f[overflow_doc_hash]['meta'][()].decode('utf-8'))
+                    if meta['token_ids'] == token_ids:
+                        return {
+                            "path": meta['path'],
+                            "offset": meta['offset'],
+                        }, overflow_doc_hash
+                    
+                    overflow_id += 1
+                    overflow_doc_hash = doc_hash + f"_overflow-{overflow_id}"
+        except FileNotFoundError:
+            return None, None
     
 
 class PreemptionMode(enum.Enum):
@@ -569,6 +572,7 @@ class Scheduler:
             enable_caching=self.cache_config.enable_prefix_caching,
             enable_pooling=self.cache_config.enable_pooling,
             pooling_blk_size=self.cache_config.pooling_blk_size,
+            enable_chunk_caching=self.enable_blk_attn_prefill,
         )
 
         self.sparse_index_block_manager: SparseIndexBlockManager = None
@@ -1263,7 +1267,7 @@ class Scheduler:
                 waiting_queue.popleft()
                 continue
             num_new_tokens_uncached, num_new_tokens_cached = (
-                self._get_num_new_uncached_and_cached_tokens(
+                self._get_num_new_uncached_and_cached_tokens( # 对于 chunk caching 需要定义 cached tokens 数量
                     seq_group,
                     SequenceStatus.WAITING,
                     enable_chunking,
@@ -1811,7 +1815,7 @@ class Scheduler:
                     prompt_token_ids = seqs[0].data._prompt_token_ids
                     docs_hash = []
                     kvcache_path = []
-                    for (ds, de) in doc_ranges:
+                    for (ds, de, _) in doc_ranges:
                         tmp_doc_hash = list_to_xxhash(prompt_token_ids[ds:de])
                         path, actual_doc_hash = self.doc_metafile_handler.save_doc_meta(
                             doc_hash=tmp_doc_hash,
@@ -1843,7 +1847,7 @@ class Scheduler:
                         kvcache_path = []
                         cached_offset = []
                         missed_cnt = 0
-                        for (ds, de) in doc_ranges:
+                        for (ds, de, _) in doc_ranges:
                             doc_hash = list_to_xxhash(prompt_token_ids[ds:de])
                             meta, actual_doc_hash = self.doc_metafile_handler.load_doc_meta(
                                 doc_hash,
@@ -1870,11 +1874,6 @@ class Scheduler:
                         doc_ranges = None
                     else:
                         doc_ranges = seqs[0].inputs["doc_ranges"]
-                    
-                    if doc_ranges is not None:
-                        if doc_ranges[0][0] != 0:
-                            doc_ranges = [(0, doc_ranges[0][0])] + doc_ranges
-                        # TODO:[shk] 类似 common_computed_block_nums 判断 doc_ranges 缓存命中情况
 
                 if self.cache_config.enable_pooling:
                     assert (not self.scheduler_config.chunked_prefill_enabled)
@@ -1885,7 +1884,7 @@ class Scheduler:
                     doc_ranges = seqs[0].inputs["doc_ranges"]
                     if doc_ranges is not None:
                         pooling_token_delta = 0
-                        for (ds, de) in doc_ranges:
+                        for (ds, de, _) in doc_ranges:
                             doc_len = de - ds
                             # if doc_len <= 20:
                             #     continue
