@@ -359,6 +359,11 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         device = Device.GPU
         return self._allocators[device].mark_blocks_as_computed(block_ids)
 
+    def free_chunks(self, chunk_hashes: Optional[List[str]] = None) -> None:
+        assert self.chunk_alloc_type
+        device = Device.GPU
+        return self._allocators[device].free_chunks(chunk_hashes)
+
     def get_common_computed_block_ids(
             self, computed_seq_block_ids: List[List[int]]) -> List[int]:
         # Prefix caching only supported on GPU.

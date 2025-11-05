@@ -18,6 +18,9 @@ from vllm.utils import Device
 SeqId = int
 EncoderSeqId = str
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 class SelfAttnBlockSpaceManager(BlockSpaceManager):
     """BlockSpaceManager which manages the allocation of KV cache.
@@ -198,6 +201,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         seq = waiting_seqs[0]
         block_table: BlockTable = self._allocate_sequence(seq)
         self.block_tables[seq.seq_id] = block_table
+        if block_table._chunk_alloc_info is not None:
+            logger.info(f"======== allocated block table chunk allocation info ==========\n {block_table._chunk_alloc_info}")
 
         # Track seq
         self._last_access_blocks_tracker.add_seq(seq.seq_id)

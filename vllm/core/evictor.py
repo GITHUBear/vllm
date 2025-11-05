@@ -219,7 +219,7 @@ class LRUChunkBasedEvictor(Evictor):
 
     def _cleanup_if_necessary(self):
         if len(self.priority_queue) > LRUEvictor.CLEANUP_THRESHOLD * len(
-                self.free_table):
+                self._free_table):
             self._cleanup()
 
     def _cleanup(self):

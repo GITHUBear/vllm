@@ -78,7 +78,7 @@ class ChunkAllocationInfo:
             assert chunk_start_token_offset is not None
             self._delta_rotray_offset = chunk_start_token_offset - origin_chunk_start_token_offset
     
-    def __str__(self):
+    def __repr__(self):
         return (
             f"[\nstate:{self._state}\n"
             f"chunk_start:{self._chunk_start_token_offset}\n"
@@ -200,11 +200,12 @@ class ChunkCachingBlockAllocator(BlockAllocator):
         chunk_alloc_states: Optional[List[ChunkAllocationInfo]] = None,
         can_be_cached: bool = True,
         chunk_hash_cached: Optional[str] = None) -> List[Block]:
-        assert device is None and chunk_alloc_states is not None
+        assert device is None
         # assert doc_range is not None
         blocks = []
 
         if doc_range is not None:
+            assert chunk_alloc_states is not None
             # 是可命中缓存或者留作未来命中的 chunk
             if chunk_hash_cached is None:
                 token_ids = [token_id for block_token_id in block_token_ids for token_id in block_token_id]
@@ -221,6 +222,7 @@ class ChunkCachingBlockAllocator(BlockAllocator):
                     self._incr_refcount_cached_chunk(chunk_meta)
 
                     for block_token_id, cached_block_id in zip(block_token_ids, chunk_meta._block_ids):
+                        self._refcounter.incr(cached_block_id)
                         prev_block = self._block_pool.init_block(
                             prev_block=prev_block,
                             token_ids=block_token_id,
@@ -253,7 +255,7 @@ class ChunkCachingBlockAllocator(BlockAllocator):
                     physical_block_id=allocated_block_id,
                 )
                 blocks.append(prev_block)
-                block_ids.append(block_ids)
+                block_ids.append(allocated_block_id)
 
             # 缓存未命中，且可以登记为可命中的 chunk
             if promote_to_cache and can_be_cached:
@@ -487,7 +489,7 @@ class ChunkCachingBlockAllocator(BlockAllocator):
         Since the naive allocator does not implement prefix caching, we do
         nothing.
         """
-        assert chunk_hash is not None
+        assert chunk_hashes is not None
         for chunk_hash in chunk_hashes:
             self._cached_chunk[chunk_hash]._last_accessed = now
     

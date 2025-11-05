@@ -2075,7 +2075,6 @@ class Scheduler:
             self._async_stopped.clear()
 
     def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
-        # TODO[shk]:对于池化情况，不应该分配完整的数量
         self.block_manager.allocate(seq_group)
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             seq.status = SequenceStatus.RUNNING
