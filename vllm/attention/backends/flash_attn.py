@@ -495,7 +495,7 @@ class FlashAttentionMetadataBuilder(
     #    对于 decode 请求，仅处理原始的 query len
     #    对于非 chunk 请求，仅处理原始的 query len
     # 2. cu_seqlens_q & max_seqlen_q：根据上述 query len 进行处理
-    # 3. seqused_k：对于 prefill 请求，对于未命中的 chunk，设置为 -1，每个请求的最后一个 chunk 使用整个序列长度
+    # 3. seqused_k：对于 prefill 请求，对于未命中的 chunk，设置为块长度，每个请求的最后一个 chunk 使用整个序列长度
     #    对于 decode 请求，仅处理最后一个 chunk，因此需要独立维护一个 kv_lens
     #    对于非 chunk 请求，seqlen
     # 4. max_seqlen_k：根据 kv_lens 获取
@@ -645,7 +645,7 @@ class FlashAttentionMetadataBuilder(
                             # 未命中 chunk，对齐后的长度
                             self.chunked_prefill_query_lens.append(doc_range[1] - doc_range[0])
                             # 未命中 chunk，seqused_k = -1
-                            self.chunked_prefill_kv_lens.append(-1)
+                            self.chunked_prefill_kv_lens.append(doc_range[1] - doc_range[0])
                             # 未命中 chunk，actual_chunked_seqlen_k 可以设置为对齐后的长度
                             self.detail_chunked_prefill_kv_lens.append(doc_range[1] - doc_range[0])
                             # 未命中 chunk，rotary offset = 0
@@ -2612,6 +2612,58 @@ class FlashAttentionImpl(AttentionImpl):
 
                     if prefill_meta.enable_blk_attn:
                         assert query.dtype == torch.float16
+                        # new_key = torch.cat([
+                        #     key[0:11776],
+                        #     key[0:41],
+                        #     key[48:48+976],
+                        #     key[1024:1024+275],
+                        #     key[1312:1312+2418],
+                        #     key[3744:3744+2090],
+                        #     key[5840:5840+1261],
+                        #     key[7104:7104+167],
+                        #     key[7280:7280+1516],
+                        #     key[8800:8800+1977],
+                        #     key[10784:10784+384],
+                        #     key[11168:11168+597],
+                        #     key[11776:]
+                        # ], dim=0).to(device=query.device)
+                        # new_value = torch.cat([
+                        #     value[0:11776],
+                        #     value[0:41],
+                        #     value[48:48+976],
+                        #     value[1024:1024+275],
+                        #     value[1312:1312+2418],
+                        #     value[3744:3744+2090],
+                        #     value[5840:5840+1261],
+                        #     value[7104:7104+167],
+                        #     value[7280:7280+1516],
+                        #     value[8800:8800+1977],
+                        #     value[10784:10784+384],
+                        #     value[11168:11168+597],
+                        #     value[11776:]
+                        # ], dim=0).to(device=query.device)
+                        # new_cu_seqlen_k = torch.tensor([0, 48, 1024, 1312, 3744, 5840, 7104, 7280, 8800, 10784, 11168, 11776, 23530], 
+                        #                                dtype=torch.int32).to(device=query.device)
+                        # flash_attn_varlen_func(
+                        #     q=query,
+                        #     k=new_key,
+                        #     v=new_value,
+                        #     cu_seqlens_q=prefill_meta.blk_attn_prefill_cu_seqlens_q,
+                        #     cu_seqlens_k=new_cu_seqlen_k,
+                        #     max_seqlen_q=prefill_meta.blk_attn_max_prefill_q_len,
+                        #     max_seqlen_k=11754,
+                        #     # batch_idx_offset_for_blk_attn=prefill_meta.batch_idx_offset_for_blk_attn_tensor if prefill_meta.enable_blk_attn else None,
+                        #     softmax_scale=softmax_scale,
+                        #     causal=True,
+                        #     window_size=window_size,
+                        #     alibi_slopes=alibi_slopes,
+                        #     softcap=logits_soft_cap,
+                        #     out=prefill_output,
+                        #     fa_version=self.vllm_flash_attn_version,
+                        #     q_descale=layer._q_scale.expand(descale_shape),
+                        #     k_descale=layer._k_scale.expand(descale_shape),
+                        #     v_descale=layer._v_scale.expand(descale_shape),
+                        # )
                         flash_attn_varlen_func(  # noqa
                             q=query,
                             k=key_cache,
@@ -2630,9 +2682,6 @@ class FlashAttentionImpl(AttentionImpl):
                             chunk_rotray_offset_positions=prefill_meta.blk_attn_prefill_chunk_rotary_offset_positions,
                             cu_num_chunks_k=prefill_meta.blk_attn_prefill_cu_num_chunks_k,
                             cos_sin_cache=self._cos_sin_cache,
-                            local_key=key,
-                            local_value=value,
-                            local_cu_seqlen_k=prefill_meta.blk_attn_prefill_cu_seqlens_q,
 
                             softcap=logits_soft_cap,
                             out=prefill_output,
@@ -3119,23 +3168,6 @@ class FlashAttentionImpl(AttentionImpl):
                             k_descale=layer._k_scale.expand(descale_shape),
                             v_descale=layer._v_scale.expand(descale_shape),
                         )
-                        # flash_attn_with_kvcache(
-                        #     q=decode_query.unsqueeze(1),
-                        #     k_cache=key_cache,
-                        #     v_cache=value_cache,
-                        #     block_table=block_tables_arg,
-                        #     cache_seqlens=seq_lens_arg,
-                        #     softmax_scale=softmax_scale,
-                        #     causal=True,
-                        #     window_size=window_size,
-                        #     alibi_slopes=alibi_slopes,
-                        #     softcap=logits_soft_cap,
-                        #     out=decode_output.unsqueeze(1),
-                        #     fa_version=self.vllm_flash_attn_version,
-                        #     q_descale=layer._q_scale.expand(descale_shape),
-                        #     k_descale=layer._k_scale.expand(descale_shape),
-                        #     v_descale=layer._v_scale.expand(descale_shape),
-                        # )
                     else:
                         if block_index_gpu_cache is not None and block_index_gpu_cache.size(0) > 0:
                             flash_attn_with_kvcache(

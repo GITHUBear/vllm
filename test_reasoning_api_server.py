@@ -46,6 +46,9 @@ user_prompt2 = (
     "Answer the question based on the given passages. Only give me the answer and do not output any other words.\nQuestion: Which case was brought to court first Miller v. California or Gates v. Collier ?\n"
 )
 
+# block_system_prompt1 = block_system_prompt1.replace("<|DOC_SEP|>", "")
+# block_system_prompt2 = block_system_prompt2.replace("<|DOC_SEP|>", "")
+
 data = {
     # "model": "/data/shanhaikang.shk/modelscope/qwen25_32b",
     "model": "/data/shanhaikang.shk/Block-Attention/save_dir/checkpoint-1201",

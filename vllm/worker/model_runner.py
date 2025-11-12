@@ -621,7 +621,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                     # 位置偏移 
                     position_offset = inter_data.doc_ranges[-1][3] + inter_data.doc_ranges[-1][2] - inter_data.doc_ranges[-1][1]
                     chunked_position_for_block_attention = list(range(context_len + position_offset, seq_len + position_offset))
-                    logger.info(f"BLOCK_ATTENTION: {chunked_position_for_block_attention}")
+                    # logger.info(f"BLOCK_ATTENTION: {chunked_position_for_block_attention}")
                 
             prompt_embeds = None
         else:
