@@ -81,12 +81,13 @@ def _compute_slot_mapping_numpy(slot_mapping: List[int],
     seq_slot_mapping_array += block_offset
     slot_mapping.extend(seq_slot_mapping_array)
 
-
+# TODO[shk]: 
 def compute_slot_mapping(is_profile_run: bool, slot_mapping: List[int],
                          seq_id: int, seq_len: int, context_len: int,
                          start_idx: int, block_size: int,
                          block_tables: Dict[int, List[int]],
-                         pooling_token_delta: int = 0):
+                         pooling_token_delta: int = 0,
+                         chunked_block_range: Optional[Tuple[int, int]] = None):
     """
     Compute slot mapping.
     """
@@ -116,7 +117,11 @@ def compute_slot_mapping(is_profile_run: bool, slot_mapping: List[int],
         range_start -= pooling_token_delta
         range_end -= pooling_token_delta
     numel = range_end - range_start
-    block_table = block_tables[seq_id]
+
+    if chunked_block_range is None:
+        block_table = block_tables[seq_id]
+    else:
+        block_table = block_tables[seq_id][chunked_block_range[0]:chunked_block_range[1]]
 
     # numpy implementation will be faster than python if we have
     # many elements, otherwise it will be slower.

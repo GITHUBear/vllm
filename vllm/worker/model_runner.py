@@ -277,6 +277,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             docs_hash: Optional[list] = None,
             kvcache_path: Optional[list] = None,
             cached_offset: Optional[list] = None,
+
+            rotary_position_offsets: Optional[list] = None,
         ):
             if reinit:
                 assert len(self.seq_ids) == len(seq_ids)  # type: ignore
@@ -304,6 +306,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.docs_hash = docs_hash
             self.kvcache_path = kvcache_path
             self.cached_offset = cached_offset
+            self.rotary_position_offsets = rotary_position_offsets
 
             if reinit:
                 if len(self.seq_ids) == 1 and reinit_use_defaults:
@@ -573,6 +576,9 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         seq_len = seq_data.get_len()
         if inter_data.is_prompt:
             context_len = seq_data.get_num_computed_tokens()
+            assert (inter_data.rotary_position_offsets is None or 
+                    len(inter_data.rotary_position_offsets) == 0 or 
+                    context_len == 0)
             seq_len = min(seq_len, context_len + token_chunk_size)
         elif self.runner.scheduler_config.is_multi_step or \
             self.runner.model_config.is_encoder_decoder:
@@ -584,9 +590,39 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 context_len -= (self.runner.sparse_index_recompute_step - 1)
 
         # Compute tokens.
+        chunked_position_for_block_attention = None
+        chunked_cache_context_len = None
         if seq_data.prompt_embeds is None:
-            # TODO:[shk] 对于 block attention 来说 tokens 需要取特定区间
-            tokens = seq_data.get_token_ids()[context_len:seq_len]
+            # 对于 block attention 来说 tokens 需要取特定区间
+            if inter_data.is_prompt and inter_data.doc_ranges is not None and inter_data.rotary_position_offsets is not None:
+                tokens = []
+                chunked_position_for_block_attention = []
+                chunked_cache_context_len = 0
+                seq_token_ids = seq_data.get_token_ids()
+                for doc_range, rotary_postition_offset in zip(inter_data.doc_ranges, inter_data.rotary_position_offsets):
+                    if rotary_postition_offset == -1:
+                        tokens.extend(seq_token_ids[doc_range[0]:doc_range[1]]) 
+                        # 不连续的位置编码会导致异常输出，不可以使用 [doc_range[0],doc_range[1])
+                        # 需要使用 [doc_range[3], doc_range[3] + (doc_range[1] - doc_range[0]))
+                        chunked_position_for_block_attention.extend(range(doc_range[3], doc_range[3] + (doc_range[1] - doc_range[0])))
+                    else:
+                        chunked_cache_context_len += (doc_range[1] - doc_range[0])
+                assert inter_data.doc_ranges[-1][1] < seq_len
+                tokens.extend(seq_token_ids[inter_data.doc_ranges[-1][1]:seq_len])
+                # 起始位置 doc_ranges[-1][3] + doc_ranges[-1][2]
+                # 长度 seq_len - inter_data.doc_ranges[-1][1]
+                chunked_position_for_block_attention.extend(
+                    range(inter_data.doc_ranges[-1][3] + inter_data.doc_ranges[-1][2], 
+                          inter_data.doc_ranges[-1][3] + inter_data.doc_ranges[-1][2] + (seq_len - inter_data.doc_ranges[-1][1]))
+                )
+            else:
+                tokens = seq_data.get_token_ids()[context_len:seq_len]
+                if (not inter_data.is_prompt) and inter_data.doc_ranges is not None and inter_data.rotary_position_offsets is not None:
+                    # 位置偏移 
+                    position_offset = inter_data.doc_ranges[-1][3] + inter_data.doc_ranges[-1][2] - inter_data.doc_ranges[-1][1]
+                    chunked_position_for_block_attention = list(range(context_len + position_offset, seq_len + position_offset))
+                    logger.info(f"BLOCK_ATTENTION: {chunked_position_for_block_attention}")
+                
             prompt_embeds = None
         else:
             tokens = [0] * (seq_len - context_len)
@@ -602,13 +638,23 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         inter_data.seq_lens[seq_idx] = seq_len
         inter_data.orig_seq_lens[seq_idx] = seq_len
         inter_data.prompt_lens[seq_idx] = seq_data.get_prompt_len()
-        inter_data.context_lens[seq_idx] = context_len
+        # TODO[shk]: context_lens & query_lens 是否要修改
+        if chunked_cache_context_len is not None:
+            inter_data.context_lens[seq_idx] = chunked_cache_context_len
+        else:
+            inter_data.context_lens[seq_idx] = context_len
         inter_data.input_tokens[seq_idx].extend(tokens)
         inter_data.inputs_embeds = prompt_embeds
-        inter_data.input_positions[seq_idx].extend(range(context_len, seq_len))
+        if chunked_position_for_block_attention is not None:
+            inter_data.input_positions[seq_idx] = chunked_position_for_block_attention
+        else:
+            inter_data.input_positions[seq_idx].extend(range(context_len, seq_len))
         inter_data.token_types[seq_idx].extend(
             token_types if token_types else [])
-        inter_data.query_lens[seq_idx] = seq_len - context_len
+        if chunked_cache_context_len is not None:
+            inter_data.query_lens[seq_idx] = seq_len - chunked_cache_context_len
+        else:
+            inter_data.query_lens[seq_idx] = seq_len - context_len
 
         if seq_data.mrope_position_delta is not None:
             if inter_data.mrope_input_positions is None:
@@ -873,7 +919,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             doc_ranges=seq_group_metadata.doc_ranges,
             docs_hash=seq_group_metadata.docs_hash,
             kvcache_path=seq_group_metadata.kvcache_path,
-            cached_offset=seq_group_metadata.cached_offset,)
+            cached_offset=seq_group_metadata.cached_offset,
+            rotary_position_offsets=seq_group_metadata.rotary_position_offsets,)
 
         self.inter_data_list.append(inter_data)
 

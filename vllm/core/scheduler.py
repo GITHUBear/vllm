@@ -1799,6 +1799,8 @@ class Scheduler:
                 docs_hash = None
                 kvcache_path = None
                 cached_offset = None
+                rotary_offsets = None
+
                 if self.cache_config.enable_blend_prepare and is_prompt:
                     assert self.doc_metafile_handler is not None
                     assert (not self.scheduler_config.chunked_prefill_enabled)
@@ -1866,14 +1868,32 @@ class Scheduler:
                         if missed_cnt > 0:
                             logger.info(f"REQ:[{seq_group.request_id}] missed {missed_cnt} docs in {len(doc_ranges)}")
 
-                if self.enable_blk_attn_prefill and is_prompt:
-                    assert (not self.scheduler_config.chunked_prefill_enabled)
-                    seqs = seq_group.get_seqs()
-                    assert len(seqs) == 1
-                    if "doc_ranges" not in seqs[0].inputs:
-                        doc_ranges = None
+                if self.enable_blk_attn_prefill:
+                    if is_prompt:
+                        assert (not self.scheduler_config.chunked_prefill_enabled)
+                        seqs = seq_group.get_seqs()
+                        assert len(seqs) == 1
+                        if "doc_ranges" not in seqs[0].inputs:
+                            doc_ranges = None
+                        else:
+                            doc_ranges = seqs[0].inputs["doc_ranges"]
+                            assert self.block_manager._chunk_allocation_tracker is not None
+                            rotary_offsets = self.block_manager._chunk_allocation_tracker.get_rotary_position_offsets(seq_group.get_seqs()[0].seq_id)
+
+                        logger.info(f"============== BLOCK ATTN rotary_offsets: {rotary_offsets}  doc_ranges: {doc_ranges}")
+                        # 开启 block cache 时，sequence group meta 需要提供以下信息：
+                        # 1. 分块情况，即每个 chunk 的实际长度（非 block size 对齐长度）
+                        #    a. 对于无分块的，即认为一个 chunk，长度即当前 sequence 长度
+                        # 2. 每个分块 rotary offset，对于无分块或者未命中的分块，offset = -1
                     else:
-                        doc_ranges = seqs[0].inputs["doc_ranges"]
+                        assert self.block_manager._chunk_allocation_tracker is not None
+                        seqs = seq_group.get_seqs()
+                        assert len(seqs) >= 1
+                        if "doc_ranges" not in seqs[0].inputs:
+                            doc_ranges = None
+                        else:
+                            doc_ranges = seqs[0].inputs["doc_ranges"]
+                        rotary_offsets = self.block_manager._chunk_allocation_tracker.get_rotary_position_offsets(seq_group.get_seqs()[0].seq_id)
 
                 if self.cache_config.enable_pooling:
                     assert (not self.scheduler_config.chunked_prefill_enabled)
@@ -1927,6 +1947,8 @@ class Scheduler:
                     docs_hash=docs_hash,
                     kvcache_path=kvcache_path,
                     cached_offset=cached_offset,
+
+                    rotary_position_offsets=rotary_offsets,
                 )
                 if self.sparse_index_block_manager is not None:
                     self.sparse_index_block_manager.build_seq_group_meta_sparse_index_table(

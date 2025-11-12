@@ -230,10 +230,23 @@ class FlashAttentionMetadata(AttentionMetadata):
     cache_blend_static_index_cache: Optional[List] = None
 
     enable_blk_attn: bool = False
-    batch_idx_offset_for_blk_attn_tensor: Optional[torch.Tensor] = None
-    blk_attn_max_prefill_kv_len: Optional[int] = None
+    # batch_idx_offset_for_blk_attn_tensor: Optional[torch.Tensor] = None
+    blk_attn_prefill_cu_seqlens_q: Optional[torch.Tensor] = None
     blk_attn_max_prefill_q_len: Optional[int] = None
-    blk_attn_seq_start_loc_tensor: Optional[torch.Tensor] = None
+    blk_attn_prefill_seqused_k: Optional[torch.Tensor] = None
+    blk_attn_max_prefill_kv_len: Optional[int] = None
+    blk_attn_prefill_actual_chunked_seqlen_k: Optional[torch.Tensor] = None
+    blk_attn_prefill_chunk_rotary_offset_positions: Optional[torch.Tensor] = None
+    blk_attn_prefill_cu_num_chunks_k: Optional[torch.Tensor] = None
+
+    blk_attn_decode_cu_seqlens_q: Optional[torch.Tensor] = None
+    blk_attn_max_decode_q_len: Optional[int] = None
+    blk_attn_decode_seqused_k: Optional[torch.Tensor] = None
+    blk_attn_max_decode_kv_len: Optional[int] = None
+    blk_attn_decode_actual_chunked_seqlen_k: Optional[torch.Tensor] = None
+    blk_attn_decode_chunk_rotary_offset_positions: Optional[torch.Tensor] = None
+    blk_attn_decode_cu_num_chunks_k: Optional[torch.Tensor] = None
+    # blk_attn_seq_start_loc_tensor: Optional[torch.Tensor] = None
 
     @property
     def is_all_encoder_attn_metadata_set(self):
@@ -315,10 +328,16 @@ class FlashAttentionMetadata(AttentionMetadata):
             cached_offset=self.cached_offset,
             cache_blend_static_index_cache=self.cache_blend_static_index_cache,
             enable_blk_attn=self.enable_blk_attn,
-            batch_idx_offset_for_blk_attn_tensor=self.batch_idx_offset_for_blk_attn_tensor,
-            blk_attn_max_prefill_kv_len=self.blk_attn_max_prefill_kv_len,
+            # batch_idx_offset_for_blk_attn_tensor=self.batch_idx_offset_for_blk_attn_tensor,
+            blk_attn_prefill_cu_seqlens_q=self.blk_attn_prefill_cu_seqlens_q,
             blk_attn_max_prefill_q_len=self.blk_attn_max_prefill_q_len,
-            blk_attn_seq_start_loc_tensor=self.blk_attn_seq_start_loc_tensor)
+            blk_attn_prefill_seqused_k=self.blk_attn_prefill_seqused_k,
+            blk_attn_max_prefill_kv_len=self.blk_attn_max_prefill_kv_len,
+            blk_attn_prefill_actual_chunked_seqlen_k=self.blk_attn_prefill_actual_chunked_seqlen_k,
+            blk_attn_prefill_chunk_rotary_offset_positions=self.blk_attn_prefill_chunk_rotary_offset_positions,
+            blk_attn_prefill_cu_num_chunks_k=self.blk_attn_prefill_cu_num_chunks_k,
+            # blk_attn_seq_start_loc_tensor=self.blk_attn_seq_start_loc_tensor
+        )
         return self._cached_prefill_metadata
 
     @property
@@ -381,7 +400,17 @@ class FlashAttentionMetadata(AttentionMetadata):
             actual_seqlen_tensor=self.actual_seqlen_tensor,
             page_selector_max_block_size=self.page_selector_max_block_size,
             page_compress_topk=self.page_compress_topk,
-            seq_len_after_pooling_for_decode_tensor=self.seq_len_after_pooling_for_decode_tensor)
+            seq_len_after_pooling_for_decode_tensor=self.seq_len_after_pooling_for_decode_tensor,
+
+            enable_blk_attn=self.enable_blk_attn,
+            blk_attn_decode_cu_seqlens_q=self.blk_attn_decode_cu_seqlens_q,
+            blk_attn_max_decode_q_len=self.blk_attn_max_decode_q_len,
+            blk_attn_decode_seqused_k=self.blk_attn_decode_seqused_k,
+            blk_attn_max_decode_kv_len=self.blk_attn_max_decode_kv_len,
+            blk_attn_decode_actual_chunked_seqlen_k=self.blk_attn_decode_actual_chunked_seqlen_k,
+            blk_attn_decode_chunk_rotary_offset_positions=self.blk_attn_decode_chunk_rotary_offset_positions,
+            blk_attn_decode_cu_num_chunks_k=self.blk_attn_decode_cu_num_chunks_k,
+        )
         return self._cached_decode_metadata
 
     def advance_step(self,
@@ -460,6 +489,27 @@ class FlashAttentionMetadata(AttentionMetadata):
 
 class FlashAttentionMetadataBuilder(
         AttentionMetadataBuilder[FlashAttentionMetadata]):
+    
+    # Block Attention 需要处理的几个参数：
+    # 1. q：对于 prefill 的请求，需要处理未命中的 chunk （rotary offsets == -1）
+    #    对于 decode 请求，仅处理原始的 query len
+    #    对于非 chunk 请求，仅处理原始的 query len
+    # 2. cu_seqlens_q & max_seqlen_q：根据上述 query len 进行处理
+    # 3. seqused_k：对于 prefill 请求，对于未命中的 chunk，设置为 -1，每个请求的最后一个 chunk 使用整个序列长度
+    #    对于 decode 请求，仅处理最后一个 chunk，因此需要独立维护一个 kv_lens
+    #    对于非 chunk 请求，seqlen
+    # 4. max_seqlen_k：根据 kv_lens 获取
+    # 5. block_tables：对于 prefill 请求，未命中的 chunk 需要截取，以便计算 slot id；decode无需处理；
+    # 6. actual_chunked_seqlen_k：是 seqused_k 的 chunk 细分版本， 对于 prefill 请求，未命中的 chunk 设置为该 chunk 的长度，对于最后一个 chunk，设置为之前的 chunk 序列
+    #    对于 decode 请求，仅处理最后一个 chunk，设置为之前的 chunk 序列
+    #    对于非 chunk 请求，seqlen
+    # 7. chunk_rotray_offset_positions：对于 prefill 请求，未命中的 chunk 设置为 0，最后一个 chunk 设置命中 chunk的offset，同时非命中的设置为0，并且最后设置为 0
+    #    对于 decode 请求，按照 prefill 的最后一个块处理
+    #    对于非 chunk 请求，0
+    # 8. cu_num_chunks_k：对于 prefill 请求，未命中的 chunk 设置为 1，最后一个 chunk，设置为之前 chunk 序列长度 + 1
+    #    对于 decode 请求，仅处理最后一个 chunk
+    #    对于非 chunk 请求，1
+    # 9. local_key & local_value & local_cu_seqlen_k：仅在 prefill 时使用
 
     def __init__(self, input_builder: "ModelInputForGPUBuilder"):
         self.input_builder = input_builder
@@ -502,8 +552,19 @@ class FlashAttentionMetadataBuilder(
         self.docs_hash: List[list] = []
         self.kvcache_path: List[list] = []
         self.cached_offset: List[list] = []
-        self.batch_idx_offset_for_blk_attn: List[int] = []
-        self.blk_attn_prefill_seq_lens: List[int] = []
+        # self.batch_idx_offset_for_blk_attn: List[int] = []
+        # self.blk_attn_prefill_seq_lens: List[int] = []
+        # blk_attn_query_lens 即每段 chunk 的
+        self.chunked_prefill_query_lens: List[int] = []
+        self.chunked_decode_query_lens: List[int] = []
+        self.chunked_prefill_kv_lens: List[int] = []
+        self.chunked_decode_kv_lens: List[int] = []
+        self.detail_chunked_prefill_kv_lens: List[int] = []
+        self.detail_chunked_decode_kv_lens: List[int] = []
+        self.detail_chunked_prefill_rotary_offsets: List[int] = []
+        self.detail_chunked_decode_rotary_offsets: List[int] = []
+        self.detail_chunk_nums_prefill: List[int] = []
+        self.detail_chunk_nums_decode: List[int] = []
 
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
@@ -522,6 +583,7 @@ class FlashAttentionMetadataBuilder(
         docs_hash = inter_data.docs_hash
         kvcache_path = inter_data.kvcache_path
         cached_offset = inter_data.cached_offset
+        rotary_offsets = inter_data.rotary_position_offsets
         assert (not is_sparse_index_recompute) or (not is_recitify)
         
         block_tables = inter_data.block_tables
@@ -559,15 +621,59 @@ class FlashAttentionMetadataBuilder(
                 if not self.enble_blk_attn:
                     pass
                 elif doc_ranges is None:
-                    assert context_len == 0
-                    self.blk_attn_prefill_seq_lens.append(seq_len)
-                    self.batch_idx_offset_for_blk_attn.append(0)
+                    # 对于非 chunk 请求，仅处理原始的 query len
+                    self.chunked_prefill_query_lens.append(query_len)
+                    # 对于非 chunk 请求，seqlen
+                    self.chunked_prefill_kv_lens.append(seq_len)
+                    # 对于非 chunk 请求，seqlen
+                    self.detail_chunked_prefill_kv_lens.append(seq_len)
+                    # 对于非 chunk 请求，0
+                    self.detail_chunked_prefill_rotary_offsets.append(0)
+                    # 对于非 chunk 请求，1
+                    self.detail_chunk_nums_prefill.append(1)
+                    # assert context_len == 0
+                    # self.blk_attn_prefill_seq_lens.append(seq_len)
+                    # self.batch_idx_offset_for_blk_attn.append(0)
                 else:
-                    assert context_len == 0
-                    self.blk_attn_prefill_seq_lens.extend([(doc_range[1] - doc_range[0]) for doc_range in doc_ranges])
-                    self.blk_attn_prefill_seq_lens.append(seq_len - doc_ranges[-1][1])
-                    self.batch_idx_offset_for_blk_attn.extend([0] * len(doc_ranges))
-                    self.batch_idx_offset_for_blk_attn.append(len(doc_ranges))
+                    actual_chunk_lens_for_last_chunk = []
+                    rotary_offsets_for_last_chunk = []
+                    for doc_range, rotary_offset in zip(doc_ranges, rotary_offsets):
+                        actual_chunk_lens_for_last_chunk.append(doc_range[2])
+                        if rotary_offset == -1:
+                            self.num_prefills += 1 # 这里需要更新 num_prefills
+                            rotary_offsets_for_last_chunk.append(0)
+                            # 未命中 chunk，对齐后的长度
+                            self.chunked_prefill_query_lens.append(doc_range[1] - doc_range[0])
+                            # 未命中 chunk，seqused_k = -1
+                            self.chunked_prefill_kv_lens.append(-1)
+                            # 未命中 chunk，actual_chunked_seqlen_k 可以设置为对齐后的长度
+                            self.detail_chunked_prefill_kv_lens.append(doc_range[1] - doc_range[0])
+                            # 未命中 chunk，rotary offset = 0
+                            self.detail_chunked_prefill_rotary_offsets.append(0)
+                            # 未命中 chunk，chunk num = 1
+                            self.detail_chunk_nums_prefill.append(1)
+                        else:
+                            rotary_offsets_for_last_chunk.append(rotary_offset)
+                    # last chunk
+                    assert seq_len > doc_ranges[-1][1]
+                    # 最后一块，query_len 为剩余长度
+                    self.chunked_prefill_query_lens.append(seq_len - doc_ranges[-1][1])
+                    # 最后一块，seqused_k = seq_len
+                    self.chunked_prefill_kv_lens.append(seq_len)
+                    # 最后一块，chunk，actual_chunked_seqlen_k
+                    actual_chunk_lens_for_last_chunk.append(seq_len - doc_ranges[-1][1])
+                    self.detail_chunked_prefill_kv_lens.extend(actual_chunk_lens_for_last_chunk)
+                    # 最后一块，rotary_offsets
+                    rotary_offsets_for_last_chunk.append(0)
+                    self.detail_chunked_prefill_rotary_offsets.extend(rotary_offsets_for_last_chunk)
+                    # 最后一块，chunk_num
+                    assert len(actual_chunk_lens_for_last_chunk) == len(rotary_offsets_for_last_chunk)
+                    self.detail_chunk_nums_prefill.append(len(actual_chunk_lens_for_last_chunk))
+                    # assert context_len == 0
+                    # self.blk_attn_prefill_seq_lens.extend([(doc_range[1] - doc_range[0]) for doc_range in doc_ranges])
+                    # self.blk_attn_prefill_seq_lens.append(seq_len - doc_ranges[-1][1])
+                    # self.batch_idx_offset_for_blk_attn.extend([0] * len(doc_ranges))
+                    # self.batch_idx_offset_for_blk_attn.append(len(doc_ranges))
             else:
                 # decode
                 self.num_decode_tokens += query_len
@@ -601,15 +707,66 @@ class FlashAttentionMetadataBuilder(
                 else:
                     self.actual_curr_seq_lens.append(curr_seq_len)
 
+                if not self.enble_blk_attn:
+                    pass
+                elif doc_ranges is None:
+                    assert query_len == 1
+                    # 对于非 chunk 请求，query len = 1
+                    self.chunked_decode_query_lens.append(1)
+                    # 对于非 chunk 请求，seqlen
+                    self.chunked_decode_kv_lens.append(seq_len)
+                    # 对于非 chunk 请求，seqlen
+                    self.detail_chunked_decode_kv_lens.append(seq_len)
+                    # 对于非 chunk 请求，0
+                    self.detail_chunked_decode_rotary_offsets.append(0)
+                    # 对于非 chunk 请求，1
+                    self.detail_chunk_nums_decode.append(1)
+                else:
+                    assert query_len == 1
+                    actual_chunk_lens_for_last_chunk = []
+                    rotary_offsets_for_last_chunk = []
+                    for doc_range, rotary_offset in zip(doc_ranges, rotary_offsets):
+                        actual_chunk_lens_for_last_chunk.append(doc_range[2])
+                        if rotary_offset == -1:
+                            rotary_offsets_for_last_chunk.append(0)
+                        else:
+                            rotary_offsets_for_last_chunk.append(rotary_offset)
+                    # last chunk
+                    assert seq_len > doc_ranges[-1][1]
+                    # 最后一块，query_len = 1
+                    self.chunked_decode_query_lens.append(1)
+                    # 最后一块，seqused_k = seq_len
+                    self.chunked_decode_kv_lens.append(seq_len)
+                    # 最后一块，chunk，actual_chunked_seqlen_k
+                    actual_chunk_lens_for_last_chunk.append(seq_len - doc_ranges[-1][1])
+                    self.detail_chunked_decode_kv_lens.extend(actual_chunk_lens_for_last_chunk)
+                    # 最后一块，rotary_offsets
+                    rotary_offsets_for_last_chunk.append(0)
+                    self.detail_chunked_decode_rotary_offsets.extend(rotary_offsets_for_last_chunk)
+                    # 最后一块，chunk_num
+                    assert len(actual_chunk_lens_for_last_chunk) == len(rotary_offsets_for_last_chunk)
+                    self.detail_chunk_nums_decode.append(len(actual_chunk_lens_for_last_chunk))
+
             # Compute block table.
             # TODO(sang): Combine chunked prefill and prefix caching by
             # only allowing multiple of block_size chunk size.
             # NOTE: This only works for oooooooxxx style attention.
             block_table = []
+            chunked_block_ranges = []
             if prefix_cache_hit or (self.enble_blk_attn and block_tables is not None):
                 # NOTE(woosuk): For flash-attn, the block table should
                 # include the entries for the incoming prefill tokens.
                 block_table = block_tables[seq_id]
+                # 对于 prefill 请求，未命中的 chunk 需要截取 block_table；decode无需处理；
+                if self.enble_blk_attn and is_prompt and doc_ranges is not None:
+                    for doc_range, rotary_offset in zip(doc_ranges, rotary_offsets):
+                        assert (doc_range[0] % self.block_size == 0) and (doc_range[1] % self.block_size == 0)
+                        if rotary_offset == -1:
+                            block_ranges = (doc_range[0] // self.block_size, doc_range[1] // self.block_size, doc_range[1] - doc_range[0])
+                            chunked_block_ranges.append(block_ranges)
+                            self.block_tables.append(block_table[block_ranges[0]:block_ranges[1]])
+                    chunked_block_ranges.append((doc_ranges[-1][1] // self.block_size, len(block_table), seq_len - doc_ranges[-1][1]))
+
             elif ((chunked_prefill_enabled or not is_prompt)
                   and block_tables is not None):
                 if curr_sliding_window_block == 0:
@@ -631,10 +788,19 @@ class FlashAttentionMetadataBuilder(
             start_idx = compute_slot_mapping_start_idx(is_prompt, query_len,
                                                        context_len,
                                                        self.sliding_window)
-            compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
-                                 seq_len, context_len, start_idx,
-                                 self.block_size, inter_data.block_tables,
-                                 pooling_token_delta=pooling_token_delta)
+            if len(chunked_block_ranges) > 0:
+                assert start_idx == 0
+                for chunked_block_range in chunked_block_ranges:
+                    compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
+                                    chunked_block_range[2], 0, 0,
+                                    self.block_size, inter_data.block_tables,
+                                    pooling_token_delta=0,
+                                    chunked_block_range=chunked_block_range)
+            else:
+                compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
+                                    seq_len, context_len, start_idx,
+                                    self.block_size, inter_data.block_tables,
+                                    pooling_token_delta=pooling_token_delta)
 
     def _get_graph_runner_block_tables(
             self, num_seqs: int,
@@ -704,20 +870,30 @@ class FlashAttentionMetadataBuilder(
         max_prefill_seq_len = max(self.prefill_seq_lens, default=0)
         # max_sparse_index_decode_seq_len = max(self.use_sparse_index_seq_lens, default=0)
         max_decode_seq_len = max(self.curr_seq_lens, default=0)
-        if self.enble_blk_attn:
-            blk_attn_max_prefill_q_len = max(self.blk_attn_prefill_seq_lens, default = 0)
-            blk_attn_max_prefill_kv_len = max_prefill_seq_len
-        else:
-            blk_attn_max_prefill_q_len = 0
-            blk_attn_max_prefill_kv_len = None
+
+        blk_attn_prefill_cu_seqlens_q = list(accumulate(self.chunked_prefill_query_lens, initial=0)) if self.enble_blk_attn else None
+        blk_attn_max_prefill_q_len = max(self.chunked_prefill_query_lens, default=0) if self.enble_blk_attn else None
+        blk_attn_prefill_seqused_k = self.chunked_prefill_kv_lens if self.enble_blk_attn else None
+        blk_attn_max_prefill_kv_len = max(self.chunked_prefill_kv_lens, default=0) if self.enble_blk_attn else None
+        blk_attn_prefill_actual_chunked_seqlen_k = self.detail_chunked_prefill_kv_lens if self.enble_blk_attn else None
+        blk_attn_prefill_chunk_rotary_offset_positions = self.detail_chunked_prefill_rotary_offsets if self.enble_blk_attn else None
+        blk_attn_prefill_cu_num_chunks_k = list(accumulate(self.detail_chunk_nums_prefill, initial=0)) if self.enble_blk_attn else None
+
+        blk_attn_decode_cu_seqlens_q = list(accumulate(self.chunked_decode_query_lens, initial=0)) if self.enble_blk_attn else None
+        blk_attn_max_decode_q_len = max(self.chunked_decode_query_lens, default=0) if self.enble_blk_attn else None
+        blk_attn_decode_seqused_k = self.chunked_decode_kv_lens if self.enble_blk_attn else None
+        blk_attn_max_decode_kv_len = max(self.chunked_decode_kv_lens, default=0) if self.enble_blk_attn else None
+        blk_attn_decode_actual_chunked_seqlen_k = self.detail_chunked_decode_kv_lens if self.enble_blk_attn else None
+        blk_attn_decode_chunk_rotary_offset_positions = self.detail_chunked_decode_rotary_offsets if self.enble_blk_attn else None
+        blk_attn_decode_cu_num_chunks_k = list(accumulate(self.detail_chunk_nums_decode, initial=0)) if self.enble_blk_attn else None
 
         num_decode_tokens = self.num_decode_tokens
         query_start_loc = list(accumulate(query_lens, initial=0))
         seq_start_loc = list(accumulate(seq_lens, initial=0))
-        if self.enble_blk_attn:
-            blk_attn_seq_start_loc = list(accumulate(self.blk_attn_prefill_seq_lens, initial=0))
-        else:
-            blk_attn_seq_start_loc = []
+        # if self.enble_blk_attn:
+        #     blk_attn_seq_start_loc = list(accumulate(self.blk_attn_prefill_seq_lens, initial=0))
+        # else:
+        #     blk_attn_seq_start_loc = []
 
         num_seqs = len(seq_lens)
         if use_captured_graph:
@@ -788,16 +964,38 @@ class FlashAttentionMetadataBuilder(
             for modality, placeholder_map in
             self.multimodal_placeholder_maps.items()
         }
-        batch_idx_offset_for_blk_attn_tensor = async_tensor_h2d(
-            self.batch_idx_offset_for_blk_attn,
-            torch.int32,
-            device, self.runner.pin_memory
-        )
-        blk_attn_seq_start_loc_tensor = async_tensor_h2d(
-            blk_attn_seq_start_loc,
-            torch.int32,
-            device, self.runner.pin_memory
-        )
+        # batch_idx_offset_for_blk_attn_tensor = async_tensor_h2d(
+        #     self.batch_idx_offset_for_blk_attn,
+        #     torch.int32,
+        #     device, self.runner.pin_memory
+        # )
+        # blk_attn_seq_start_loc_tensor = async_tensor_h2d(
+        #     blk_attn_seq_start_loc,
+        #     torch.int32,
+        #     device, self.runner.pin_memory
+        # )
+
+        if blk_attn_prefill_cu_seqlens_q is not None:
+            blk_attn_prefill_cu_seqlens_q = async_tensor_h2d(blk_attn_prefill_cu_seqlens_q, torch.int32, device, self.runner.pin_memory)
+        if blk_attn_prefill_seqused_k is not None:
+            blk_attn_prefill_seqused_k = async_tensor_h2d(blk_attn_prefill_seqused_k, torch.int32, device, self.runner.pin_memory)
+        if blk_attn_prefill_actual_chunked_seqlen_k is not None:
+            blk_attn_prefill_actual_chunked_seqlen_k = async_tensor_h2d(blk_attn_prefill_actual_chunked_seqlen_k, torch.int32, device, self.runner.pin_memory)
+        if blk_attn_prefill_chunk_rotary_offset_positions is not None:
+            blk_attn_prefill_chunk_rotary_offset_positions = async_tensor_h2d(blk_attn_prefill_chunk_rotary_offset_positions, torch.int32, device, self.runner.pin_memory)
+        if blk_attn_prefill_cu_num_chunks_k is not None:
+            blk_attn_prefill_cu_num_chunks_k = async_tensor_h2d(blk_attn_prefill_cu_num_chunks_k, torch.int32, device, self.runner.pin_memory)
+
+        if blk_attn_decode_cu_seqlens_q is not None:
+            blk_attn_decode_cu_seqlens_q = async_tensor_h2d(blk_attn_decode_cu_seqlens_q, torch.int32, device, self.runner.pin_memory)
+        if blk_attn_decode_seqused_k is not None:
+            blk_attn_decode_seqused_k = async_tensor_h2d(blk_attn_decode_seqused_k, torch.int32, device, self.runner.pin_memory)
+        if blk_attn_decode_actual_chunked_seqlen_k is not None:
+            blk_attn_decode_actual_chunked_seqlen_k = async_tensor_h2d(blk_attn_decode_actual_chunked_seqlen_k, torch.int32, device, self.runner.pin_memory)
+        if blk_attn_decode_chunk_rotary_offset_positions is not None:
+            blk_attn_decode_chunk_rotary_offset_positions = async_tensor_h2d(blk_attn_decode_chunk_rotary_offset_positions, torch.int32, device, self.runner.pin_memory)
+        if blk_attn_decode_cu_num_chunks_k is not None:
+            blk_attn_decode_cu_num_chunks_k = async_tensor_h2d(blk_attn_decode_cu_num_chunks_k, torch.int32, device, self.runner.pin_memory)
 
         return FlashAttentionMetadata(
             num_prefills=self.num_prefills,
@@ -835,10 +1033,23 @@ class FlashAttentionMetadataBuilder(
             cached_offset=self.cached_offset,
             cache_blend_static_index_cache=None,
             enable_blk_attn=self.enble_blk_attn,
-            batch_idx_offset_for_blk_attn_tensor=batch_idx_offset_for_blk_attn_tensor,
-            blk_attn_max_prefill_kv_len=blk_attn_max_prefill_kv_len,
+            # batch_idx_offset_for_blk_attn_tensor=batch_idx_offset_for_blk_attn_tensor,
+            # blk_attn_seq_start_loc_tensor=blk_attn_seq_start_loc_tensor,
+            blk_attn_prefill_cu_seqlens_q=blk_attn_prefill_cu_seqlens_q,
             blk_attn_max_prefill_q_len=blk_attn_max_prefill_q_len,
-            blk_attn_seq_start_loc_tensor=blk_attn_seq_start_loc_tensor,
+            blk_attn_prefill_seqused_k=blk_attn_prefill_seqused_k,
+            blk_attn_max_prefill_kv_len=blk_attn_max_prefill_kv_len,
+            blk_attn_prefill_actual_chunked_seqlen_k=blk_attn_prefill_actual_chunked_seqlen_k,
+            blk_attn_prefill_chunk_rotary_offset_positions=blk_attn_prefill_chunk_rotary_offset_positions,
+            blk_attn_prefill_cu_num_chunks_k=blk_attn_prefill_cu_num_chunks_k,
+
+            blk_attn_decode_cu_seqlens_q=blk_attn_decode_cu_seqlens_q,
+            blk_attn_max_decode_q_len=blk_attn_max_decode_q_len,
+            blk_attn_decode_seqused_k=blk_attn_decode_seqused_k,
+            blk_attn_max_decode_kv_len=blk_attn_max_decode_kv_len,
+            blk_attn_decode_actual_chunked_seqlen_k=blk_attn_decode_actual_chunked_seqlen_k,
+            blk_attn_decode_chunk_rotary_offset_positions=blk_attn_decode_chunk_rotary_offset_positions,
+            blk_attn_decode_cu_num_chunks_k=blk_attn_decode_cu_num_chunks_k,
         )
 
 class BlendType(IntEnum):
@@ -1186,14 +1397,31 @@ class FlashAttentionImpl(AttentionImpl):
 
         # 参数目前硬编码
         # TODO[shk]: 传入参数
-        self.blend_rotary = RotaryEmbedding(
-            head_size=self.head_size,
-            rotary_dim=self.head_size,
-            max_position_embeddings=32768,
-            base=1000000.0,
-            is_neox_style=True,
-            dtype=torch.bfloat16,
-        )
+        # self.blend_rotary = RotaryEmbedding(
+        #     head_size=self.head_size,
+        #     rotary_dim=self.head_size,
+        #     max_position_embeddings=32768,
+        #     base=1000000.0,
+        #     is_neox_style=True,
+        #     dtype=torch.bfloat16,
+        # )
+            
+        self._cos_sin_cache = self._init_cos_sin_cache()
+
+    def _init_cos_sin_cache(
+        self,
+        base = 1000000.0,
+        rotary_dim = 128,
+        max_position_embeddings = 32768,
+    ):
+        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cos_sin_cache = torch.cat((cos, sin), dim=-1).to(dtype=torch.float16)
+        assert cos_sin_cache.stride(-1) == 1
+        return cos_sin_cache
     
     def apply_rotary(
         self,
@@ -1204,11 +1432,11 @@ class FlashAttentionImpl(AttentionImpl):
             return key
         tensor_len = key.shape[0]
         positions = torch.tensor([offset]*tensor_len, dtype=torch.int64, device=key.device)
-        key, _ = self.blend_rotary.forward_cuda(
-            positions=positions,
-            query=key,
-            key=None,
-        )
+        # key, _ = self.blend_rotary.forward_cuda(
+        #     positions=positions,
+        #     query=key,
+        #     key=None,
+        # )
         del positions
         return key
 
@@ -2144,11 +2372,11 @@ class FlashAttentionImpl(AttentionImpl):
                 q_seq_start_loc, q_seq_len, k_seq_start_loc, k_seq_len = \
                     _get_query_key_seq_metadata(prefill_meta, True, attn_type)
 
-                if prefill_meta.enable_blk_attn:
-                    q_seq_start_loc = prefill_meta.blk_attn_seq_start_loc_tensor
-                    k_seq_start_loc = prefill_meta.blk_attn_seq_start_loc_tensor
-                    q_seq_len = prefill_meta.blk_attn_max_prefill_q_len
-                    k_seq_len = prefill_meta.blk_attn_max_prefill_kv_len
+                # if prefill_meta.enable_blk_attn:
+                #     q_seq_start_loc = prefill_meta.blk_attn_seq_start_loc_tensor
+                #     k_seq_start_loc = prefill_meta.blk_attn_seq_start_loc_tensor
+                #     q_seq_len = prefill_meta.blk_attn_max_prefill_q_len
+                #     k_seq_len = prefill_meta.blk_attn_max_prefill_kv_len
 
                 key = key[:num_prefill_kv_tokens]
                 value = value[:num_prefill_kv_tokens]
@@ -2189,7 +2417,7 @@ class FlashAttentionImpl(AttentionImpl):
                         cu_seqlens_k=k_seq_start_loc,
                         max_seqlen_q=q_seq_len,
                         max_seqlen_k=k_seq_len,
-                        batch_idx_offset_for_blk_attn=prefill_meta.batch_idx_offset_for_blk_attn_tensor if prefill_meta.enable_blk_attn else None,
+                        # batch_idx_offset_for_blk_attn=prefill_meta.batch_idx_offset_for_blk_attn_tensor if prefill_meta.enable_blk_attn else None,
                         softmax_scale=softmax_scale,
                         causal=_get_causal_option(attn_type),
                         window_size=window_size,
@@ -2382,26 +2610,58 @@ class FlashAttentionImpl(AttentionImpl):
                     descale_shape = (prefill_meta.query_start_loc.shape[0] - 1,
                                     key.shape[1])
 
-                    flash_attn_varlen_func(  # noqa
-                        q=query,
-                        k=key_cache,
-                        v=value_cache,
-                        cu_seqlens_q=prefill_meta.query_start_loc,
-                        max_seqlen_q=prefill_meta.max_query_len,
-                        seqused_k=prefill_meta.seq_lens_tensor,
-                        max_seqlen_k=max_seq_len,
-                        softmax_scale=softmax_scale,
-                        causal=True,
-                        window_size=window_size,
-                        alibi_slopes=alibi_slopes,
-                        block_table=prefill_meta.block_tables,
-                        softcap=logits_soft_cap,
-                        out=prefill_output,
-                        fa_version=self.vllm_flash_attn_version,
-                        q_descale=layer._q_scale.expand(descale_shape),
-                        k_descale=layer._k_scale.expand(descale_shape),
-                        v_descale=layer._v_scale.expand(descale_shape),
-                    )
+                    if prefill_meta.enable_blk_attn:
+                        assert query.dtype == torch.float16
+                        flash_attn_varlen_func(  # noqa
+                            q=query,
+                            k=key_cache,
+                            v=value_cache,
+                            cu_seqlens_q=prefill_meta.blk_attn_prefill_cu_seqlens_q,
+                            max_seqlen_q=prefill_meta.blk_attn_max_prefill_q_len,
+                            seqused_k=prefill_meta.blk_attn_prefill_seqused_k,
+                            max_seqlen_k=prefill_meta.blk_attn_max_prefill_kv_len,
+                            softmax_scale=softmax_scale,
+                            causal=True,
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            block_table=prefill_meta.block_tables,
+
+                            actual_chunked_seqlen_k=prefill_meta.blk_attn_prefill_actual_chunked_seqlen_k,
+                            chunk_rotray_offset_positions=prefill_meta.blk_attn_prefill_chunk_rotary_offset_positions,
+                            cu_num_chunks_k=prefill_meta.blk_attn_prefill_cu_num_chunks_k,
+                            cos_sin_cache=self._cos_sin_cache,
+                            local_key=key,
+                            local_value=value,
+                            local_cu_seqlen_k=prefill_meta.blk_attn_prefill_cu_seqlens_q,
+
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                            q_descale=layer._q_scale.expand(descale_shape),
+                            k_descale=layer._k_scale.expand(descale_shape),
+                            v_descale=layer._v_scale.expand(descale_shape),
+                        )
+                    else:
+                        flash_attn_varlen_func(  # noqa
+                            q=query,
+                            k=key_cache,
+                            v=value_cache,
+                            cu_seqlens_q=prefill_meta.query_start_loc,
+                            max_seqlen_q=prefill_meta.max_query_len,
+                            seqused_k=prefill_meta.seq_lens_tensor,
+                            max_seqlen_k=max_seq_len,
+                            softmax_scale=softmax_scale,
+                            causal=True,
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            block_table=prefill_meta.block_tables,
+                            softcap=logits_soft_cap,
+                            out=prefill_output,
+                            fa_version=self.vllm_flash_attn_version,
+                            q_descale=layer._q_scale.expand(descale_shape),
+                            k_descale=layer._k_scale.expand(descale_shape),
+                            v_descale=layer._v_scale.expand(descale_shape),
+                        )
 
                     if self.enable_attn_out_dump:
                         print(f"================== ENABLE ATTN OUT DUMP {self.tp_rank} {self.layer_idx} ================")
@@ -2831,46 +3091,92 @@ class FlashAttentionImpl(AttentionImpl):
                     # else:
                     # if dbg_num_compressed_page == 258:
                     #     print("dbg")
-                    if block_index_gpu_cache is not None and block_index_gpu_cache.size(0) > 0:
-                        flash_attn_with_kvcache(
-                            q=decode_query.unsqueeze(1),
-                            k_cache=key_cache,
-                            v_cache=value_cache,
-                            block_table=block_tables_arg,
-                            page_compress_cache=block_index_gpu_cache,
-                            page_compress_cache_ids=page_compress_cache_ids_tensor,
-                            num_compressed_pages=num_compressed_page_tensor,
-                            cache_seqlens=actual_seqlen_tensor,
+                    if decode_meta.enable_blk_attn:
+                        assert query.dtype == torch.float16
+                        flash_attn_varlen_func(  # noqa
+                            q=decode_query,
+                            k=key_cache,
+                            v=value_cache,
+                            cu_seqlens_q=decode_meta.blk_attn_decode_cu_seqlens_q,
+                            max_seqlen_q=decode_meta.blk_attn_max_decode_q_len,
+                            seqused_k=decode_meta.blk_attn_decode_seqused_k,
+                            max_seqlen_k=decode_meta.blk_attn_max_decode_kv_len,
                             softmax_scale=softmax_scale,
                             causal=True,
                             window_size=window_size,
                             alibi_slopes=alibi_slopes,
+                            block_table=block_tables_arg,
+
+                            actual_chunked_seqlen_k=decode_meta.blk_attn_decode_actual_chunked_seqlen_k,
+                            chunk_rotray_offset_positions=decode_meta.blk_attn_decode_chunk_rotary_offset_positions,
+                            cu_num_chunks_k=decode_meta.blk_attn_decode_cu_num_chunks_k,
+                            cos_sin_cache=self._cos_sin_cache,
+
                             softcap=logits_soft_cap,
-                            out=decode_output.unsqueeze(1),
+                            out=decode_output,
                             fa_version=self.vllm_flash_attn_version,
                             q_descale=layer._q_scale.expand(descale_shape),
                             k_descale=layer._k_scale.expand(descale_shape),
                             v_descale=layer._v_scale.expand(descale_shape),
-                            actual_max_num_blocks_per_seq=actual_max_num_blocks_per_seq,
                         )
+                        # flash_attn_with_kvcache(
+                        #     q=decode_query.unsqueeze(1),
+                        #     k_cache=key_cache,
+                        #     v_cache=value_cache,
+                        #     block_table=block_tables_arg,
+                        #     cache_seqlens=seq_lens_arg,
+                        #     softmax_scale=softmax_scale,
+                        #     causal=True,
+                        #     window_size=window_size,
+                        #     alibi_slopes=alibi_slopes,
+                        #     softcap=logits_soft_cap,
+                        #     out=decode_output.unsqueeze(1),
+                        #     fa_version=self.vllm_flash_attn_version,
+                        #     q_descale=layer._q_scale.expand(descale_shape),
+                        #     k_descale=layer._k_scale.expand(descale_shape),
+                        #     v_descale=layer._v_scale.expand(descale_shape),
+                        # )
                     else:
-                        flash_attn_with_kvcache(
-                            q=decode_query.unsqueeze(1),
-                            k_cache=key_cache,
-                            v_cache=value_cache,
-                            block_table=block_tables_arg,
-                            cache_seqlens=seq_lens_arg,
-                            softmax_scale=softmax_scale,
-                            causal=True,
-                            window_size=window_size,
-                            alibi_slopes=alibi_slopes,
-                            softcap=logits_soft_cap,
-                            out=decode_output.unsqueeze(1),
-                            fa_version=self.vllm_flash_attn_version,
-                            q_descale=layer._q_scale.expand(descale_shape),
-                            k_descale=layer._k_scale.expand(descale_shape),
-                            v_descale=layer._v_scale.expand(descale_shape),
-                        )
+                        if block_index_gpu_cache is not None and block_index_gpu_cache.size(0) > 0:
+                            flash_attn_with_kvcache(
+                                q=decode_query.unsqueeze(1),
+                                k_cache=key_cache,
+                                v_cache=value_cache,
+                                block_table=block_tables_arg,
+                                page_compress_cache=block_index_gpu_cache,
+                                page_compress_cache_ids=page_compress_cache_ids_tensor,
+                                num_compressed_pages=num_compressed_page_tensor,
+                                cache_seqlens=actual_seqlen_tensor,
+                                softmax_scale=softmax_scale,
+                                causal=True,
+                                window_size=window_size,
+                                alibi_slopes=alibi_slopes,
+                                softcap=logits_soft_cap,
+                                out=decode_output.unsqueeze(1),
+                                fa_version=self.vllm_flash_attn_version,
+                                q_descale=layer._q_scale.expand(descale_shape),
+                                k_descale=layer._k_scale.expand(descale_shape),
+                                v_descale=layer._v_scale.expand(descale_shape),
+                                actual_max_num_blocks_per_seq=actual_max_num_blocks_per_seq,
+                            )
+                        else:
+                            flash_attn_with_kvcache(
+                                q=decode_query.unsqueeze(1),
+                                k_cache=key_cache,
+                                v_cache=value_cache,
+                                block_table=block_tables_arg,
+                                cache_seqlens=seq_lens_arg,
+                                softmax_scale=softmax_scale,
+                                causal=True,
+                                window_size=window_size,
+                                alibi_slopes=alibi_slopes,
+                                softcap=logits_soft_cap,
+                                out=decode_output.unsqueeze(1),
+                                fa_version=self.vllm_flash_attn_version,
+                                q_descale=layer._q_scale.expand(descale_shape),
+                                k_descale=layer._k_scale.expand(descale_shape),
+                                v_descale=layer._v_scale.expand(descale_shape),
+                            )
                 else:
                     # Just to check whether sparse pattern exists.
                     seq_len_cpu = seq_lens_arg.cpu().tolist()

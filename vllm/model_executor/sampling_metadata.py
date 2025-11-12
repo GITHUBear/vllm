@@ -283,6 +283,9 @@ def _prepare_seq_groups(
             num_prefill_sample = len(seq_ids)
             assert num_prefill_sample == 1
             assert query_lens is not None and seq_lens is not None
+            # 注意到这里使用 query len 计算了 prompt_logprob_len
+            # 而 prompt_logprob_len 用于确定 selected_token_indices 的范围
+            # 所以在 model runner prepare_model_input 时需要修正 query_len 和 context_len
             query_len, seq_len = query_lens[i], seq_lens[i]
             # If we need sampling, exclude num_prefill_sample tokens from
             # prompt logprob.

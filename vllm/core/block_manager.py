@@ -168,15 +168,15 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             return AllocStatus.LATER
 
     def _allocate_sequence(self, seq: Sequence) -> BlockTable:
+        doc_ranges = seq.inputs.get("doc_ranges", None)
         block_table = BlockTable(
             block_size=self.block_size,
             block_allocator=self.block_allocator,
             max_block_sliding_window=self.max_block_sliding_window,
             enable_pooling=self.enable_pooling,
             pooling_blk_size=self.pooling_blk_size,
-            enable_chunk_caching=self.enable_chunk_caching,
+            enable_chunk_caching=(self.enable_chunk_caching and doc_ranges is not None),
         )
-        doc_ranges = seq.inputs.get("doc_ranges", None)
         if seq.get_token_ids():
             # NOTE: If there are any factors affecting the block besides
             # token_ids, they should be added as input to extra_hash.

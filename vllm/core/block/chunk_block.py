@@ -20,6 +20,7 @@ class ChunkMeta:
         chunk_start_token_offset: int,
         chunk_end_token_offset: int,
         num_tokens: int,
+        rotary_offset: int,
         block_ref_counter: RefCounter,
     ):
         assert (chunk_start_token_offset % block_size == 0) and (chunk_end_token_offset % block_size == 0)
@@ -27,6 +28,7 @@ class ChunkMeta:
         self._chunk_start_token_offset = chunk_start_token_offset
         self._chunk_end_token_offset = chunk_end_token_offset
         self._num_tokens = num_tokens
+        self._rotary_offset = rotary_offset
         self._block_size = block_size
         self._chunk_hash = chunk_hash
 
@@ -66,17 +68,19 @@ class ChunkAllocationInfo:
         state: ChunkAllocationState,
         chunk_start_token_offset: Optional[int],
         chunk_end_token_offset: Optional[int],
+        rotary_offset: Optional[int],
         chunk_hash: Optional[str],
-        origin_chunk_start_token_offset: Optional[int],
+        origin_chunk_rotary_offset: Optional[int],
     ):
         self._state = state
         self._chunk_hash = chunk_hash
         self._chunk_start_token_offset = chunk_start_token_offset
         self._chunk_end_token_offset = chunk_end_token_offset
+        self._rotary_offset = rotary_offset
         self._delta_rotray_offset = None
-        if origin_chunk_start_token_offset is not None:
-            assert chunk_start_token_offset is not None
-            self._delta_rotray_offset = chunk_start_token_offset - origin_chunk_start_token_offset
+        if origin_chunk_rotary_offset is not None:
+            assert rotary_offset is not None
+            self._delta_rotray_offset = rotary_offset - origin_chunk_rotary_offset
     
     def __repr__(self):
         return (
@@ -84,6 +88,7 @@ class ChunkAllocationInfo:
             f"chunk_start:{self._chunk_start_token_offset}\n"
             f"chunk_end:{self._chunk_end_token_offset}\n"
             f"chunk_hash:{self._chunk_hash}\n"
+            f"rotary_offset:{self._rotary_offset}\n"
             f"delta_rotray_offset:{self._delta_rotray_offset}\n]"
         )
 
@@ -235,8 +240,9 @@ class ChunkCachingBlockAllocator(BlockAllocator):
                             state=ChunkAllocationState.HIT_CHUNK,
                             chunk_start_token_offset=doc_range[0],
                             chunk_end_token_offset=doc_range[1],
+                            rotary_offset=doc_range[3],
                             chunk_hash=chunk_hash,
-                            origin_chunk_start_token_offset=chunk_meta._chunk_start_token_offset,
+                            origin_chunk_rotary_offset=chunk_meta._rotary_offset,
                         )
                     )
                     return blocks
@@ -266,6 +272,7 @@ class ChunkCachingBlockAllocator(BlockAllocator):
                     chunk_start_token_offset=doc_range[0],
                     chunk_end_token_offset=doc_range[1],
                     num_tokens=doc_range[2],
+                    rotary_offset=doc_range[3],
                     block_ref_counter=self._refcounter,
                 )
                 self._incr_refcount_cached_chunk(new_chunk_meta)
@@ -276,8 +283,9 @@ class ChunkCachingBlockAllocator(BlockAllocator):
                     state=ChunkAllocationState.FUTURE_CHUNK,
                     chunk_start_token_offset=doc_range[0],
                     chunk_end_token_offset=doc_range[1],
+                    rotary_offset=doc_range[3],
                     chunk_hash=chunk_hash,
-                    origin_chunk_start_token_offset=None,
+                    origin_chunk_rotary_offset=None,
                 )
             )
             self._touched_chunk.append(chunk_hash)
@@ -579,6 +587,20 @@ class ChunkAllocationTracker:
         """
         assert seq_id not in self._seq_chunk_alloc_info
         self._seq_chunk_alloc_info[seq_id] = chunk_alloc_info
+    
+    def get_rotary_position_offsets(self, seq_id: int):
+        assert seq_id in self._seq_chunk_alloc_info
+        chunk_alloc_info = self._seq_chunk_alloc_info[seq_id]
+        # 未命中设置为 -1
+        if len(chunk_alloc_info) == 0:
+            return [-1]
+        rotary_pos_offsets = []
+        for info in chunk_alloc_info:
+            if info._state == ChunkAllocationState.HIT_CHUNK:
+                rotary_pos_offsets.append(info._delta_rotray_offset)
+            else:
+                rotary_pos_offsets.append(-1)
+        return rotary_pos_offsets
 
     def remove_seq(self, seq_id: int) -> None:
         """Stop tracking seq_id

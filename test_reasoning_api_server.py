@@ -54,10 +54,11 @@ data = {
     "messages": [
         {"role": "system", "content": block_system_prompt2},
         {"role": "user", "content": user_prompt2},
+        # {"role": "user", "content": "你是谁"},
         # {"role": "user", "content": prompt_template.format(question=question)},
         # {"role": "user", "content": prompt},
     ],
-    "temperature": 0.8,
+    "temperature": 0.0,
     "stream": True,
     # "ignore_eos": True,
     # "max_tokens": 65537,

@@ -64,7 +64,7 @@ class BlockTable:
         self._enable_pooling = enable_pooling
         self._pooling_blk_size = pooling_blk_size
         self._enable_chunk_caching = enable_chunk_caching
-        self._chunk_alloc_info = None
+        self._chunk_alloc_info = []
         if self._enable_chunk_caching:
             if chunk_alloc_info is None:
                 chunk_alloc_info = []

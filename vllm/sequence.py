@@ -21,6 +21,8 @@ from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from vllm.core.block.chunk_block import ChunkAllocationInfo
+
 VLLM_TOKEN_ID_ARRAY_TYPE = "l"
 
 VLLM_INVALID_TOKEN_ID = -1
@@ -1123,6 +1125,8 @@ class SequenceGroupMetadata(
     docs_hash: Optional[list] = None
     kvcache_path: Optional[list] = None
     cached_offset: Optional[list] = None
+
+    rotary_position_offsets: Optional[list] = None
 
     def __post_init__(self):
         if self.seq_data is not None and self.token_chunk_size is None:

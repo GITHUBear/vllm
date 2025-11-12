@@ -529,10 +529,13 @@ class OpenAIServing:
                 non_sep_token_cnter += 1
                 new_input_ids.append(token_id)
         assert len(tmp_doc_ranges) % 2 == 0
+        cu_actual_len = 0
         if len(tmp_doc_ranges) > 0:
-            doc_ranges.append((0, tmp_doc_ranges[0], actual_len[0]))
+            doc_ranges.append((0, tmp_doc_ranges[0], actual_len[0], cu_actual_len))
+            cu_actual_len += actual_len[0]
         for i, l in zip(range(0, len(tmp_doc_ranges), 2), actual_len[1:]):
-            doc_ranges.append((tmp_doc_ranges[i], tmp_doc_ranges[i + 1], l))
+            doc_ranges.append((tmp_doc_ranges[i], tmp_doc_ranges[i + 1], l, cu_actual_len))
+            cu_actual_len += l
 
         logger.info(f"========== DOC OFFSETS: {doc_ranges} ============")
         if len(doc_ranges) == 0:
