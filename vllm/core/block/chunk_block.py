@@ -8,8 +8,15 @@ from vllm.core.block.common import (BlockPool, CopyOnWriteTracker, RefCounter,
                                     get_all_blocks_recursively)
 from vllm.core.block.interfaces import Block, BlockAllocator, BlockId, Device
 from vllm.core.evictor import LRUChunkBasedEvictor, make_evictor, EvictionPolicy
+from vllm.sequence import Sequence
 
 Refcount = int
+
+def list_to_xxhash(nums: List[int]) -> str:
+    ba = bytearray()
+    for x in nums:
+        ba.extend(x.to_bytes(4, 'little', signed=True))
+    return str(xxhash.xxh64(ba).intdigest())
 
 class ChunkMeta:
     def __init__(
@@ -139,12 +146,12 @@ class ChunkCachingBlockAllocator(BlockAllocator):
         )
         self._touched_chunk: List[str] = []
     
-    @staticmethod
-    def _list_to_xxhash(nums: List[int]) -> str:
-        ba = bytearray()
-        for x in nums:
-            ba.extend(x.to_bytes(4, 'little', signed=True))
-        return str(xxhash.xxh64(ba).intdigest())
+    # @staticmethod
+    # def _list_to_xxhash(nums: List[int]) -> str:
+    #     ba = bytearray()
+    #     for x in nums:
+    #         ba.extend(x.to_bytes(4, 'little', signed=True))
+    #     return str(xxhash.xxh64(ba).intdigest())
     
 
     def allocate_immutable_block(self,
@@ -214,7 +221,7 @@ class ChunkCachingBlockAllocator(BlockAllocator):
             # 是可命中缓存或者留作未来命中的 chunk
             if chunk_hash_cached is None:
                 token_ids = [token_id for block_token_id in block_token_ids for token_id in block_token_id]
-                chunk_hash = ChunkCachingBlockAllocator._list_to_xxhash(token_ids)
+                chunk_hash = list_to_xxhash(token_ids)
             else:
                 chunk_hash = chunk_hash_cached
 
@@ -571,6 +578,14 @@ class ChunkCachingBlockAllocator(BlockAllocator):
     def find_cached_blocks_prefix(self, block_hashes: List[int]) -> List[int]:
         # Not applicable for naive block allocator.
         return []
+    
+    def get_num_cached_tokens_for_chunk_cache(self, chunk_hashes: List[str]) -> int:
+        num_cached_tokens = 0
+        for chunk_hash in chunk_hashes:
+            if chunk_hash in self._cached_chunk and self._cached_chunk[chunk_hash].is_valid():
+                chunk_meta = self._cached_chunk[chunk_hash]
+                num_cached_tokens += chunk_meta._chunk_end_token_offset - chunk_meta._chunk_start_token_offset
+        return num_cached_tokens
 
 # allocate_immutable_blocks
 # 传入一个 chunk 块内的按照 block 分开的 token_ids 数组
@@ -615,3 +630,38 @@ class ChunkAllocationTracker:
         assert seq_id in self._seq_chunk_alloc_info
         chunk_alloc_info = self._seq_chunk_alloc_info[seq_id]
         return [info._chunk_hash for info in chunk_alloc_info]
+
+
+class ComputedChunksTracker:
+    def __init__(
+        self,
+        allocator: ChunkCachingBlockAllocator,
+    ):
+        self._allocator = allocator
+        self._seq_id_to_chunk_hashes: Dict[int, List[str]] = {}
+    
+    def get_num_cached_tokens_for_chunk_cache(self, seq: Sequence) -> int:
+        assert seq.seq_id not in self._seq_id_to_chunk_hashes
+        doc_ranges = seq.inputs.get("doc_ranges", None)
+        if doc_ranges is None:
+            return 0
+        
+        token_ids = seq.get_token_ids()
+        chunk_hashes = []
+        for doc_range in doc_ranges:
+            chunk_hashes.append(list_to_xxhash(token_ids[doc_range[0]:doc_range[1]]))
+        
+        num_cached_tokens = self._allocator.get_num_cached_tokens_for_chunk_cache(chunk_hashes)
+        self._seq_id_to_chunk_hashes[seq.seq_id] = chunk_hashes
+        return num_cached_tokens
+    
+    def get_chunk_hashes(self, seq: Sequence) -> Optional[List[str]]:
+        if seq.seq_id not in self._seq_id_to_chunk_hashes:
+            return None
+        return self._seq_id_to_chunk_hashes[seq.seq_id]
+
+    def remove_seq(self, seq_id: int) -> None:
+        if seq_id not in self._seq_id_to_chunk_hashes:
+            return
+        
+        del self._seq_id_to_chunk_hashes[seq_id]

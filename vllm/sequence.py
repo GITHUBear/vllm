@@ -21,8 +21,6 @@ from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
-from vllm.core.block.chunk_block import ChunkAllocationInfo
-
 VLLM_TOKEN_ID_ARRAY_TYPE = "l"
 
 VLLM_INVALID_TOKEN_ID = -1

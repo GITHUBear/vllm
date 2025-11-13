@@ -1409,7 +1409,7 @@ class Scheduler:
         waiting_queue.extendleft(leftover_waiting_sequences)
         if len(seq_groups) > 0:
             self.prev_prompt = True
-
+        
         return SchedulerPrefillOutputs(
             seq_groups=seq_groups,
             ignored_seq_groups=ignored_seq_groups,
@@ -2334,8 +2334,15 @@ class Scheduler:
             num_computed_tokens_seq = seq.get_num_computed_tokens()
             all_num_new_tokens_seq = seq.get_len() - num_computed_tokens_seq
             if not self.cache_config.enable_prefix_caching:
-                # If prefix caching is not enabled, all new tokens are uncached.
-                num_uncached_new_tokens += all_num_new_tokens_seq
+                if self.enable_blk_attn_prefill:
+                    assert num_computed_tokens_seq == 0
+                    num_cached_by_chunk_cache = self.block_manager.get_num_cached_tokens_for_chunk_cache(seq)
+                    num_cached_new_tokens += num_cached_by_chunk_cache
+                    num_uncached_new_tokens += (all_num_new_tokens_seq - num_cached_by_chunk_cache)
+                    # logger.info(f"============ BLK ATTN: seq[{seq.seq_id}] num_cached_new_tokens:{num_cached_new_tokens} num_uncached_new_tokens:{num_uncached_new_tokens}")
+                else:
+                    # If prefix caching is not enabled, all new tokens are uncached.
+                    num_uncached_new_tokens += all_num_new_tokens_seq
                 continue
 
             # NOTE: the cache token might be currently in a block that's in an

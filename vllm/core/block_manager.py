@@ -9,7 +9,7 @@ from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
 from vllm.core.block.interfaces import Block
 from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
-from vllm.core.block.chunk_block import ChunkAllocationTracker
+from vllm.core.block.chunk_block import ChunkAllocationTracker, ChunkAllocationState, ComputedChunksTracker
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
@@ -123,8 +123,12 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self._last_access_blocks_tracker = LastAccessBlocksTracker(
             self.block_allocator)
         self._chunk_allocation_tracker = None
+        self._computed_chunks_tracker = None
         if enable_chunk_caching:
             self._chunk_allocation_tracker = ChunkAllocationTracker(
+                self.block_allocator
+            )
+            self._computed_chunks_tracker = ComputedChunksTracker(
                 self.block_allocator
             )
 
@@ -182,10 +186,15 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             # token_ids, they should be added as input to extra_hash.
             extra_hash = seq.extra_hash()
 
+            cached_chunk_hashes = None
+            if self._computed_chunks_tracker is not None:
+                cached_chunk_hashes = self._computed_chunks_tracker.get_chunk_hashes(seq)
+
             # Add blocks to the block table only if the sequence is non empty.
             block_table.allocate(token_ids=seq.get_token_ids(),
                                  extra_hash=extra_hash,
-                                 doc_ranges=doc_ranges)
+                                 doc_ranges=doc_ranges,
+                                 cached_chunk_hashes=cached_chunk_hashes)
 
         return block_table
 
@@ -202,7 +211,12 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         block_table: BlockTable = self._allocate_sequence(seq)
         self.block_tables[seq.seq_id] = block_table
         if block_table._chunk_alloc_info is not None:
-            logger.info(f"======== allocated block table chunk allocation info ==========\n {block_table._chunk_alloc_info}")
+            hit_tokens = 0
+            total_tokens = block_table._chunk_alloc_info[-1]._chunk_end_token_offset if len(block_table._chunk_alloc_info) != 0 else 1
+            for chunk_alloc_info in block_table._chunk_alloc_info:
+                if chunk_alloc_info._state == ChunkAllocationState.HIT_CHUNK:
+                    hit_tokens += (chunk_alloc_info._chunk_end_token_offset - chunk_alloc_info._chunk_start_token_offset)
+            logger.info(f"======== allocated block table chunk allocation info ==========\n {block_table._chunk_alloc_info}\n =========== HIT_RATE: {(hit_tokens / total_tokens) * 100}% ============\n")
 
         # Track seq
         self._last_access_blocks_tracker.add_seq(seq.seq_id)
@@ -308,7 +322,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # Untrack seq
         self._last_access_blocks_tracker.remove_seq(seq_id)
         self._computed_blocks_tracker.remove_seq(seq_id)
-        self._chunk_allocation_tracker.remove_seq(seq_id)
+        if self._chunk_allocation_tracker is not None:
+            self._chunk_allocation_tracker.remove_seq(seq_id)
+        if self._computed_chunks_tracker is not None:
+            self._computed_chunks_tracker.remove_seq(seq_id)
 
         # Free table/blocks
         self.block_tables[seq_id].free()
@@ -570,3 +587,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         cached in the block manager for the sequence.
         """
         return self._computed_blocks_tracker.get_num_cached_tokens(seq)
+    
+    def get_num_cached_tokens_for_chunk_cache(self, seq: Sequence) -> int:
+        assert self._computed_chunks_tracker is not None
+        return self._computed_chunks_tracker.get_num_cached_tokens_for_chunk_cache(seq)

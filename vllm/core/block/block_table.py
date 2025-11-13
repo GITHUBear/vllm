@@ -98,7 +98,8 @@ class BlockTable:
                  token_ids: List[int],
                  device: Device = Device.GPU,
                  extra_hash: Optional[int] = None,
-                 doc_ranges: Optional[list[tuple]] = None) -> None:
+                 doc_ranges: Optional[list[tuple]] = None,
+                 cached_chunk_hashes: Optional[list[str]] = None) -> None:
         """Allocates memory blocks for storing the given sequence of token IDs.
 
         This method allocates the required number of blocks to store the given
@@ -118,7 +119,8 @@ class BlockTable:
                                                      token_ids=token_ids,
                                                      device=device,
                                                      extra_hash=extra_hash,
-                                                     doc_ranges=doc_ranges)
+                                                     doc_ranges=doc_ranges,
+                                                     cached_chunk_hashes=cached_chunk_hashes)
         self.update(blocks)
         self._num_full_slots = len(token_ids)
 
@@ -372,12 +374,15 @@ class BlockTable:
         token_ids: List[int],
         device: Device,
         extra_hash: Optional[int] = None,
-        doc_ranges: Optional[list[tuple]] = None
+        doc_ranges: Optional[list[tuple]] = None,
+        cached_chunk_hashes: Optional[list[str]] = None,
     ) -> List[Block]:
         assert doc_ranges is not None
+        assert cached_chunk_hashes is None or len(cached_chunk_hashes) == len(doc_ranges)
         blocks: List[Block] = []
-        for doc_range in doc_ranges:
+        for idx, doc_range in enumerate(doc_ranges):
             assert (doc_range[0] % self._block_size == 0) and (doc_range[1] % self._block_size == 0)
+            cached_chunk_hash = cached_chunk_hashes[idx] if cached_chunk_hashes is not None else None
             block_token_ids = [
                 cur_token_ids
                 for cur_token_ids in chunk_list(token_ids[doc_range[0]:doc_range[1]], self._block_size)
@@ -390,6 +395,7 @@ class BlockTable:
                     extra_hash=extra_hash,
                     doc_range=doc_range,
                     chunk_alloc_states=self._chunk_alloc_info,
+                    chunk_hash_cached=cached_chunk_hash,
                 )
             )
             prev_block = blocks[-1]
@@ -431,7 +437,9 @@ class BlockTable:
         token_ids: List[int],
         device: Device,
         extra_hash: Optional[int] = None,
-        doc_ranges: Optional[list[tuple]] = None) -> List[Block]:
+        doc_ranges: Optional[list[tuple]] = None,
+        cached_chunk_hashes: Optional[list[str]] = None
+    ) -> List[Block]:
         if not self._enable_chunk_caching:
             return self._allocate_blocks_for_token_ids_common_mode(
                 prev_block=prev_block,
@@ -446,6 +454,7 @@ class BlockTable:
             device=device,
             extra_hash=extra_hash,
             doc_ranges=doc_ranges,
+            cached_chunk_hashes=cached_chunk_hashes,
         )
 
     def _get_all_token_ids(self) -> List[int]:

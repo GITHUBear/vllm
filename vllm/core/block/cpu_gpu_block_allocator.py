@@ -173,7 +173,8 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             extra_hash: Optional[int] = None,
 
             doc_range: Optional[Tuple] = None,
-            chunk_alloc_states: Optional[List[ChunkAllocationInfo]] = None) -> List[Block]:
+            chunk_alloc_states: Optional[List[ChunkAllocationInfo]] = None,
+            chunk_hash_cached: Optional[str] = None) -> List[Block]:
         """Allocates a new group of immutable blocks with the provided block 
         token IDs on the specified device.
 
@@ -198,6 +199,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
                 extra_hash=extra_hash,
                 doc_range=doc_range,
                 chunk_alloc_states=chunk_alloc_states,
+                chunk_hash_cached=chunk_hash_cached,
             )
         return self._allocators[device].allocate_immutable_blocks(
             prev_block, block_token_ids, extra_hash=extra_hash)
@@ -363,6 +365,11 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         assert self.chunk_alloc_type
         device = Device.GPU
         return self._allocators[device].free_chunks(chunk_hashes)
+    
+    def get_num_cached_tokens_for_chunk_cache(self, chunk_hashes: List[str]) -> int:
+        assert self.chunk_alloc_type
+        device = Device.GPU
+        return self._allocators[device].get_num_cached_tokens_for_chunk_cache(chunk_hashes)
 
     def get_common_computed_block_ids(
             self, computed_seq_block_ids: List[List[int]]) -> List[int]:
