@@ -73,8 +73,8 @@ data = {
     # "model": "/data/shanhaikang.shk/modelscope/qwq32b",
     # "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
     "messages": [
-        {"role": "system", "content": block_system_prompt3},
-        {"role": "user", "content": user_prompt3},
+        {"role": "system", "content": block_system_prompt2},
+        {"role": "user", "content": user_prompt2},
         # {"role": "user", "content": "你是谁"},
         # {"role": "user", "content": prompt_template.format(question=question)},
         # {"role": "user", "content": prompt},
@@ -82,7 +82,7 @@ data = {
     "temperature": 0.0,
     "stream": True,
     # "ignore_eos": True,
-    "max_tokens": 10,
+    # "max_tokens": 10,
 }
 
 ttft = 0.0

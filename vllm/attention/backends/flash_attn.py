@@ -3160,6 +3160,7 @@ class FlashAttentionImpl(AttentionImpl):
                             chunk_rotray_offset_positions=decode_meta.blk_attn_decode_chunk_rotary_offset_positions,
                             cu_num_chunks_k=decode_meta.blk_attn_decode_cu_num_chunks_k,
                             cos_sin_cache=self._cos_sin_cache,
+                            enable_splitkv_for_chunked_kv=True,
 
                             softcap=logits_soft_cap,
                             out=decode_output,
