@@ -106,6 +106,7 @@ class EngineCore:
             include_finished_set=vllm_config.parallel_config.data_parallel_size
             > 1,
             log_stats=self.log_stats,
+            enable_blk_attn=vllm_config.model_config.enable_blk_attn,
         )
 
         # Setup MM Input Mapper.

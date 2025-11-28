@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Attention layer with FlashAttention."""
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Dict
 
 import numpy as np
 import torch
@@ -485,6 +485,17 @@ class FlashAttentionImpl(AttentionImpl):
         logits_soft_cap: Optional[float] = None,
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
+        # Extended Parameters
+        layer_idx: int = -1,
+        enable_pooling: bool = False,
+        enable_blend_prepare: bool = False,
+        enable_cache_blend: bool = False,
+        pooling_blk_size: Optional[int] = None,
+        dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
+        enable_attn_out_dump: bool = False,
+        enable_last_attn_map_dump: bool = False,
+        dump_last_query_len: int = 64,
+        num_layers: Optional[int] = None,
     ) -> None:
         if blocksparse_params is not None:
             raise ValueError(

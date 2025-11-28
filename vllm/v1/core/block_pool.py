@@ -9,7 +9,8 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import (BlockHashType, FreeKVCacheBlockQueue,
                                          KVCacheBlock,
                                          generate_block_hash_extra_keys,
-                                         hash_block_tokens)
+                                         hash_block_tokens,
+                                         KVCacheChunk, FreeKVCacheChunkQueue)
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -33,6 +34,7 @@ class BlockPool:
         num_gpu_blocks: int,
         enable_caching: bool,
         enable_kv_cache_events: bool = False,
+        enable_blk_caching: bool = False,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -66,6 +68,12 @@ class BlockPool:
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
+        self.free_chunk_queue = None
+        self.cached_chunk_hash_to_chunk_meta: Optional[dict[str, KVCacheChunk]] = None
+        if enable_blk_caching:
+            self.cached_chunk_hash_to_chunk_meta = {}
+            self.free_chunk_queue = FreeKVCacheChunkQueue()
+
     def get_cached_block(self,
                          block_hash: BlockHashType) -> Optional[KVCacheBlock]:
         """Get a cached block by the block hash, or None if cache miss.
@@ -82,6 +90,9 @@ class BlockPool:
             return None
         first_block_id = next(iter(cached_blocks))
         return cached_blocks[first_block_id]
+    
+    def get_cached_chunk(self, chunk_hash: str) -> Optional[KVCacheChunk]:
+        return self.cached_chunk_hash_to_chunk_meta.get(chunk_hash, None)
 
     def cache_full_blocks(
         self,
@@ -182,6 +193,13 @@ class BlockPool:
                     lora_id=request.lora_request.id
                     if request.lora_request else None,
                 ))
+            
+    def cache_chunk(
+        self,
+        chunk_hash: str,
+        chunk: KVCacheChunk,
+    ) -> None:
+        self.cached_chunk_hash_to_chunk_meta[chunk_hash] = chunk
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -201,6 +219,13 @@ class BlockPool:
         ret: list[KVCacheBlock] = []
         idx = 0
         while idx < num_blocks:
+            # 当 free block 队列中 block 不足时，淘汰掉 chunk
+            if self.free_block_queue.num_free_blocks == 0 and self.free_chunk_queue:
+                curr_chunk = self.free_chunk_queue.popleft()
+                assert curr_chunk._ref_count == 0
+                self._maybe_evict_cached_chunk(curr_chunk)
+                assert self.free_block_queue.num_free_blocks > 0
+                
             # First allocate blocks.
             curr_block = self.free_block_queue.popleft()
             assert curr_block.ref_cnt == 0
@@ -214,6 +239,16 @@ class BlockPool:
             idx += 1
 
         return ret
+
+    def _maybe_evict_cached_chunk(self, chunk: KVCacheChunk) -> None:
+        chunk_hash = chunk._chunk_hash
+        assert (chunk_hash in self.cached_chunk_hash_to_chunk_meta and
+                self.cached_chunk_hash_to_chunk_meta[chunk_hash]._ref_count == 0)
+        self.cached_chunk_hash_to_chunk_meta.pop(chunk_hash)
+        for block in reversed(chunk._blocks):
+            assert block.ref_cnt == 1
+            block.decr_ref()
+            self.free_block_queue.append(block)
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
@@ -254,6 +289,12 @@ class BlockPool:
             if block.ref_cnt == 0 and block != self.null_block:
                 self.free_block_queue.remove(block)
             block.incr_ref()
+    
+    def touch_chunk(self, chunks: list[KVCacheChunk]) -> None:
+        for chunk in chunks:
+            if chunk._ref_count == 0:
+                self.free_chunk_queue.remove(chunk)
+            chunk.incr_ref_count()
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
@@ -268,6 +309,14 @@ class BlockPool:
             # null_block should not be added to the free list.
             if block.ref_cnt == 0 and block != self.null_block:
                 self.free_block_queue.append(block)
+    
+    def free_chunks(self, chunk_hashes: list[str]) -> None:
+        for chunk_hash in chunk_hashes:
+            assert chunk_hash in self.cached_chunk_hash_to_chunk_meta
+            chunk = self.cached_chunk_hash_to_chunk_meta[chunk_hash]
+            chunk.decr_ref_count()
+            if chunk._ref_count == 0:
+                self.free_chunk_queue.append(chunk)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -305,7 +354,9 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        return self.free_block_queue.num_free_blocks + (
+            0 if self.free_chunk_queue is None else self.free_chunk_queue.num_free_blocks
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

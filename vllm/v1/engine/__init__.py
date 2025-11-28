@@ -58,6 +58,7 @@ class EngineCoreRequest(
     arrival_time: float
     lora_request: Optional[LoRARequest]
     cache_salt: Optional[str]
+    doc_ranges: Optional[list[tuple]]
 
     # Used in DP case to indicate which wave of requests this is expected to
     # belong to, to cover a race condition where the request is sent before

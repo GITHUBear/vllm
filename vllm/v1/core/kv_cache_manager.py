@@ -2,14 +2,16 @@
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
+import xxhash
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils import sha256
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import (BlockHashType, KVCacheBlock,
-                                         hash_request_tokens)
+from vllm.v1.core.kv_cache_utils import (BlockHashType, KVCacheBlocks,
+                                         hash_request_tokens, KVCacheChunk,
+                                         KVCacheChunkHitInfo, ChunkHitState)
 from vllm.v1.core.single_type_kv_cache_manager import (
     get_manager_for_kv_cache_spec)
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -18,29 +20,11 @@ from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
-
-@dataclass
-class KVCacheBlocks:
-    blocks: list[KVCacheBlock]
-
-    def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
-        """Adds two KVCacheBlocks instances."""
-        return KVCacheBlocks(self.blocks + other.blocks)
-
-    @classmethod
-    def create_empty(cls) -> "KVCacheBlocks":
-        """Creates a new KVCacheBlocks instance with no blocks."""
-        return cls([])
-
-    def get_block_ids(self) -> list[int]:
-        """Converts the KVCacheBlocks instance to a list of block IDs."""
-        return [block.block_id for block in self.blocks]
-
-    def get_unhashed_block_ids(self) -> list[int]:
-        """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
-        return [
-            block.block_id for block in self.blocks if block.block_hash is None
-        ]
+# def list_to_xxhash(nums: List[int]) -> str:
+#     ba = bytearray()
+#     for x in nums:
+#         ba.extend(x.to_bytes(4, 'little', signed=True))
+#     return str(xxhash.xxh64(ba).intdigest())
 
 
 class KVCacheManager:
@@ -54,6 +38,7 @@ class KVCacheManager:
         use_eagle: bool = False,
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
+        enable_blk_caching: bool = False,
     ) -> None:
         assert len(kv_cache_config.kv_cache_groups) == 1, (
             "KVCacheManager does not support hybrid models with more than 1 "
@@ -64,6 +49,7 @@ class KVCacheManager:
         self.max_model_len = max_model_len
 
         self.enable_caching = enable_caching
+        self.enable_blk_caching = enable_blk_caching
         self.caching_hash_fn = sha256 if caching_hash_algo == "sha256" else hash
         self.use_eagle = use_eagle
         self.log_stats = log_stats
@@ -71,7 +57,8 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
 
         self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching,
-                                    enable_kv_cache_events)
+                                    enable_kv_cache_events,
+                                    enable_blk_caching=enable_blk_caching)
 
         self.single_type_manager = get_manager_for_kv_cache_spec(
             kv_cache_spec=kv_cache_spec,
@@ -86,6 +73,16 @@ class KVCacheManager:
         # `get_computed_blocks` or `allocate_slots`.
         self.req_to_block_hashes: defaultdict[
             str, list[BlockHashType]] = defaultdict(list)
+        
+        # 只缓存一次，即使发生抢占
+        self.req_to_chunk_hashes: Optional[defaultdict[str, list[str]]] = None
+        # 在抢占并 resume 时重置
+        self.blk_caching_req_to_chunk_ids: Optional[defaultdict[str, list[int]]] = None
+        self.blk_caching_req_to_chunk_hit_info: Optional[defaultdict[str, list[KVCacheChunkHitInfo]]] = None
+        if self.enable_blk_caching:
+            self.req_to_chunk_hashes = defaultdict(list)
+            self.blk_caching_req_to_chunk_ids = defaultdict(list)
+            self.blk_caching_req_to_chunk_hit_info = defaultdict(list)
 
     @property
     def usage(self) -> float:
@@ -108,8 +105,7 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
-    def get_computed_blocks(self,
-                            request: Request) -> tuple[KVCacheBlocks, int]:
+    def _get_computed_blocks_for_prefix_caching(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
@@ -161,12 +157,106 @@ class KVCacheManager:
 
         return KVCacheBlocks(computed_blocks), num_computed_tokens
 
-    def allocate_slots(
+    def _get_computed_blocks_for_blk_caching(self, request: Request) -> tuple[List[KVCacheChunkHitInfo], int]:
+        def list_to_xxhash(nums: List[int]) -> str:
+            ba = bytearray()
+            for x in nums:
+                ba.extend(x.to_bytes(4, 'little', signed=True))
+            return str(xxhash.xxh64(ba).intdigest())
+        
+        assert self.enable_blk_caching
+        
+        chunk_hashes = self.req_to_chunk_hashes[request.request_id]
+        if not chunk_hashes:
+            # chunk hashes 是无论被抢占多少次也一致的结果
+            chunk_hashes = []
+            for doc_range in request.doc_ranges:
+                chunk_hashes.append(list_to_xxhash(request.all_token_ids[doc_range[0]:doc_range[1]]))
+            self.req_to_chunk_hashes[request.request_id] = chunk_hashes
+
+        if self.log_stats:
+            # TODO[shk]: blk caching 统计信息
+            pass
+
+        computed_chunks = self.single_type_manager.find_chunk_hit(chunk_hashes)
+        num_computed_tokens = 0
+        computed_chunks_parsed: List[KVCacheChunkHitInfo] = []
+        for chunk_hash, computed_chunk in zip(chunk_hashes, computed_chunks):
+            if not computed_chunk:
+                computed_chunks_parsed.append(KVCacheChunkHitInfo(
+                    chunk_hash=chunk_hash,
+                ))
+                continue
+            
+            num_computed_tokens += len(computed_chunk._blocks) * self.block_size
+            computed_chunks_parsed.append(KVCacheChunkHitInfo(
+                hit_state=ChunkHitState.NATIVE_HIT,
+                origin_rotary_offset=computed_chunk._rotary_offset,
+                blocks=KVCacheBlocks(computed_chunk._blocks),
+                chunk_hash=chunk_hash,
+            ))
+
+        # 每次被抢占后 resume 需要重新计算，所以这里直接覆盖
+        native_hit_chunk_ids = []
+        flattened_computed_chunks = []
+        for idx, computed_chunk_parsed in enumerate(computed_chunks_parsed):
+            if computed_chunk_parsed._hit_state == ChunkHitState.NATIVE_HIT:
+                native_hit_chunk_ids.append(idx)
+                flattened_computed_chunks.extend(computed_chunk_parsed._blocks.blocks)
+        self.blk_caching_req_to_chunk_ids[request.request_id] = native_hit_chunk_ids
+        self.blk_caching_req_to_chunk_hit_info[request.request_id] = computed_chunks_parsed
+                
+        if self.log_stats:
+            # TODO[shk]: blk caching 统计信息
+            pass
+
+        return KVCacheBlocks(flattened_computed_chunks), num_computed_tokens
+
+    def get_computed_blocks(self,
+                            request: Request,
+                            blk_caching_mode: bool = False) -> tuple[KVCacheBlocks | List[KVCacheChunkHitInfo], int]:
+        if blk_caching_mode and self.enable_blk_caching:
+            return self._get_computed_blocks_for_blk_caching(request)
+        return self._get_computed_blocks_for_prefix_caching(request)
+    
+    def complete_block_caching_chunk_hit_infos(
         self,
         request: Request,
-        num_new_tokens: int,
-        num_new_computed_tokens: int = 0,
-        new_computed_blocks: Optional[KVCacheBlocks] = None,
+        external_hit_chunk_ids: List[int],
+        external_rotary_offsets: List[int],
+    ) -> None:
+        if not self.enable_blk_caching:
+            return
+        
+        assert len(external_hit_chunk_ids) == len(external_rotary_offsets)
+        assert (request.request_id in self.blk_caching_req_to_chunk_ids and
+                request.request_id in self.blk_caching_req_to_chunk_hit_info)
+
+        doc_ranges = request.doc_ranges
+        chunk_ids = self.blk_caching_req_to_chunk_ids[request.request_id]
+        if len(doc_ranges) == len(chunk_ids):
+            return
+        
+        chunk_ids.extend(external_hit_chunk_ids)
+        chunk_ids_set = set(chunk_ids)
+        assert len(chunk_ids_set) == len(chunk_ids)
+        for idx in range(len(doc_ranges)):
+            if idx not in chunk_ids_set:
+                chunk_ids.append(idx)
+        
+        assert len(doc_ranges) == len(self.blk_caching_req_to_chunk_ids[request.request_id])
+
+        chunk_hit_infos = self.blk_caching_req_to_chunk_hit_info[request.request_id]
+        for chunk_id, rotary_offset in zip(external_hit_chunk_ids, external_rotary_offsets):
+            chunk_hit_infos[chunk_id]._hit_state = ChunkHitState.EXTERNAL_HIT
+            chunk_hit_infos[chunk_id]._origin_rotary_offset = rotary_offset
+
+    def _allocate_slots_for_prefix_caching(
+        self,
+        request: Request,
+        num_new_tokens: int,    # remote_key 还没准备好时，需要提前分配 external 命中的缓存
+        num_new_computed_tokens: int = 0,   # num_native_computed_tokens
+        new_computed_blocks: Optional[KVCacheBlocks] = None,    # new_computed_blocks
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
     ) -> Optional[KVCacheBlocks]:
@@ -269,6 +359,210 @@ class KVCacheManager:
             num_computed_tokens + num_new_tokens - len(request.spec_token_ids))
 
         return KVCacheBlocks(new_blocks)
+    
+    def _allocate_slots_for_blk_caching(
+        self,
+        request: Request,
+        num_new_tokens: int,    # remote_key 还没准备好时，需要提前分配 external 命中的缓存
+        num_new_computed_tokens: int = 0,   # num_native_computed_tokens
+        new_computed_blocks: Optional[KVCacheBlocks] = None,    # new_computed_blocks
+        num_lookahead_tokens: int = 0,
+        delay_cache_blocks: bool = False,
+    ) -> Optional[KVCacheBlocks]:
+        assert self.enable_blk_caching
+
+        if num_new_tokens == 0:
+            raise ValueError("num_new_tokens must be greater than 0")
+        
+        if new_computed_blocks is not None:
+            new_computed_block_list = new_computed_blocks.blocks
+        else:
+            new_computed_block_list = []
+
+        # block attention 尚不支持 slide window
+        # self.single_type_manager.remove_skipped_blocks(
+        #     request.request_id, request.num_computed_tokens)
+
+        num_computed_tokens = (request.num_computed_tokens +
+                               num_new_computed_tokens)
+        num_tokens_need_slot = min(
+            num_computed_tokens + num_new_tokens + num_lookahead_tokens,
+            self.max_model_len)
+        num_blocks_to_allocate = (
+            self.single_type_manager.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=num_tokens_need_slot,
+                new_computed_blocks=new_computed_block_list,
+            ))
+        
+        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            # Cannot allocate new blocks
+            return None
+        
+        assert (request.request_id in self.blk_caching_req_to_chunk_ids and
+                request.request_id in self.blk_caching_req_to_chunk_hit_info)
+        cache_ordered_chunk_idx = self.blk_caching_req_to_chunk_ids[request.request_id]
+        chunk_hit_info = self.blk_caching_req_to_chunk_hit_info[request.request_id]
+        doc_ranges = request.doc_ranges
+        assert doc_ranges is not None
+
+        self.block_pool.touch(new_computed_block_list)
+        self.single_type_manager.save_new_computed_blocks(
+            request.request_id, new_computed_block_list)
+        if num_new_computed_tokens > 0:
+            hit_tokens_num_for_check = 0
+            for chunk_idx in cache_ordered_chunk_idx:
+                if chunk_hit_info[chunk_idx]._hit_state != ChunkHitState.NATIVE_HIT:
+                    break
+                hit_tokens_num_for_check += (doc_ranges[chunk_idx][1] - doc_ranges[chunk_idx][0])
+                cached_chunk = self.block_pool.get_cached_chunk(chunk_hit_info[chunk_idx]._chunk_hash)
+                assert cached_chunk is not None
+                self.block_pool.touch_chunk([cached_chunk])
+            assert hit_tokens_num_for_check == num_new_computed_tokens
+        
+        if num_computed_tokens > doc_ranges[-1][1]:
+            # chunk 区域全部分配过了
+            # 正常分配即可
+            new_blocks = self.single_type_manager.allocate_new_blocks(
+                request_id=request.request_id,
+                num_tokens=num_tokens_need_slot,
+            )
+            return KVCacheBlocks(new_blocks)
+
+        remain_computed_tokens = num_computed_tokens
+        remain_chunk_idxs = []
+        need_refresh_block_ids = (num_computed_tokens + num_new_tokens >= doc_ranges[-1][1])
+        for idx, chunk_idx in enumerate(cache_ordered_chunk_idx):
+            chunk_len = doc_ranges[chunk_idx][1] - doc_ranges[chunk_idx][0]
+            if remain_computed_tokens < chunk_len:
+                remain_chunk_idxs = cache_ordered_chunk_idx[idx:]
+                break
+            remain_computed_tokens -= chunk_len
+
+        # 要求必须对 chunk 对齐
+        assert remain_computed_tokens == 0
+        remain_new_tokens = num_new_tokens
+        for idx, chunk_idx in enumerate(remain_chunk_idxs):
+            chunk_len = doc_ranges[chunk_idx][1] - doc_ranges[chunk_idx][0]
+            if remain_new_tokens < chunk_len:
+                remain_chunk_idxs = remain_chunk_idxs[:idx]
+                break
+            remain_new_tokens -= chunk_len
+        if not need_refresh_block_ids:
+            assert remain_new_tokens == 0
+
+        all_new_blocks = []
+        cur_num_tokens_need_slot = num_computed_tokens
+        for chunk_idx in remain_chunk_idxs:
+            chunk_len = doc_ranges[chunk_idx][1] - doc_ranges[chunk_idx][0]
+            cur_num_tokens_need_slot += chunk_len
+            # 分配 chunk_len 长度的 slot
+            new_blocks = self.single_type_manager.allocate_new_blocks(
+                request_id=request.request_id,
+                num_tokens=cur_num_tokens_need_slot,
+            )
+            all_new_blocks.extend(new_blocks)
+            hit_info = chunk_hit_info[chunk_idx]
+            hit_info._blocks = KVCacheBlocks(new_blocks)
+            if hit_info._hit_state == ChunkHitState.EXTERNAL_HIT and delay_cache_blocks:
+                # 如果是外部命中且是异步load，先不着急构造 KVCacheChunk 结构体加入缓存
+                pass
+            else:
+                # 说明是没命中的 chunk，构造 KVCacheChunk 加入缓存
+                new_chunk = KVCacheChunk(
+                    blocks=new_blocks,
+                    block_size=self.block_size,
+                    chunk_hash=hit_info._chunk_hash,
+                    chunk_start_token_offset=doc_ranges[chunk_idx][0],
+                    chunk_end_token_offset=doc_ranges[chunk_idx][1],
+                    num_tokens=doc_ranges[chunk_idx][2],
+                    rotary_offset=doc_ranges[chunk_idx][3]
+                )
+                self.block_pool.touch_chunk([new_chunk])
+                self.block_pool.cache_chunk(
+                    chunk_hash=hit_info._chunk_hash,
+                    chunk=new_chunk,
+                )
+
+        if remain_new_tokens > 0:
+            cur_num_tokens_need_slot += (remain_new_tokens + num_lookahead_tokens)
+            new_blocks = self.single_type_manager.allocate_new_blocks(
+                request_id=request.request_id,
+                num_tokens=cur_num_tokens_need_slot,
+            )
+            all_new_blocks.extend(new_blocks)
+
+        if need_refresh_block_ids:
+            ordered_chunk_blocks = []
+            delta_rotary_offsets = []
+            for hit_info, doc_range in zip(chunk_hit_info, doc_ranges):
+                assert hit_info._blocks is not None
+                ordered_chunk_blocks.extend(hit_info._blocks.blocks)
+                if hit_info._hit_state == ChunkHitState.MISSED:
+                    delta_rotary_offsets.append(-1)
+                else:
+                    delta_rotary_offsets.append(doc_range[3] - hit_info._origin_rotary_offset)
+            self.single_type_manager.refresh_blocks(
+                request_id=request.request_id,
+                new_blocks=ordered_chunk_blocks,
+            )
+            request.delta_rotary_offsets = delta_rotary_offsets
+ 
+        return KVCacheBlocks(all_new_blocks)
+
+    def allocate_slots(
+        self,
+        request: Request,
+        num_new_tokens: int,    # remote_key 还没准备好时，需要提前分配 external 命中的缓存
+        num_new_computed_tokens: int = 0,   # num_native_computed_tokens
+        new_computed_blocks: Optional[KVCacheBlocks] = None,    # new_computed_blocks
+        num_lookahead_tokens: int = 0,
+        delay_cache_blocks: bool = False,
+        blk_caching_mode: bool = False
+    ) -> Optional[KVCacheBlocks]:
+        if blk_caching_mode and self.enable_blk_caching:
+            return self._allocate_slots_for_blk_caching(
+                request,
+                num_new_tokens,
+                num_new_computed_tokens=num_new_computed_tokens,
+                new_computed_blocks=new_computed_blocks,
+                num_lookahead_tokens=num_lookahead_tokens,
+                delay_cache_blocks=delay_cache_blocks,
+            )
+        return self._allocate_slots_for_prefix_caching(
+            request,
+            num_new_tokens,
+            num_new_computed_tokens=num_new_computed_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_lookahead_tokens=num_lookahead_tokens,
+            delay_cache_blocks=delay_cache_blocks,
+        )
+
+    def cache_external_async_load_chunks(
+        self,
+        request: Request,
+    ) -> None:
+        assert (request.request_id in self.blk_caching_req_to_chunk_hit_info)
+        chunk_hit_info = self.blk_caching_req_to_chunk_hit_info[request.request_id]
+        doc_ranges = request.doc_ranges
+        assert doc_ranges is not None
+
+        for hit_info, doc_range in zip(chunk_hit_info, doc_ranges):
+            assert hit_info._blocks is not None
+            new_chunk = KVCacheChunk(
+                blocks=hit_info._blocks.blocks,
+                block_size=self.block_size,
+                chunk_hash=hit_info._chunk_hash,
+                chunk_start_token_offset=doc_range[0],
+                chunk_end_token_offset=doc_range[1],
+                num_tokens=doc_range[2],
+                rotary_offset=doc_range[3]
+            )
+            self.block_pool.touch_chunk([new_chunk])
+            self.block_pool.cache_chunk(
+                chunk_hash=hit_info._chunk_hash,
+                chunk=new_chunk,
+            )
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
@@ -279,6 +573,14 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.single_type_manager.free(request.request_id)
+
+        if self.req_to_chunk_hashes is not None:
+            chunk_hashes = self.req_to_chunk_hashes.pop(request.request_id, [])
+            self.block_pool.free_chunks(chunk_hashes)
+        if self.blk_caching_req_to_chunk_ids is not None:
+            self.blk_caching_req_to_chunk_ids.pop(request.request_id, [])
+        if self.blk_caching_req_to_chunk_hit_info is not None:
+            self.blk_caching_req_to_chunk_hit_info.pop(request.request_id, [])
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import Callable
+from typing import Callable, Optional
 
 from vllm.utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import BlockHashType, KVCacheBlock
+from vllm.v1.core.kv_cache_utils import BlockHashType, KVCacheBlock, KVCacheChunk
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheSpec,
                                         SlidingWindowSpec)
 from vllm.v1.request import Request
@@ -132,6 +132,12 @@ class SingleTypeKVCacheManager(ABC):
                 num_new_blocks * self.num_kv_cache_groups)
             req_blocks.extend(new_blocks)
             return new_blocks
+    
+    def refresh_blocks(self, request_id: str, new_blocks: list[KVCacheBlock]) -> None:
+        req_blocks = self.req_to_blocks[request_id]
+        assert len(req_blocks) >= len(new_blocks)
+        new_blocks.extend(req_blocks[len(new_blocks):])
+        self.req_to_blocks[request_id] = new_blocks
 
     def cache_blocks(self, request: Request, block_hashes: list[BlockHashType],
                      num_tokens: int) -> None:
@@ -208,6 +214,10 @@ class SingleTypeKVCacheManager(ABC):
         """
 
         raise NotImplementedError
+    
+    @abstractmethod
+    def find_chunk_hit(self, chunk_hashes: list[str]) -> list[Optional[KVCacheChunk]]:
+        raise NotImplementedError
 
     @abstractmethod
     def remove_skipped_blocks(self, request_id: str,
@@ -244,6 +254,12 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if self.use_eagle and len(computed_blocks) > 0:
             computed_blocks.pop()
         return computed_blocks
+    
+    def find_chunk_hit(self, chunk_hashes: list[str]) -> list[Optional[KVCacheChunk]]:
+        computed_chunks = []
+        for chunk_hash in chunk_hashes:
+            computed_chunks.append(self.block_pool.get_cached_chunk(chunk_hash))
+        return computed_chunks
 
     def remove_skipped_blocks(self, request_id: str,
                               num_computed_tokens: int) -> None:

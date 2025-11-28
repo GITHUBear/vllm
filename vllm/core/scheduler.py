@@ -1409,6 +1409,7 @@ class Scheduler:
         waiting_queue.extendleft(leftover_waiting_sequences)
         if len(seq_groups) > 0:
             self.prev_prompt = True
+            # logger.info(f"==================== BLK ATTN: Prefill Schedule Reqs: [{len(seq_groups)}] ================")
         
         return SchedulerPrefillOutputs(
             seq_groups=seq_groups,

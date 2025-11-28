@@ -29,6 +29,10 @@ class NewRequestData:
     block_ids: list[int]
     num_computed_tokens: int
     lora_request: Optional[LoRARequest]
+    # For Block Attention
+    doc_ranges: Optional[list[tuple]]
+    rotary_position_offsets: Optional[list[int]]
+
 
     @classmethod
     def from_request(
@@ -36,6 +40,7 @@ class NewRequestData:
         request: Request,
         block_ids: list[int],
     ) -> NewRequestData:
+        assert (request.doc_ranges is None or request.delta_rotary_offsets is not None)
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -46,6 +51,9 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
+            doc_ranges=request.doc_ranges,
+            # TODO[shk]:设置
+            rotary_position_offsets=request.delta_rotary_offsets,
         )
 
     def __repr__(self):
@@ -58,7 +66,9 @@ class NewRequestData:
                 f"sampling_params={self.sampling_params},"
                 f"block_ids={self.block_ids},"
                 f"num_computed_tokens={self.num_computed_tokens},"
-                f"lora_request={self.lora_request}"
+                f"lora_request={self.lora_request},"
+                f"doc_ranges={self.doc_ranges},"
+                f"rotary_position_offsets={self.rotary_position_offsets}"
                 ")")
 
     # Version of __repr__ with the prompt data obfuscated
@@ -72,7 +82,9 @@ class NewRequestData:
                 f"sampling_params={self.sampling_params},"
                 f"block_ids={self.block_ids},"
                 f"num_computed_tokens={self.num_computed_tokens},"
-                f"lora_request={self.lora_request}"
+                f"lora_request={self.lora_request},"
+                f"doc_ranges={self.doc_ranges},"
+                f"rotary_position_offsets={self.rotary_position_offsets}"
                 ")")
 
 

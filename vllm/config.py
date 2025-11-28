@@ -4117,6 +4117,8 @@ class CompilationConfig:
                              "splitting_ops, as Full CUDA graph will override "
                              f"the splitting_ops: {self.splitting_ops}")
 
+        # 默认情况使用 vllm.unified_attention & vllm.unified_attention_with_output
+        # 进行分层编译
         if not self.splitting_ops:
             self.splitting_ops = [] if self.full_cuda_graph else [
                 "vllm.unified_attention",

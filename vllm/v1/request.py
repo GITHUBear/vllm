@@ -30,6 +30,7 @@ class Request:
         lora_request: Optional["LoRARequest"] = None,
         structured_output_request: Optional["StructuredOutputRequest"] = None,
         cache_salt: Optional[str] = None,
+        doc_ranges: Optional[list[tuple]] = None,
     ) -> None:
         self.request_id = request_id
         self.sampling_params = sampling_params
@@ -53,6 +54,8 @@ class Request:
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: Optional[str] = cache_salt
+        self.doc_ranges: Optional[list[tuple]] = doc_ranges
+        self.delta_rotary_offsets: Optional[list[int]] = None
 
         # Multi-modal related
         self.mm_positions = multi_modal_placeholders or []
@@ -97,6 +100,7 @@ class Request:
             structured_output_request=StructuredOutputRequest(
                 sampling_params=request.sampling_params),
             cache_salt=request.cache_salt,
+            doc_ranges=request.doc_ranges,
         )
 
     def append_output_token_ids(

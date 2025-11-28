@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """KV-Cache Utilities."""
 import os
+import enum
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional, List
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -157,6 +158,97 @@ class KVCacheBlock:
                 f"prev_free_block={prev_block_id}, "
                 f"next_free_block={next_block_id})")
 
+@dataclass
+class KVCacheBlocks:
+    blocks: list[KVCacheBlock]
+
+    def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
+        """Adds two KVCacheBlocks instances."""
+        return KVCacheBlocks(self.blocks + other.blocks)
+
+    @classmethod
+    def create_empty(cls) -> "KVCacheBlocks":
+        """Creates a new KVCacheBlocks instance with no blocks."""
+        return cls([])
+
+    def get_block_ids(self) -> list[int]:
+        """Converts the KVCacheBlocks instance to a list of block IDs."""
+        return [block.block_id for block in self.blocks]
+
+    def get_unhashed_block_ids(self) -> list[int]:
+        """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
+        return [
+            block.block_id for block in self.blocks if block.block_hash is None
+        ]
+
+class ChunkHitState(enum.Enum):
+    NATIVE_HIT = 0
+    EXTERNAL_HIT = 1
+    MISSED = 2
+
+class KVCacheChunkHitInfo:
+    def __init__(
+        self,
+        hit_state: ChunkHitState = ChunkHitState.MISSED,
+        origin_rotary_offset: int = -1,
+        blocks: Optional[KVCacheBlocks] = None,
+        chunk_hash: str = "",
+    ):
+        self._blocks = blocks
+        self._chunk_hash = chunk_hash
+        self._origin_rotary_offset = origin_rotary_offset
+        self._hit_state = hit_state
+
+# Note: 相对于 V0 版本，去掉了 _computed 字段
+# 这使得在同一个批次中的请求也可以共享 chunk，进一步减少显存占用
+class KVCacheChunk:
+    def __init__(
+        self,
+        blocks: List[KVCacheBlock],
+        block_size: int,
+        chunk_hash: str,
+        chunk_start_token_offset: int,
+        chunk_end_token_offset: int,
+        num_tokens: int,
+        rotary_offset: int,
+    ):
+        assert ((chunk_start_token_offset == 0 or chunk_start_token_offset % block_size == 0) and 
+                (chunk_end_token_offset == 0 or chunk_end_token_offset % block_size == 0))
+        self._blocks = blocks
+        self._chunk_start_token_offset = chunk_start_token_offset
+        self._chunk_end_token_offset = chunk_end_token_offset
+        self._num_tokens = num_tokens
+        self._rotary_offset = rotary_offset
+        self._block_size = block_size
+        self._chunk_hash = chunk_hash
+
+        self._ref_count = 0
+        # self._computed = False
+
+        self._prev_free_chunk: Optional["KVCacheChunk"] = None
+        self._next_free_chunk: Optional["KVCacheChunk"] = None
+
+        for block in self._blocks:
+            block.incr_ref()
+
+    # def is_valid(self):
+    #     return self._computed
+    
+    def incr_ref_count(self):
+        self._ref_count += 1
+        return self._ref_count
+
+    def decr_ref_count(self):
+        self._ref_count -= 1
+        return self._ref_count
+    
+    def get_num_block(self):
+        assert len(self._blocks) == (self._chunk_end_token_offset - self._chunk_start_token_offset) // self._block_size
+        return len(self._blocks)
+    
+    # def mark_as_computed(self):
+    #     self._computed = True
+
 
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
@@ -261,6 +353,49 @@ class FreeKVCacheBlockQueue:
             ret.append(curr_block)
             curr_block = curr_block.next_free_block
         return ret
+    
+class FreeKVCacheChunkQueue:
+    def __init__(self):
+        self.dummy_chunk: KVCacheChunk = KVCacheChunk(
+            blocks=[],
+            block_size=0,
+            chunk_hash="",
+            chunk_start_token_offset=0,
+            chunk_end_token_offset=0,
+            num_tokens=0,
+            rotary_offset=0,
+        )
+        self.dummy_chunk._prev_free_chunk = self.dummy_chunk
+        self.dummy_chunk._next_free_chunk = self.dummy_chunk
+    
+        self.num_free_blocks = 0
+
+    def popleft(self) -> KVCacheChunk:
+        if self.num_free_blocks == 0:
+            raise ValueError("No free chunks available")
+        
+        chunk = self.dummy_chunk._next_free_chunk
+        self.remove(chunk)
+        return chunk
+        
+    def remove(self, chunk: KVCacheChunk) -> None:
+        if chunk._prev_free_chunk is None:
+            return
+        if chunk._next_free_chunk is None:
+            return
+        chunk._prev_free_chunk._next_free_chunk = chunk._next_free_chunk
+        chunk._next_free_chunk._prev_free_chunk = chunk._prev_free_chunk
+        chunk._prev_free_chunk = None
+        chunk._next_free_chunk = None
+        self.num_free_blocks -= chunk.get_num_block()
+    
+    def append(self, chunk: KVCacheChunk) -> None:
+        tail_chunk = self.dummy_chunk._prev_free_chunk
+        chunk._prev_free_chunk = tail_chunk
+        chunk._next_free_chunk = self.dummy_chunk
+        self.dummy_chunk._prev_free_chunk = chunk
+        tail_chunk._next_free_chunk = chunk
+        self.num_free_blocks += chunk.get_num_block()
 
 
 def need_extra_keys(request: Request) -> bool:

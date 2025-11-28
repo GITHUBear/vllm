@@ -18,6 +18,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_utils import ChunkHitState
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
@@ -44,6 +45,7 @@ class Scheduler(SchedulerInterface):
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
+        enable_blk_attn: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -52,6 +54,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.log_stats = log_stats
+        self.enable_blk_attn = enable_blk_attn
         self.structured_output_manager = structured_output_manager
 
         # include_finished_set controls whether a separate set of finished
@@ -138,14 +141,16 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
 
         # Create the KV cache manager.
+        self.enable_caching = self.cache_config.enable_prefix_caching
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
-            enable_caching=self.cache_config.enable_prefix_caching,
+            enable_caching=self.enable_caching,
             caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
             use_eagle=self.use_eagle,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
+            enable_blk_caching=self.enable_blk_attn,
         )
 
     def schedule(self) -> SchedulerOutput:
@@ -231,7 +236,8 @@ class Scheduler(SchedulerInterface):
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
-                    num_lookahead_tokens=self.num_lookahead_tokens)
+                    num_lookahead_tokens=self.num_lookahead_tokens,
+                    blk_caching_mode=(request.doc_ranges is not None))
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -350,15 +356,31 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if num_prealloc_computed_tokens == 0:
+                    blk_caching_mode = (request.doc_ranges is not None)
+                    # 1. 没有使用 external 缓存；
+                    # 2. 使用了但是第一次；也可能是 resume
                     new_computed_blocks, num_native_computed_tokens = \
                         self.kv_cache_manager.get_computed_blocks(
-                            request)
+                            request,
+                            blk_caching_mode=blk_caching_mode)
 
                     # Get externally-cached tokens if using a KVConnector.
+                    external_hit_chunk_ids = []
+                    external_rotary_offsets = []
                     if self.connector is not None:
+                        # connector 在 block cache 模式下需要额外返回以下信息：
+                        # 1. external_hit_chunk_ids：除了 native 以外的命中 chunk
+                        # 2. external_rotary_offsets：external 块的 rotary offset
                         num_external_computed_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_native_computed_tokens))
+                    
+                    if blk_caching_mode:
+                        self.kv_cache_manager.complete_block_caching_chunk_hit_infos(
+                            request,
+                            external_hit_chunk_ids,
+                            external_rotary_offsets,
+                        )
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (num_native_computed_tokens +
@@ -388,6 +410,11 @@ class Scheduler(SchedulerInterface):
                             < num_new_tokens):
                         num_new_tokens = (
                             self.scheduler_config.long_prefill_token_threshold)
+                    # shk：在开启 blk_cache 时，如果 token_budget 不足，目前跳过调度
+                    if (self.enable_blk_attn and (request.doc_ranges is not None) and
+                        request.num_prompt_tokens - num_computed_tokens > token_budget):
+                        # 目前先保证 chunk 区域在一次 forward 完成 prefill
+                        continue
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
@@ -409,6 +436,7 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks,
                     num_lookahead_tokens=self.num_lookahead_tokens,
                     delay_cache_blocks=load_kv_async,
+                    blk_caching_mode=(request.doc_ranges is not None),
                 )
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -443,6 +471,8 @@ class Scheduler(SchedulerInterface):
                                          scheduled_timestamp)
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
+                    if request.doc_ranges is not None:
+                        logger.info(f"============= BLOCK CACHING delta_rotary_offsets: {request.delta_rotary_offsets}")
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
                 else:
@@ -497,6 +527,9 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens,
         )
         # Construct the scheduler output.
+        # 目标一致：
+        # 1. 按照正常逻辑顺序排列的 block id
+        # 2. delta rotary
         new_reqs_data = [
             NewRequestData.from_request(req,
                                         req_to_new_block_ids[req.request_id])
@@ -950,7 +983,7 @@ class Scheduler(SchedulerInterface):
         block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
         return self.connector.request_finished(request, block_ids)
 
-    def _update_waiting_for_remote_kv(self, request: Request) -> bool:
+    def _update_waiting_for_remote_kv_prefix_caching_mode(self, request: Request) -> bool:
         """
         P/D: check if the request_id is finished_recving.
 
@@ -982,6 +1015,30 @@ class Scheduler(SchedulerInterface):
         # Return that we are ready.
         self.finished_recving_kv_req_ids.remove(request.request_id)
         return True
+    
+    def _update_waiting_for_remote_kv_block_caching_mode(self, request: Request):
+        if request.request_id not in self.finished_recving_kv_req_ids:
+            return False
+        
+        block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+        num_computed_tokens = len(block_ids) * self.block_size
+        if num_computed_tokens == request.num_tokens:
+            num_computed_tokens -= 1
+
+        
+
+        # Update the request state for scheduling.
+        request.num_computed_tokens = num_computed_tokens
+
+        # Return that we are ready.
+        self.finished_recving_kv_req_ids.remove(request.request_id)
+        return True
+
+    # TODO[shk]: 对于 block attention 需要适配
+    def _update_waiting_for_remote_kv(self, request: Request, blk_caching_mode: bool = False) -> bool:
+        if blk_caching_mode and self.enable_blk_attn:
+            return self._update_waiting_for_remote_kv_block_caching_mode(request)
+        return self._update_waiting_for_remote_kv_prefix_caching_mode(request)
 
     def _update_from_kv_xfer_finished(self,
                                       model_runner_output: ModelRunnerOutput):

@@ -327,6 +327,7 @@ class Processor:
             arrival_time=arrival_time,
             lora_request=lora_request,
             cache_salt=decoder_inputs.get("cache_salt"),
+            doc_ranges=decoder_inputs.get("doc_ranges"),
         )
 
     def _validate_model_inputs(self,

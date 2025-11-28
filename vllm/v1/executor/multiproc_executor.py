@@ -160,7 +160,7 @@ class MultiprocExecutor(Executor):
                                          unique_reply_rank=self.output_rank,
                                          non_block=self.max_concurrent_batches
                                          > 1,
-                                         timeout=EXECUTE_MODEL_TIMEOUT_S)
+                                         timeout=None)
         return output
 
     def collective_rpc(self,

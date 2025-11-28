@@ -1499,7 +1499,7 @@ class EngineArgs:
     def _set_default_args_v1(self, usage_context: UsageContext) -> None:
         """Set Default Arguments for V1 Engine."""
 
-        # V1 always uses chunked prefills.
+        # 为了在 V1 下使用 Block Attention，需要允许关闭 chunked prefill
         self.enable_chunked_prefill = True
 
         # V1 enables prefix caching by default.

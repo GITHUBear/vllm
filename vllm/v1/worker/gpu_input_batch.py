@@ -38,6 +38,10 @@ class CachedRequestState:
 
     lora_request: Optional[LoRARequest] = None
 
+    # For Block Attention
+    doc_ranges: Optional[list[tuple]] = None
+    rotary_position_offsets: Optional[list[int]] = None
+
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)
 
