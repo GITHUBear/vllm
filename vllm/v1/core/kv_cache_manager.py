@@ -499,7 +499,7 @@ class KVCacheManager:
                 assert hit_info._blocks is not None
                 ordered_chunk_blocks.extend(hit_info._blocks.blocks)
                 if hit_info._hit_state == ChunkHitState.MISSED:
-                    delta_rotary_offsets.append(-1)
+                    delta_rotary_offsets.append(0)
                 else:
                     delta_rotary_offsets.append(doc_range[3] - hit_info._origin_rotary_offset)
             self.single_type_manager.refresh_blocks(
@@ -537,6 +537,94 @@ class KVCacheManager:
             num_lookahead_tokens=num_lookahead_tokens,
             delay_cache_blocks=delay_cache_blocks,
         )
+
+    # (chunked_new_len, offset, rotary_offset, context_len)
+    def get_req_new_tokens_chunk_info(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        seq_chunk_lens: list[int],
+        seq_delta_rotary_offsets: list[int],
+        seq_chunk_num: list[int],
+        seq_block_table_range: list[tuple],
+    ):
+        def ceil(a, b):
+            return (a + b - 1) // b
+        
+        if (not self.enable_blk_caching) or (request.doc_ranges is None):
+            seq_chunk_lens.append(num_computed_tokens + num_new_tokens)
+            seq_delta_rotary_offsets.append(0)
+            seq_chunk_num.append(1)
+            seq_block_table_range.append((0, ceil(num_computed_tokens + num_new_tokens, self.block_size)))
+            return [(num_new_tokens, num_computed_tokens, 
+                     num_computed_tokens, num_computed_tokens)]
+        
+        doc_ranges = request.doc_ranges
+        assert request.request_id in self.blk_caching_req_to_chunk_ids
+        cache_ordered_chunk_idx = self.blk_caching_req_to_chunk_ids[request.request_id]
+
+        if num_computed_tokens > doc_ranges[-1][1]:
+            for doc_range in doc_ranges:
+                seq_chunk_lens.append(doc_range[2])
+            if num_computed_tokens > doc_ranges[-1][1]:
+                seq_chunk_lens.append(num_computed_tokens + num_new_tokens - doc_ranges[-1][1])
+
+            assert request.delta_rotary_offsets is not None
+            seq_delta_rotary_offsets.extend(request.delta_rotary_offsets)
+            if num_computed_tokens > doc_ranges[-1][1]:
+                seq_delta_rotary_offsets.append(0)
+            seq_chunk_num.append(len(seq_chunk_lens))
+
+            seq_block_table_range.append((0, ceil(num_computed_tokens + num_new_tokens, self.block_size)))
+
+            # 注意这里的 rotary offset 的计算
+            return [(num_new_tokens, 
+                     num_computed_tokens,
+                     num_computed_tokens + doc_ranges[-1][3] + doc_ranges[-1][2] - doc_ranges[-1][1],
+                     num_computed_tokens)]
+
+        remain_computed_tokens = num_computed_tokens
+        remain_chunk_idxs = []
+        for idx, chunk_idx in enumerate(cache_ordered_chunk_idx):
+            chunk_len = doc_ranges[chunk_idx][1] - doc_ranges[chunk_idx][0]
+            if remain_computed_tokens < chunk_len:
+                assert remain_computed_tokens == 0
+                remain_chunk_idxs = cache_ordered_chunk_idx[idx:]
+                break
+            remain_computed_tokens -= chunk_len
+
+        remain_new_tokens = num_new_tokens
+        chunk_infos = []
+        for idx, chunk_idx in enumerate(remain_chunk_idxs):
+            chunk_len = doc_ranges[chunk_idx][1] - doc_ranges[chunk_idx][0]
+            if remain_new_tokens < chunk_len:
+                assert remain_new_tokens == 0
+                return chunk_infos
+            seq_chunk_lens.append(chunk_len)
+            seq_delta_rotary_offsets.append(0)
+            seq_chunk_num.append(1)
+            seq_block_table_range.append((doc_ranges[chunk_idx][0] // self.block_size, doc_ranges[chunk_idx][1] // self.block_size))
+            chunk_infos.append((chunk_len, doc_ranges[chunk_idx][0], 
+                                doc_ranges[chunk_idx][3], 0))
+            remain_new_tokens -= chunk_len
+        
+        if remain_new_tokens > 0:
+            for doc_range in doc_ranges:
+                seq_chunk_lens.append(doc_range[2])
+            seq_chunk_lens.append(num_computed_tokens + num_new_tokens - doc_ranges[-1][1])
+            assert request.delta_rotary_offsets is not None
+            seq_delta_rotary_offsets.extend(request.delta_rotary_offsets)
+            seq_delta_rotary_offsets.append(0)
+            seq_chunk_num.append(len(doc_ranges) + 1)
+            seq_block_table_range.append((0, ceil(num_computed_tokens + num_new_tokens, self.block_size)))
+            chunk_infos.append((remain_new_tokens,
+                                doc_ranges[-1][1], 
+                                doc_ranges[-1][3] + doc_ranges[-1][2],
+                                doc_ranges[-1][1]))
+
+        return chunk_infos
+        
 
     def cache_external_async_load_chunks(
         self,

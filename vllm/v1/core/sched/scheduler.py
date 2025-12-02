@@ -180,6 +180,11 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_block_ids: dict[str, list[int]] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        num_scheduled_tokens_in_chunk: dict[str, list[int]] = {}
+        seq_chunk_lens_per_req: dict[str, list[int]] = {}
+        seq_delta_rotary_per_req: dict[str, list[int]] = {}
+        seq_chunk_num_per_req: dict[str, list[int]] = {}
+        seq_block_table_range_per_req: dict[str, list[tuple]] = {}
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -274,6 +279,24 @@ class Scheduler(SchedulerInterface):
             req_to_new_block_ids[request.request_id] = (
                 new_blocks.get_block_ids())
             num_scheduled_tokens[request.request_id] = num_new_tokens
+            seq_chunk_lens = []
+            seq_delta_rotary = []
+            seq_chunk_num = []
+            seq_block_table_range = []
+            num_scheduled_tokens_in_chunk[request.request_id] = (
+                self.kv_cache_manager.get_req_new_tokens_chunk_info(
+                    request=request,
+                    num_computed_tokens=request.num_computed_tokens,
+                    num_new_tokens=num_new_tokens,
+                    seq_chunk_lens=seq_chunk_lens,
+                    seq_delta_rotary_offsets=seq_delta_rotary,
+                    seq_chunk_num=seq_chunk_num,
+                    seq_block_table_range=seq_block_table_range,
+                ))
+            seq_chunk_lens_per_req[request.request_id] = seq_chunk_lens
+            seq_delta_rotary_per_req[request.request_id] = seq_delta_rotary
+            seq_chunk_num_per_req[request.request_id] = seq_chunk_num
+            seq_block_table_range_per_req[request.request_id] = seq_block_table_range
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -484,6 +507,24 @@ class Scheduler(SchedulerInterface):
                 req_to_new_block_ids[request.request_id] = (
                     self.kv_cache_manager.get_block_ids(request.request_id))
                 num_scheduled_tokens[request.request_id] = num_new_tokens
+                seq_chunk_lens = []
+                seq_delta_rotary = []
+                seq_chunk_num = []
+                seq_block_table_range = []
+                num_scheduled_tokens_in_chunk[request.request_id] = (
+                    self.kv_cache_manager.get_req_new_tokens_chunk_info(
+                        request=request,
+                        num_computed_tokens=num_computed_tokens,
+                        num_new_tokens=num_new_tokens,
+                        seq_chunk_lens=seq_chunk_lens,
+                        seq_delta_rotary_offsets=seq_delta_rotary,
+                        seq_chunk_num=seq_chunk_num,
+                        seq_block_table_range=seq_block_table_range,
+                    ))
+                seq_chunk_lens_per_req[request.request_id] = seq_chunk_lens
+                seq_delta_rotary_per_req[request.request_id] = seq_delta_rotary
+                seq_chunk_num_per_req[request.request_id] = seq_chunk_num
+                seq_block_table_range_per_req[request.request_id] = seq_block_table_range
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -515,7 +556,7 @@ class Scheduler(SchedulerInterface):
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
         num_common_prefix_blocks = 0
-        if self.running:
+        if self.running and (all([(req.doc_ranges is None) for req in self.running])):
             any_request = self.running[0]
             num_common_prefix_blocks = (
                 self.kv_cache_manager.get_num_common_prefix_blocks(
@@ -557,6 +598,11 @@ class Scheduler(SchedulerInterface):
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=resumed_reqs_data + running_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
+            num_scheduled_tokens_in_chunk=num_scheduled_tokens_in_chunk,
+            seq_chunk_lens_per_req=seq_chunk_lens_per_req,
+            seq_delta_rotary_per_req=seq_delta_rotary_per_req,
+            seq_chunk_num_per_req=seq_chunk_num_per_req,
+            seq_block_table_range_per_req=seq_block_table_range_per_req,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,

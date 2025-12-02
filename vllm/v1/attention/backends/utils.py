@@ -16,3 +16,12 @@ class CommonAttentionMetadata:
     seq_lens: torch.Tensor
     """(batch_size,), the length of each request including both computed tokens
     and newly scheduled tokens"""
+    total_num_chunks: int
+    """scalar, chunk 数量"""
+    seq_chunk_len_gpu_tensor: torch.Tensor
+    """"""
+    seq_delta_rotarys_gpu_tensor: torch.Tensor
+    """"""
+    cu_num_chunk_gpu_tensor: torch.Tensor
+    """"""
+

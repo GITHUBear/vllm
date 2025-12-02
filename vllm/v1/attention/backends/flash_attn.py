@@ -99,6 +99,11 @@ class FlashAttentionMetadata:
     scheduler_metadata: Optional[torch.Tensor] = None
     prefix_scheduler_metadata: Optional[torch.Tensor] = None
 
+    # For Block Attention
+    seq_chunk_len_gpu_tensor: Optional[torch.Tensor] = None
+    seq_delta_rotarys_gpu_tensor: Optional[torch.Tensor] = None
+    cu_num_chunk_gpu_tensor: Optional[torch.Tensor] = None
+
     # for local attention
     @dataclass
     class LocalAttentionMetadata:
@@ -325,11 +330,14 @@ class FlashAttentionMetadataBuilder:
     def build(self, num_reqs: int, num_actual_tokens: int, max_query_len: int,
               common_prefix_len: int,
               common_attn_metadata: CommonAttentionMetadata):
-        max_seq_len = self.runner.seq_lens_np[:num_reqs].max()
+        max_seq_len = self.runner.seq_lens_np[:common_attn_metadata.total_num_chunks].max()
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
+        seq_chunk_len_gpu_tensor = common_attn_metadata.seq_chunk_len_gpu_tensor
+        seq_delta_rotarys_gpu_tensor = common_attn_metadata.seq_delta_rotarys_gpu_tensor
+        cu_num_chunk_gpu_tensor = common_attn_metadata.cu_num_chunk_gpu_tensor
         block_table = self.block_table
-        block_table_tensor = block_table.get_device_tensor()[:num_reqs]
+        block_table_tensor = block_table.get_device_tensor()[:common_attn_metadata.total_num_chunks]
 
         block_table.slot_mapping[:num_actual_tokens].copy_(
             block_table.slot_mapping_cpu[:num_actual_tokens],
@@ -463,6 +471,9 @@ class FlashAttentionMetadataBuilder:
             suffix_kv_lens=suffix_kv_lens,
             local_attn_metadata=local_attn_metadata,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
+            seq_chunk_len_gpu_tensor=seq_chunk_len_gpu_tensor,
+            seq_delta_rotarys_gpu_tensor=seq_delta_rotarys_gpu_tensor,
+            cu_num_chunk_gpu_tensor=cu_num_chunk_gpu_tensor,
         )
         return attn_metadata
 
@@ -538,6 +549,23 @@ class FlashAttentionImpl(AttentionImpl):
             and not flash_attn_supports_fp8():
             raise NotImplementedError(
                 "FlashAttention does not support fp8 kv-cache on this device.")
+        
+        self._cos_sin_cache = self._init_cos_sin_cache()
+
+    def _init_cos_sin_cache(
+        self,
+        base = 1000000.0,
+        rotary_dim = 128,
+        max_position_embeddings = 32768,
+    ):
+        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cos_sin_cache = torch.cat((cos, sin), dim=-1).to(dtype=torch.float16)
+        assert cos_sin_cache.stride(-1) == 1
+        return cos_sin_cache
 
     def forward(
         self,
@@ -644,6 +672,13 @@ class FlashAttentionImpl(AttentionImpl):
                 alibi_slopes=self.alibi_slopes,
                 window_size=self.sliding_window,
                 block_table=block_table,
+
+                actual_chunked_seqlen_k=attn_metadata.seq_chunk_len_gpu_tensor,
+                chunk_rotray_offset_positions=attn_metadata.seq_delta_rotarys_gpu_tensor,
+                cu_num_chunks_k=attn_metadata.cu_num_chunk_gpu_tensor,
+                cos_sin_cache=self._cos_sin_cache,
+                enable_splitkv_for_chunked_kv=True,
+
                 softcap=self.logits_soft_cap,
                 scheduler_metadata=scheduler_metadata,
                 fa_version=self.vllm_flash_attn_version,

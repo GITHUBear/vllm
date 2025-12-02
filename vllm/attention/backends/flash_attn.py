@@ -509,7 +509,6 @@ class FlashAttentionMetadataBuilder(
     # 8. cu_num_chunks_k：对于 prefill 请求，未命中的 chunk 设置为 1，最后一个 chunk，设置为之前 chunk 序列长度 + 1
     #    对于 decode 请求，仅处理最后一个 chunk
     #    对于非 chunk 请求，1
-    # 9. local_key & local_value & local_cu_seqlen_k：仅在 prefill 时使用
 
     def __init__(self, input_builder: "ModelInputForGPUBuilder"):
         self.input_builder = input_builder

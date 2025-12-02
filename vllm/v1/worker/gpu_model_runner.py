@@ -68,6 +68,8 @@ logger = init_logger(__name__)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
+    # TODO[shk]: 作为配置
+    MAX_CHUNKS_PER_REQ = 20
 
     def __init__(
         self,
@@ -283,7 +285,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
         # Keep in int64 to avoid overflow with long context
-        self.arange_np = np.arange(max(self.max_num_reqs + 1,
+        self.arange_np = np.arange(max(self.max_num_reqs * GPUModelRunner.MAX_CHUNKS_PER_REQ + 1,
                                        self.max_model_len,
                                        self.max_num_tokens),
                                    dtype=np.int64)
@@ -299,16 +301,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                          device="cpu",
                                          pin_memory=self.pin_memory)
         self.positions_np = self.positions_cpu.numpy()
-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
+        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs * GPUModelRunner.MAX_CHUNKS_PER_REQ + 1,
                                                dtype=torch.int32,
                                                device="cpu",
                                                pin_memory=self.pin_memory)
         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
-        self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
+        self.seq_lens_cpu = torch.zeros(self.max_num_reqs * GPUModelRunner.MAX_CHUNKS_PER_REQ,
                                         dtype=torch.int32,
                                         device="cpu",
                                         pin_memory=self.pin_memory)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
+
+        self.seq_chunk_len_gpu_tensor = torch.zeros(2 * self.max_num_reqs * GPUModelRunner.MAX_CHUNKS_PER_REQ,
+                                           dtype=torch.int32,
+                                           device=self.device)
+        self.seq_delta_rotarys_gpu_tensor = torch.zeros(2 * self.max_num_reqs * GPUModelRunner.MAX_CHUNKS_PER_REQ,
+                                           dtype=torch.int32,
+                                           device=self.device)
+        self.cu_num_chunk_gpu_tensor = torch.zeros(2 * self.max_num_reqs * GPUModelRunner.MAX_CHUNKS_PER_REQ + 1,
+                                           dtype=torch.int32,
+                                           device=self.device)
+        self.seq_chunk_len_cpu_tensor = torch.zeros(2 * self.max_num_reqs * GPUModelRunner.MAX_CHUNKS_PER_REQ,
+                                           dtype=torch.int32,
+                                           device="cpu",
+                                           pin_memory=self.pin_memory)
+        self.seq_delta_rotarys_cpu_tensor = torch.zeros(2 * self.max_num_reqs * GPUModelRunner.MAX_CHUNKS_PER_REQ,
+                                           dtype=torch.int32,
+                                           device="cpu",
+                                           pin_memory=self.pin_memory)
+        self.cu_num_chunk_cpu_tensor = torch.zeros(2 * self.max_num_reqs * GPUModelRunner.MAX_CHUNKS_PER_REQ + 1,
+                                           dtype=torch.int32,
+                                           device="cpu",
+                                           pin_memory=self.pin_memory)
+        self.seq_chunk_len_np = self.seq_chunk_len_cpu_tensor.numpy()
+        self.seq_delta_rotarys_np = self.seq_delta_rotarys_cpu_tensor.numpy()
+        self.cu_num_chunk_np = self.cu_num_chunk_cpu_tensor.numpy()        
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -525,28 +552,76 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+        req_ids = self.input_batch.req_ids
+        block_table_chunk_index = 0
+        for idx, req_id in enumerate(req_ids):
+            block_table_ranges = scheduler_output.seq_block_table_range_per_req[req_id]
+            cur_block_table = self.input_batch.block_table.get_cpu_tensor()[idx]
+            block_table_for_chunk = self.input_batch.block_table.block_table_per_chunk_np
+            for block_table_range in block_table_ranges:
+                block_table_for_chunk[block_table_chunk_index, :(block_table_range[1] - block_table_range[0])] = cur_block_table[block_table_range[0]:block_table_range[1]]
+                block_table_chunk_index += 1
+
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit(num_reqs)
+        self.input_batch.block_table.commit(num_reqs, block_table_chunk_index)
+        
 
         # Get the number of scheduled tokens for each request.
-        req_ids = self.input_batch.req_ids
-        tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+        tokens_per_req = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+        num_scheduled_tokens_per_req = np.array(tokens_per_req, dtype=np.int32)
+        total_num_chunks = 0
+        tokens = []
+        token_offset_in_chunk = []
+        rotary_offset_in_chunk = []
+        chunk_context_lens = []
+        seq_chunk_lens = []
+        seq_delta_rotarys = []
+        seq_chunk_nums = []
+        for i in req_ids:
+            total_num_chunks += len(scheduler_output.num_scheduled_tokens_in_chunk[i])
+            for chunk in scheduler_output.num_scheduled_tokens_in_chunk[i]:
+                tokens.append(chunk[0])
+                token_offset_in_chunk.append(chunk[1])
+                rotary_offset_in_chunk.append(chunk[2])
+                chunk_context_lens.append(chunk[3])
+            seq_chunk_lens.extend(scheduler_output.seq_chunk_lens_per_req[i])
+            seq_delta_rotarys.extend(scheduler_output.seq_delta_rotary_per_req[i])
+            seq_chunk_nums.extend(scheduler_output.seq_chunk_num_per_req[i])
+        assert total_num_chunks == block_table_chunk_index
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
+        token_offset_in_chunk_np = np.array(token_offset_in_chunk, dtype=np.int32)
+        rotary_offset_in_chunk_np = np.array(rotary_offset_in_chunk, dtype=np.int32)
+        chunk_context_lens_np = np.array(chunk_context_lens, dtype=np.int32)
+        seq_chunk_info_len = len(seq_chunk_lens)
+        self.seq_chunk_len_np[:seq_chunk_info_len] = np.array(seq_chunk_lens, dtype=np.int32)
+        self.seq_delta_rotarys_np[:seq_chunk_info_len] = np.array(seq_delta_rotarys, dtype=np.int32)
+        cu_chunk_num_len = len(seq_chunk_nums)
+        seq_chunk_nums_np = np.array(seq_chunk_nums, dtype=np.int32)
         max_num_scheduled_tokens = max(tokens)
+
+        cu_chunk_nums_np = np.cumsum(seq_chunk_nums_np)
+        self.cu_num_chunk_np[0] = 0
+        self.cu_num_chunk_np[1:cu_chunk_num_len+1] = cu_chunk_nums_np
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs],
-                                num_scheduled_tokens)
+                                num_scheduled_tokens_per_req)
+        
+        chunk_indices = np.repeat(self.arange_np[:total_num_chunks],
+                                  num_scheduled_tokens)
 
+        logits_indices_np = np.cumsum(num_scheduled_tokens_per_req) - 1
         # Get batched arange.
         # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # Equivalent to but faster than:
         # np.concatenate([np.arange(n) for n in num_scheduled_tokens])
         # Step 1. [2, 5, 3] -> [2, 7, 10]
+        # chunked 时，应该使用每个请求对自己 new token 的 chunk 来进行计算
         cu_num_tokens = np.cumsum(num_scheduled_tokens)
         # Step 2. [2, 7, 10] -> [0, 0, 2, 2, 2, 2, 2, 7, 7, 7]
+        # 同样的 num_scheduled_tokens 应该使用 chunked 情况
         cumsums_offsets = np.repeat(cu_num_tokens - num_scheduled_tokens,
                                     num_scheduled_tokens)
         # Step 3. [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -554,7 +629,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Get positions.
         positions_np = self.positions_np[:total_num_scheduled_tokens]
-        np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
+        # 增加 num_computed_tokens_cpu 的 chunk 版本 (rotary_offset)
+        # 先临时使用 token_offset，为下面计算 token_ids / slot_mapping 做准备
+        # 拷贝到 gpu 前更换为 rotary_offset
+        np.add(token_offset_in_chunk_np[chunk_indices],
                arange,
                out=positions_np)
 
@@ -596,13 +674,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Prepare the attention metadata.
         self.query_start_loc_np[0] = 0
-        self.query_start_loc_np[1:num_reqs + 1] = cu_num_tokens
+        self.query_start_loc_np[1:total_num_chunks + 1] = cu_num_tokens
 
-        self.seq_lens_np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] +
-            num_scheduled_tokens)
+        self.seq_lens_np[:total_num_chunks] = (
+            chunk_context_lens_np + num_scheduled_tokens)
 
         # Copy the tensors to the GPU.
+        np.add(rotary_offset_in_chunk_np[chunk_indices],
+               arange,
+               out=positions_np)
         self.input_ids[:total_num_scheduled_tokens].copy_(
             self.input_ids_cpu[:total_num_scheduled_tokens], non_blocking=True)
         if self.uses_mrope:
@@ -616,20 +696,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.positions_cpu[:total_num_scheduled_tokens],
                 non_blocking=True)
 
-        self.query_start_loc[:num_reqs + 1].copy_(
-            self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
-        self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
+        self.query_start_loc[:total_num_chunks + 1].copy_(
+            self.query_start_loc_cpu[:total_num_chunks + 1], non_blocking=True)
+        self.seq_lens[:total_num_chunks].copy_(self.seq_lens_cpu[:total_num_chunks],
                                        non_blocking=True)
+        self.seq_chunk_len_gpu_tensor[:seq_chunk_info_len].copy_(
+            self.seq_chunk_len_cpu_tensor[:seq_chunk_info_len], non_blocking=True)
+        self.seq_delta_rotarys_gpu_tensor[:seq_chunk_info_len].copy_(
+            self.seq_delta_rotarys_cpu_tensor[:seq_chunk_info_len], non_blocking=True)
+        self.cu_num_chunk_gpu_tensor[:cu_chunk_num_len+1].copy_(
+            self.cu_num_chunk_cpu_tensor[:cu_chunk_num_len+1], non_blocking=True)
 
         # Fill unused with -1. Needed for reshape_and_cache
-        self.seq_lens[num_reqs:].fill_(0)
-        self.query_start_loc[num_reqs + 1:].fill_(-1)
+        self.seq_lens[total_num_chunks:].fill_(0)
+        self.query_start_loc[total_num_chunks + 1:].fill_(-1)
 
-        query_start_loc = self.query_start_loc[:num_reqs + 1]
-        seq_lens = self.seq_lens[:num_reqs]
+        query_start_loc = self.query_start_loc[:total_num_chunks + 1]
+        seq_lens = self.seq_lens[:total_num_chunks]
+        seq_chunk_len_gpu_tensor = self.seq_chunk_len_gpu_tensor[:seq_chunk_info_len]
+        seq_delta_rotarys_gpu_tensor = self.seq_delta_rotarys_gpu_tensor[:seq_chunk_info_len]
+        cu_num_chunk_gpu_tensor = self.cu_num_chunk_gpu_tensor[:cu_chunk_num_len+1]
 
         common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=query_start_loc, seq_lens=seq_lens)
+            query_start_loc=query_start_loc, seq_lens=seq_lens, 
+            total_num_chunks=total_num_chunks,
+            seq_chunk_len_gpu_tensor=seq_chunk_len_gpu_tensor,
+            seq_delta_rotarys_gpu_tensor=seq_delta_rotarys_gpu_tensor,
+            cu_num_chunk_gpu_tensor=cu_num_chunk_gpu_tensor,)
 
         attn_metadata: dict[str, FlashAttentionMetadata] = {}
         # Prepare the attention metadata for each KV cache group and make layers
@@ -666,7 +759,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = query_start_loc[1:] - 1
+            # logits_indices = query_start_loc[1:] - 1
+            logits_indices = torch.from_numpy(logits_indices_np).to(dtype=torch.int32, device=query_start_loc.device, non_blocking=True)
             spec_decode_metadata = None
         else:
             # Get the number of draft tokens for each request.

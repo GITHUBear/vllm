@@ -132,6 +132,14 @@ class SchedulerOutput:
     # req_id -> num_scheduled_tokens
     # Number of tokens scheduled for each request.
     num_scheduled_tokens: dict[str, int]
+    # shk: For Block Attention
+    # 对于无分块的请求，和 num_scheduled_tokens 中存储的信息一致
+    # 有分块的请求，则存放 new_token 是分块后每个分块的长度
+    num_scheduled_tokens_in_chunk: dict[str, list[tuple]]
+    seq_chunk_lens_per_req: dict[str, list[int]]
+    seq_delta_rotary_per_req: dict[str, list[int]]
+    seq_chunk_num_per_req: dict[str, list[int]]
+    seq_block_table_range_per_req: dict[str, list[tuple]]
     # Total number of tokens scheduled for all requests.
     # Equal to sum(num_scheduled_tokens.values())
     total_num_scheduled_tokens: int
