@@ -232,8 +232,7 @@ class OpenAIServing:
             self._tokenize_prompt_input_or_inputs,
             executor=self._tokenizer_executor)
         
-        # TODO[shk]:在开发完成后将padding作为默认行为
-        self._enable_doc_padding = True
+        self._enable_doc_padding = self.model_config.enable_blk_attn
 
     async def _preprocess(
         self,
@@ -486,6 +485,9 @@ class OpenAIServing:
         if self.model_config.enable_blk_attn and self.model_config.blk_attn_special_tokens is not None:
             prompt = self.model_config.blk_attn_special_tokens + prompt
 
+        if not self.model_config.enable_blk_attn:
+            prompt = prompt.replace("<|DOC_SEP|>", "")
+
         doc_sep = "<|DOC_SEP|>"
         tokenizer.add_tokens([doc_sep])
         doc_sep_id = tokenizer.convert_tokens_to_ids(doc_sep)
@@ -505,6 +507,9 @@ class OpenAIServing:
                                 add_special_tokens=add_special_tokens,
                                 truncation=True,
                                 max_length=truncate_prompt_tokens)
+
+        if not self.model_config.enable_blk_attn:
+            return self._validate_input(request, encoded.input_ids, prompt)
 
         input_ids = encoded.input_ids
         new_input_ids = []
@@ -537,9 +542,9 @@ class OpenAIServing:
             doc_ranges.append((tmp_doc_ranges[i], tmp_doc_ranges[i + 1], l, cu_actual_len))
             cu_actual_len += l
 
-        logger.info(f"========== DOC OFFSETS: {doc_ranges} ============")
         if len(doc_ranges) == 0:
             doc_ranges = None
+        logger.info(f"========== DOC OFFSETS: {doc_ranges} ============")
         input_text = prompt
 
         return self._validate_input(request, new_input_ids, input_text, doc_ranges=doc_ranges)
