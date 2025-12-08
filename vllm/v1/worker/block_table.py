@@ -35,14 +35,26 @@ class BlockTable:
             dtype=torch.int32,
             pin_memory=pin_memory,
         )
-        self.block_table_cpu_per_chunk = torch.zeros(
-            (max_num_reqs * BlockTable.MAX_CHUNK_NUM_PER_REQ, max_num_blocks_per_req),
+        self.block_table_offsets = torch.zeros(
+            max_num_reqs * BlockTable.MAX_CHUNK_NUM_PER_REQ,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        self.block_table_offsets_cpu = torch.zeros(
+            max_num_reqs * BlockTable.MAX_CHUNK_NUM_PER_REQ,
             device="cpu",
             dtype=torch.int32,
             pin_memory=pin_memory,
         )
+        # self.block_table_cpu_per_chunk = torch.zeros(
+        #     (max_num_reqs * BlockTable.MAX_CHUNK_NUM_PER_REQ, max_num_blocks_per_req),
+        #     device="cpu",
+        #     dtype=torch.int32,
+        #     pin_memory=pin_memory,
+        # )
         self.block_table_np = self.block_table_cpu.numpy()
-        self.block_table_per_chunk_np = self.block_table_cpu_per_chunk.numpy()
+        self.block_table_offsets_np = self.block_table_offsets_cpu.numpy()
+        # self.block_table_per_chunk_np = self.block_table_cpu_per_chunk.numpy()
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
 
         self.slot_mapping_cpu = torch.zeros(self.max_num_batched_tokens,
@@ -84,13 +96,9 @@ class BlockTable:
 
         self.block_table_np[[src, tgt]] = self.block_table_np[[tgt, src]]
 
-    def commit(self, num_reqs: int, num_chunks: int) -> None:
-        if num_chunks == num_reqs:
-            self.block_table[:num_reqs].copy_(self.block_table_cpu[:num_reqs],
-                                            non_blocking=True)
-        else:
-            self.block_table[:num_chunks].copy_(self.block_table_cpu_per_chunk[:num_chunks],
-                                                non_blocking=True)
+    def commit(self, num_reqs: int) -> None:
+        self.block_table[:num_reqs].copy_(self.block_table_cpu[:num_reqs],
+                                        non_blocking=True)
 
     def clear(self) -> None:
         self.block_table.fill_(0)

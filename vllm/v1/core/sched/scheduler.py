@@ -184,7 +184,7 @@ class Scheduler(SchedulerInterface):
         seq_chunk_lens_per_req: dict[str, list[int]] = {}
         seq_delta_rotary_per_req: dict[str, list[int]] = {}
         seq_chunk_num_per_req: dict[str, list[int]] = {}
-        seq_block_table_range_per_req: dict[str, list[tuple]] = {}
+        seq_block_table_offsets_per_req: dict[str, list[int]] = {}
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -282,7 +282,7 @@ class Scheduler(SchedulerInterface):
             seq_chunk_lens = []
             seq_delta_rotary = []
             seq_chunk_num = []
-            seq_block_table_range = []
+            seq_block_table_offset = []
             num_scheduled_tokens_in_chunk[request.request_id] = (
                 self.kv_cache_manager.get_req_new_tokens_chunk_info(
                     request=request,
@@ -291,12 +291,12 @@ class Scheduler(SchedulerInterface):
                     seq_chunk_lens=seq_chunk_lens,
                     seq_delta_rotary_offsets=seq_delta_rotary,
                     seq_chunk_num=seq_chunk_num,
-                    seq_block_table_range=seq_block_table_range,
+                    seq_block_table_offset=seq_block_table_offset,
                 ))
             seq_chunk_lens_per_req[request.request_id] = seq_chunk_lens
             seq_delta_rotary_per_req[request.request_id] = seq_delta_rotary
             seq_chunk_num_per_req[request.request_id] = seq_chunk_num
-            seq_block_table_range_per_req[request.request_id] = seq_block_table_range
+            seq_block_table_offsets_per_req[request.request_id] = seq_block_table_offset
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -510,7 +510,7 @@ class Scheduler(SchedulerInterface):
                 seq_chunk_lens = []
                 seq_delta_rotary = []
                 seq_chunk_num = []
-                seq_block_table_range = []
+                seq_block_table_offset = []
                 num_scheduled_tokens_in_chunk[request.request_id] = (
                     self.kv_cache_manager.get_req_new_tokens_chunk_info(
                         request=request,
@@ -519,12 +519,12 @@ class Scheduler(SchedulerInterface):
                         seq_chunk_lens=seq_chunk_lens,
                         seq_delta_rotary_offsets=seq_delta_rotary,
                         seq_chunk_num=seq_chunk_num,
-                        seq_block_table_range=seq_block_table_range,
+                        seq_block_table_offset=seq_block_table_offset,
                     ))
                 seq_chunk_lens_per_req[request.request_id] = seq_chunk_lens
                 seq_delta_rotary_per_req[request.request_id] = seq_delta_rotary
                 seq_chunk_num_per_req[request.request_id] = seq_chunk_num
-                seq_block_table_range_per_req[request.request_id] = seq_block_table_range
+                seq_block_table_offsets_per_req[request.request_id] = seq_block_table_offset
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -602,7 +602,7 @@ class Scheduler(SchedulerInterface):
             seq_chunk_lens_per_req=seq_chunk_lens_per_req,
             seq_delta_rotary_per_req=seq_delta_rotary_per_req,
             seq_chunk_num_per_req=seq_chunk_num_per_req,
-            seq_block_table_range_per_req=seq_block_table_range_per_req,
+            seq_block_table_offsets_per_req=seq_block_table_offsets_per_req,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,

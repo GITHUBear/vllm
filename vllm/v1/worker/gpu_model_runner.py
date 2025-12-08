@@ -555,16 +555,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_ids = self.input_batch.req_ids
         block_table_chunk_index = 0
         for idx, req_id in enumerate(req_ids):
-            block_table_ranges = scheduler_output.seq_block_table_range_per_req[req_id]
-            cur_block_table = self.input_batch.block_table.get_cpu_tensor()[idx]
-            block_table_for_chunk = self.input_batch.block_table.block_table_per_chunk_np
-            for block_table_range in block_table_ranges:
-                block_table_for_chunk[block_table_chunk_index, :(block_table_range[1] - block_table_range[0])] = cur_block_table[block_table_range[0]:block_table_range[1]]
+            block_table_offsets = scheduler_output.seq_block_table_offsets_per_req[req_id]
+            for block_table_offset in block_table_offsets:
+                global_block_table_offset = idx * self.input_batch.block_table.max_num_blocks_per_req + block_table_offset
+                self.input_batch.block_table.block_table_offsets_np[block_table_chunk_index] = global_block_table_offset
                 block_table_chunk_index += 1
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit(num_reqs, block_table_chunk_index)
+        self.input_batch.block_table.commit(num_reqs)
         
 
         # Get the number of scheduled tokens for each request.
@@ -706,6 +705,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.seq_delta_rotarys_cpu_tensor[:seq_chunk_info_len], non_blocking=True)
         self.cu_num_chunk_gpu_tensor[:cu_chunk_num_len+1].copy_(
             self.cu_num_chunk_cpu_tensor[:cu_chunk_num_len+1], non_blocking=True)
+        
+        self.input_batch.block_table.block_table_offsets[:block_table_chunk_index].copy_(
+            self.input_batch.block_table.block_table_offsets_cpu[:block_table_chunk_index],
+            non_blocking=True)
 
         # Fill unused with -1. Needed for reshape_and_cache
         self.seq_lens[total_num_chunks:].fill_(0)
@@ -716,13 +719,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         seq_chunk_len_gpu_tensor = self.seq_chunk_len_gpu_tensor[:seq_chunk_info_len]
         seq_delta_rotarys_gpu_tensor = self.seq_delta_rotarys_gpu_tensor[:seq_chunk_info_len]
         cu_num_chunk_gpu_tensor = self.cu_num_chunk_gpu_tensor[:cu_chunk_num_len+1]
+        block_table_offsets = self.input_batch.block_table.block_table_offsets[:block_table_chunk_index]
 
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc, seq_lens=seq_lens, 
             total_num_chunks=total_num_chunks,
             seq_chunk_len_gpu_tensor=seq_chunk_len_gpu_tensor,
             seq_delta_rotarys_gpu_tensor=seq_delta_rotarys_gpu_tensor,
-            cu_num_chunk_gpu_tensor=cu_num_chunk_gpu_tensor,)
+            cu_num_chunk_gpu_tensor=cu_num_chunk_gpu_tensor,
+            block_table_offsets=block_table_offsets,)
 
         attn_metadata: dict[str, FlashAttentionMetadata] = {}
         # Prepare the attention metadata for each KV cache group and make layers

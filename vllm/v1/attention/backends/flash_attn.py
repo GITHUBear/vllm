@@ -103,6 +103,7 @@ class FlashAttentionMetadata:
     seq_chunk_len_gpu_tensor: Optional[torch.Tensor] = None
     seq_delta_rotarys_gpu_tensor: Optional[torch.Tensor] = None
     cu_num_chunk_gpu_tensor: Optional[torch.Tensor] = None
+    block_table_offsets: Optional[torch.Tensor] = None
 
     # for local attention
     @dataclass
@@ -336,6 +337,7 @@ class FlashAttentionMetadataBuilder:
         seq_chunk_len_gpu_tensor = common_attn_metadata.seq_chunk_len_gpu_tensor
         seq_delta_rotarys_gpu_tensor = common_attn_metadata.seq_delta_rotarys_gpu_tensor
         cu_num_chunk_gpu_tensor = common_attn_metadata.cu_num_chunk_gpu_tensor
+        block_table_offsets = common_attn_metadata.block_table_offsets
         block_table = self.block_table
         block_table_tensor = block_table.get_device_tensor()[:common_attn_metadata.total_num_chunks]
 
@@ -474,6 +476,7 @@ class FlashAttentionMetadataBuilder:
             seq_chunk_len_gpu_tensor=seq_chunk_len_gpu_tensor,
             seq_delta_rotarys_gpu_tensor=seq_delta_rotarys_gpu_tensor,
             cu_num_chunk_gpu_tensor=cu_num_chunk_gpu_tensor,
+            block_table_offsets=block_table_offsets,
         )
         return attn_metadata
 
@@ -677,6 +680,7 @@ class FlashAttentionImpl(AttentionImpl):
                 chunk_rotray_offset_positions=attn_metadata.seq_delta_rotarys_gpu_tensor,
                 cu_num_chunks_k=attn_metadata.cu_num_chunk_gpu_tensor,
                 cos_sin_cache=self._cos_sin_cache,
+                block_table_offsets=attn_metadata.block_table_offsets,
                 enable_splitkv_for_chunked_kv=True,
 
                 softcap=self.logits_soft_cap,

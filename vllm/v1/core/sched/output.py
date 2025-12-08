@@ -139,7 +139,7 @@ class SchedulerOutput:
     seq_chunk_lens_per_req: dict[str, list[int]]
     seq_delta_rotary_per_req: dict[str, list[int]]
     seq_chunk_num_per_req: dict[str, list[int]]
-    seq_block_table_range_per_req: dict[str, list[tuple]]
+    seq_block_table_offsets_per_req: dict[str, list[int]]
     # Total number of tokens scheduled for all requests.
     # Equal to sum(num_scheduled_tokens.values())
     total_num_scheduled_tokens: int

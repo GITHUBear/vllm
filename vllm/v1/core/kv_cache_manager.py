@@ -547,16 +547,13 @@ class KVCacheManager:
         seq_chunk_lens: list[int],
         seq_delta_rotary_offsets: list[int],
         seq_chunk_num: list[int],
-        seq_block_table_range: list[tuple],
-    ):
-        def ceil(a, b):
-            return (a + b - 1) // b
-        
+        seq_block_table_offset: list[tuple],
+    ):  
         if (not self.enable_blk_caching) or (request.doc_ranges is None):
             seq_chunk_lens.append(num_computed_tokens + num_new_tokens)
             seq_delta_rotary_offsets.append(0)
             seq_chunk_num.append(1)
-            seq_block_table_range.append((0, ceil(num_computed_tokens + num_new_tokens, self.block_size)))
+            seq_block_table_offset.append(0)
             return [(num_new_tokens, num_computed_tokens, 
                      num_computed_tokens, num_computed_tokens)]
         
@@ -576,7 +573,7 @@ class KVCacheManager:
                 seq_delta_rotary_offsets.append(0)
             seq_chunk_num.append(len(seq_chunk_lens))
 
-            seq_block_table_range.append((0, ceil(num_computed_tokens + num_new_tokens, self.block_size)))
+            seq_block_table_offset.append(0)
 
             # 注意这里的 rotary offset 的计算
             return [(num_new_tokens, 
@@ -604,7 +601,7 @@ class KVCacheManager:
             seq_chunk_lens.append(chunk_len)
             seq_delta_rotary_offsets.append(0)
             seq_chunk_num.append(1)
-            seq_block_table_range.append((doc_ranges[chunk_idx][0] // self.block_size, doc_ranges[chunk_idx][1] // self.block_size))
+            seq_block_table_offset.append(doc_ranges[chunk_idx][0] // self.block_size)
             chunk_infos.append((chunk_len, doc_ranges[chunk_idx][0], 
                                 doc_ranges[chunk_idx][3], 0))
             remain_new_tokens -= chunk_len
@@ -617,7 +614,7 @@ class KVCacheManager:
             seq_delta_rotary_offsets.extend(request.delta_rotary_offsets)
             seq_delta_rotary_offsets.append(0)
             seq_chunk_num.append(len(doc_ranges) + 1)
-            seq_block_table_range.append((0, ceil(num_computed_tokens + num_new_tokens, self.block_size)))
+            seq_block_table_offset.append(0)
             chunk_infos.append((remain_new_tokens,
                                 doc_ranges[-1][1], 
                                 doc_ranges[-1][3] + doc_ranges[-1][2],

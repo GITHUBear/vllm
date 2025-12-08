@@ -24,4 +24,5 @@ class CommonAttentionMetadata:
     """"""
     cu_num_chunk_gpu_tensor: torch.Tensor
     """"""
+    block_table_offsets: torch.Tensor
 
